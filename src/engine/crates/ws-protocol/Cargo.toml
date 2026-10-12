@@ -1,0 +1,11 @@
+[package]
+name = "ws-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WinSearch IPC protocol: typed messages and framing"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

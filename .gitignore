@@ -1,0 +1,23 @@
+# Rust
+target/
+**/*.rs.bk
+
+# .NET / Visual Studio
+bin/
+obj/
+.vs/
+*.user
+*.suo
+artifacts/
+
+# WinSearch local data (never commit user data or models)
+*.db
+*.db-wal
+*.db-shm
+models/
+cache/
+
+# Tooling
+*.log
+.DS_Store
+.commandcode/

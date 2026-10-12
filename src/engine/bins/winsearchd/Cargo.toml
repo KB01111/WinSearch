@@ -1,0 +1,19 @@
+[package]
+name = "winsearchd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WinSearch indexing and search engine daemon"
+
+[[bin]]
+name = "winsearchd"
+path = "src/main.rs"
+
+[dependencies]
+ws-protocol.workspace = true
+ws-platform.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true

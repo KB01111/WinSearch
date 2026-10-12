@@ -1,0 +1,12 @@
+[package]
+name = "ws-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WinSearch Windows platform layer: named pipes, identity, paths, single instance"
+
+[dependencies]
+ws-protocol.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+windows.workspace = true

@@ -1,0 +1,440 @@
+using System.Collections.Concurrent;
+using System.IO.Pipes;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Threading.Channels;
+using WinSearch.Core.Protocol;
+
+namespace WinSearch.Core.Ipc;
+
+/// <summary>
+/// Async client for the engine's named pipe. Supports request/response with
+/// correlation ids, streamed search batches, per-request cancellation, pushed
+/// status updates, and automatic reconnection (with engine restart) when the
+/// connection drops.
+/// </summary>
+public sealed class EngineClient : IAsyncDisposable
+{
+    private const int MaxFrameBytes = 16 * 1024 * 1024;
+    private const int HandshakeTimeoutMs = 5000;
+    private const int ConnectTimeoutMs = 15000;
+
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ServerMessage>> _unary = new();
+    private readonly ConcurrentDictionary<ulong, Channel<SearchBatch>> _streams = new();
+    private readonly string _clientName;
+
+    private NamedPipeClientStream? _pipe;
+    private CancellationTokenSource _lifetime = new();
+    private Task? _readLoop;
+    private TaskCompletionSource<HelloAckMessage>? _helloAck;
+    private long _nextRequestId;
+    private bool _disposed;
+
+    public string PipeName { get; }
+    public string ClientVersion { get; }
+    public bool IsConnected => _pipe?.IsConnected == true;
+
+    /// <summary>Raised for every pushed or request-scoped status snapshot.</summary>
+    public event EventHandler<EngineStatus>? StatusChanged;
+
+    /// <summary>Raised when the pipe drops and reconnect attempts begin.</summary>
+    public event EventHandler? Disconnected;
+
+    /// <summary>Raised after a successful reconnect.</summary>
+    public event EventHandler? Reconnected;
+
+    public EngineClient(string pipeName, string clientName = "winsearch-ui", string clientVersion = "0.1.0")
+    {
+        PipeName = pipeName;
+        _clientName = clientName;
+        ClientVersion = clientVersion;
+    }
+
+    /// <summary>
+    /// Connects to the engine, starting it first if no pipe answers. Performs
+    /// the protocol handshake and begins the read loop.
+    /// </summary>
+    public async Task<HelloAckMessage> ConnectAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(ConnectTimeoutMs);
+
+        var engineStarted = false;
+        while (true)
+        {
+            timeout.Token.ThrowIfCancellationRequested();
+            try
+            {
+                return await ConnectOnceAsync(timeout.Token);
+            }
+            catch (TimeoutException) when (!timeout.Token.IsCancellationRequested)
+            {
+                // Pipe not present yet: make sure the engine process exists.
+            }
+            catch (IOException) when (!timeout.Token.IsCancellationRequested)
+            {
+            }
+
+            if (!engineStarted)
+            {
+                EngineLocator.StartEngine();
+                engineStarted = true;
+            }
+            await Task.Delay(250, timeout.Token);
+        }
+    }
+
+    private async Task<HelloAckMessage> ConnectOnceAsync(CancellationToken cancellationToken)
+    {
+        var pipe = new NamedPipeClientStream(
+            ".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+
+        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        connectCts.CancelAfter(1000);
+        try
+        {
+            await pipe.ConnectAsync(connectCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            await pipe.DisposeAsync();
+            throw new TimeoutException($"pipe {PipeName} not available");
+        }
+
+        _pipe = pipe;
+        _lifetime.Dispose();
+        _lifetime = new CancellationTokenSource();
+        _helloAck = new TaskCompletionSource<HelloAckMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _readLoop = Task.Run(() => ReadLoopAsync(pipe, _lifetime.Token));
+
+        await WriteAsync(new HelloMessage
+        {
+            ProtocolVersion = ProtocolJson.Version,
+            Client = _clientName,
+            ClientVersion = ClientVersion,
+        }, cancellationToken);
+
+        var ackTask = _helloAck.Task;
+        var completed = await Task.WhenAny(ackTask, Task.Delay(HandshakeTimeoutMs, cancellationToken));
+        if (completed != ackTask)
+        {
+            throw new TimeoutException("engine handshake timed out");
+        }
+
+        var ack = await ackTask;
+        if (ack.ProtocolVersion != ProtocolJson.Version)
+        {
+            throw new EngineException(
+                ErrorCode.ProtocolVersionMismatch,
+                $"engine speaks protocol v{ack.ProtocolVersion}, client speaks v{ProtocolJson.Version}");
+        }
+        return ack;
+    }
+
+    /// <summary>Requests a status snapshot; pushed updates also arrive via <see cref="StatusChanged"/>.</summary>
+    public Task<EngineStatus> GetStatusAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new GetStatusMessage { Id = id }, static m => ((StatusMessage)m).Status, cancellationToken);
+
+    /// <summary>
+    /// Runs a search and streams result batches. Cancelling <paramref name="cancellationToken"/>
+    /// sends a Cancel to the engine so obsolete semantic work stops server-side too.
+    /// </summary>
+    public async IAsyncEnumerable<SearchBatch> SearchAsync(
+        SearchQuery query,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var id = NextRequestId();
+        var channel = Channel.CreateUnbounded<SearchBatch>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true,
+        });
+        _streams[id] = channel;
+
+        using var registration = cancellationToken.Register(() =>
+        {
+            // Fire-and-forget: best effort server-side cancellation.
+            _ = TryCancelAsync(id);
+        });
+
+        await WriteAsync(new SearchMessage { Id = id, Query = query }, cancellationToken);
+
+        try
+        {
+            await foreach (var batch in channel.Reader.ReadAllAsync(cancellationToken))
+            {
+                yield return batch;
+            }
+        }
+        finally
+        {
+            _streams.TryRemove(id, out _);
+        }
+    }
+
+    private async Task TryCancelAsync(ulong id)
+    {
+        try
+        {
+            await WriteAsync(new CancelMessage { Id = id }, CancellationToken.None);
+        }
+        catch
+        {
+            // Connection may already be gone; nothing to do.
+        }
+    }
+
+    private async Task<T> UnaryAsync<T>(
+        Func<ulong, ClientMessage> factory,
+        Func<ServerMessage, T> selector,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        var id = NextRequestId();
+        var tcs = new TaskCompletionSource<ServerMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _unary[id] = tcs;
+        await using var registration = cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken)).ConfigureAwait(false);
+        await WriteAsync(factory(id), cancellationToken);
+        var message = await tcs.Task;
+        return selector(message);
+    }
+
+    private ulong NextRequestId() => (ulong)Interlocked.Increment(ref _nextRequestId);
+
+    private async Task WriteAsync(ClientMessage message, CancellationToken cancellationToken)
+    {
+        var pipe = _pipe ?? throw new IOException("not connected");
+        // Serialize against the base type so the "type" discriminator is
+        // written (serde needs it to route the message).
+        var payload = JsonSerializer.SerializeToUtf8Bytes(message, typeof(ClientMessage), ProtocolJson.Options);
+        if (payload.Length > MaxFrameBytes)
+        {
+            throw new InvalidOperationException("frame exceeds maximum size");
+        }
+
+        var frame = new byte[4 + payload.Length];
+        BitConverter.TryWriteBytes(frame.AsSpan(0, 4), payload.Length);
+        payload.CopyTo(frame.AsSpan(4));
+
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await pipe.WriteAsync(frame, cancellationToken);
+            await pipe.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task ReadLoopAsync(NamedPipeClientStream pipe, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var message = await ReadFrameAsync(pipe, cancellationToken);
+                if (message is null)
+                {
+                    break;
+                }
+                Dispatch(message);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (Exception)
+        {
+            // Fall through to disconnect handling.
+        }
+
+        if (!cancellationToken.IsCancellationRequested && !_disposed)
+        {
+            HandleDisconnect();
+        }
+    }
+
+    private async Task<ServerMessage?> ReadFrameAsync(NamedPipeClientStream pipe, CancellationToken cancellationToken)
+    {
+        var lengthBuffer = new byte[4];
+        var read = await ReadAtLeastAsync(pipe, lengthBuffer, cancellationToken);
+        if (read == 0)
+        {
+            return null; // clean disconnect
+        }
+        if (read < 4)
+        {
+            throw new IOException("stream ended mid-frame");
+        }
+
+        var length = BitConverter.ToInt32(lengthBuffer);
+        if (length is < 0 or > MaxFrameBytes)
+        {
+            throw new IOException($"frame of {length} bytes is invalid");
+        }
+
+        var payload = new byte[length];
+        if (await ReadAtLeastAsync(pipe, payload, cancellationToken) < length)
+        {
+            throw new IOException("stream ended mid-frame");
+        }
+
+        return (ServerMessage?)JsonSerializer.Deserialize(payload, typeof(ServerMessage), ProtocolJson.Options);
+    }
+
+    /// <summary>Reads until the buffer is full; returns 0 only for a clean EOF before any byte.</summary>
+    private static async Task<int> ReadAtLeastAsync(
+        Stream stream, byte[] buffer, CancellationToken cancellationToken)
+    {
+        var filled = 0;
+        while (filled < buffer.Length)
+        {
+            var n = await stream.ReadAsync(buffer.AsMemory(filled), cancellationToken);
+            if (n == 0)
+            {
+                return filled;
+            }
+            filled += n;
+        }
+        return filled;
+    }
+
+    private void Dispatch(ServerMessage message)
+    {
+        switch (message)
+        {
+            case HelloAckMessage ack:
+                _helloAck?.TrySetResult(ack);
+                break;
+
+            case PongMessage pong:
+                if (_unary.TryRemove(pong.Id, out var pongTcs))
+                {
+                    pongTcs.TrySetResult(pong);
+                }
+                break;
+
+            case ResultsMessage results:
+                if (_streams.TryGetValue(results.Id, out var channel))
+                {
+                    channel.Writer.TryWrite(new SearchBatch
+                    {
+                        Results = results.Batch,
+                        Done = results.Done,
+                    });
+                    if (results.Done)
+                    {
+                        channel.Writer.TryComplete();
+                    }
+                }
+                break;
+
+            case StatusMessage status:
+                if (status.Id is { } statusId && _unary.TryRemove(statusId, out var statusTcs))
+                {
+                    statusTcs.TrySetResult(status);
+                }
+                StatusChanged?.Invoke(this, status.Status);
+                break;
+
+            case ErrorMessage error:
+                var exception = new EngineException(error.Code, error.Message);
+                if (error.Id is { } errorId)
+                {
+                    if (_unary.TryRemove(errorId, out var errorTcs))
+                    {
+                        errorTcs.TrySetException(exception);
+                    }
+                    if (_streams.TryRemove(errorId, out var errorChannel))
+                    {
+                        errorChannel.Writer.TryComplete(exception);
+                    }
+                }
+                else
+                {
+                    _helloAck?.TrySetException(exception);
+                }
+                break;
+        }
+    }
+
+    private void HandleDisconnect()
+    {
+        FailPending(new IOException("engine connection lost"));
+        Disconnected?.Invoke(this, EventArgs.Empty);
+        _ = ReconnectLoopAsync();
+    }
+
+    private void FailPending(Exception exception)
+    {
+        foreach (var key in _unary.Keys)
+        {
+            if (_unary.TryRemove(key, out var tcs))
+            {
+                tcs.TrySetException(exception);
+            }
+        }
+        foreach (var key in _streams.Keys)
+        {
+            if (_streams.TryRemove(key, out var channel))
+            {
+                channel.Writer.TryComplete(exception);
+            }
+        }
+    }
+
+    private async Task ReconnectLoopAsync()
+    {
+        var engineStarted = false;
+        while (!_disposed)
+        {
+            try
+            {
+                await Task.Delay(500);
+                await ConnectAsync(_lifetime.Token);
+                Reconnected?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception)
+            {
+                if (!engineStarted)
+                {
+                    EngineLocator.StartEngine();
+                    engineStarted = true;
+                }
+            }
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        _lifetime.Cancel();
+        FailPending(new ObjectDisposedException(nameof(EngineClient)));
+        if (_pipe is not null)
+        {
+            await _pipe.DisposeAsync();
+        }
+        _writeLock.Dispose();
+        _lifetime.Dispose();
+    }
+}

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/" />
+  <Folder Name="/src/app/">
+    <Project Path="src/app/WinSearch.App/WinSearch.App.csproj" />
+    <Project Path="src/app/WinSearch.Core/WinSearch.Core.csproj" />
+    <Project Path="src/app/WinSearch.ViewModels/WinSearch.ViewModels.csproj" />
+  </Folder>
+</Solution>

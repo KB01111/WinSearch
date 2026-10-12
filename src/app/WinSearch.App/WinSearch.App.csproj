@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>WinSearch.App</RootNamespace>
+    <AssemblyName>WinSearch</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ApplicationIcon>Assets\WinSearch.ico</ApplicationIcon>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\WinSearch.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WinSearch.Core\WinSearch.Core.csproj" />
+    <ProjectReference Include="..\WinSearch.ViewModels\WinSearch.ViewModels.csproj" />
+  </ItemGroup>
+
+  <!-- Dev convenience: place the Rust engine next to the app when it has been
+       built, so EngineLocator finds engine\winsearchd.exe. The installer
+       assembles the same layout. -->
+  <Target Name="CopyEngine" AfterTargets="Build">
+    <PropertyGroup>
+      <EngineBinary>$(MSBuildThisFileDirectory)..\..\engine\target\$([System.String]::Copy('$(Configuration)').ToLowerInvariant())\winsearchd.exe</EngineBinary>
+    </PropertyGroup>
+    <Copy
+      SourceFiles="$(EngineBinary)"
+      DestinationFolder="$(OutDir)engine"
+      Condition="Exists('$(EngineBinary)')"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

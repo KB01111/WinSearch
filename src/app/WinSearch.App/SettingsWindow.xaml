@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="WinSearch.App.SettingsWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Grid x:Name="RootGrid" Padding="24" RowSpacing="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock
+            Grid.Row="0"
+            Style="{StaticResource TitleTextBlockStyle}"
+            Text="Settings" />
+
+        <!-- Theme -->
+        <StackPanel Grid.Row="1" Spacing="8">
+            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Theme" />
+            <ComboBox
+                x:Name="ThemeCombo"
+                MinWidth="220"
+                HorizontalAlignment="Left"
+                SelectionChanged="OnThemeChanged" />
+        </StackPanel>
+
+        <!-- Global shortcut -->
+        <StackPanel Grid.Row="2" Spacing="8">
+            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Global shortcut" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Border
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="4"
+                    Padding="12,6">
+                    <TextBlock x:Name="HotkeyText" FontFamily="Consolas" Text="Alt + Space" />
+                </Border>
+                <Button x:Name="ChangeHotkeyButton" Click="OnChangeHotkeyClick" Content="Change" />
+                <Button Click="OnResetHotkeyClick" Content="Reset" />
+            </StackPanel>
+            <TextBlock
+                x:Name="HotkeyStatusText"
+                FontSize="12"
+                Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                Text="Click Change, then press the new key combination." />
+        </StackPanel>
+
+        <!-- Search behaviour -->
+        <StackPanel Grid.Row="3" Spacing="8">
+            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Search" />
+            <ToggleSwitch
+                x:Name="RememberQueryToggle"
+                OffContent="Start with an empty search field"
+                OnContent="Remember the last query between launches"
+                Toggled="OnRememberQueryToggled" />
+        </StackPanel>
+    </Grid>
+</Window>
