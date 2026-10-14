@@ -1,7 +1,7 @@
 //! Builds the pinned llama.cpp tree with cmake and links the flat C shim.
 //!
 //! - Source: `LLAMA_CPP_DIR` env var if set, otherwise a shallow clone of
-//!   [`LLAMA_CPP_TAG`] cached under `target/ws-embed-llama/`. The source tree is
+//!   [`LLAMA_CPP_REV`] cached under `target/ws-embed-llama/`. The source tree is
 //!   NOT committed to the repository.
 //! - Backends are built as separately loaded DLLs (`GGML_BACKEND_DL=ON`). The CPU
 //!   variant always builds. CUDA is enabled only when the CUDA toolkit is found,
@@ -16,9 +16,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Pinned llama.cpp release. Record changes in `third_party/llama.cpp.md`.
-const LLAMA_CPP_TAG: &str = "v0.6.0";
+/// Pinned llama.cpp revision. Record changes in `third_party/llama.cpp.md`.
+///
+/// This is a commit, not a release tag: v0.6.0 has no `gemma-embedding2`
+/// architecture (EmbeddingGemma 2), and the first commit that adds it is 4fbc76dec
+/// (2026-10-06), 23 commits after v0.6.0. Pin by SHA so the build is reproducible.
+const LLAMA_CPP_REV: &str = "4fbc76dec51d0add466f0210855c0596589b60d4";
 const LLAMA_CPP_REPO: &str = "https://github.com/ggml-org/llama.cpp";
+/// Short label used for cache directory names.
+const LLAMA_CPP_LABEL: &str = "4fbc76de";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -80,17 +86,26 @@ fn llama_source_dir() -> PathBuf {
         assert!(p.join("CMakeLists.txt").is_file(), "LLAMA_CPP_DIR has no CMakeLists.txt: {}", p.display());
         return p;
     }
-    let dest = cache_root().join(format!("llama.cpp-{LLAMA_CPP_TAG}"));
+    let dest = cache_root().join(format!("llama.cpp-{LLAMA_CPP_LABEL}"));
     if dest.join("CMakeLists.txt").is_file() {
         return dest;
     }
-    fs::create_dir_all(cache_root()).expect("create cache dir");
-    let status = Command::new("git")
-        .args(["-c", "core.longpaths=true", "clone", "--depth", "1", "--branch", LLAMA_CPP_TAG, LLAMA_CPP_REPO])
-        .arg(&dest)
-        .status()
-        .expect("run git clone (git must be on PATH)");
-    assert!(status.success(), "git clone of llama.cpp {LLAMA_CPP_TAG} failed");
+    fs::create_dir_all(&dest).expect("create llama.cpp cache dir");
+    // Fetch exactly the pinned commit (shallow, no full history).
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&dest)
+            .args(["-c", "core.longpaths=true"])
+            .args(args)
+            .status()
+            .expect("run git (git must be on PATH)");
+        assert!(status.success(), "git {args:?} failed for llama.cpp {LLAMA_CPP_REV}");
+    };
+    git(&["init", "--quiet"]);
+    git(&["remote", "add", "origin", LLAMA_CPP_REPO]);
+    git(&["fetch", "--depth", "1", "--quiet", "origin", LLAMA_CPP_REV]);
+    git(&["checkout", "--quiet", "FETCH_HEAD"]);
     dest
 }
 
@@ -131,7 +146,7 @@ fn cmake_exe() -> PathBuf {
 fn build_llama(src: &Path, cuda: bool, vulkan: bool) -> PathBuf {
     let variant = format!(
         "{}-{}-{}",
-        LLAMA_CPP_TAG,
+        LLAMA_CPP_LABEL,
         if cuda { "cuda" } else { "nocuda" },
         if vulkan { "vulkan" } else { "novulkan" },
     );

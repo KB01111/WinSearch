@@ -111,8 +111,10 @@ void wse_model_free(struct llama_model * model) {
     llama_model_free(model);
 }
 
+// Pooled OUTPUT embedding dimension. Not llama_model_n_embd, which is the input
+// width: EmbeddingGemma 2 has input 512 but output 768 (embedding_length_out).
 int32_t wse_model_n_embd(const struct llama_model * model) {
-    return llama_model_n_embd(model);
+    return llama_model_n_embd_out(model);
 }
 
 // ---- context ----------------------------------------------------------------
