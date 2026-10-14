@@ -3,25 +3,40 @@
 //! Runs independently of the UI: it keeps indexing and answering searches over
 //! the per-user named pipe even when no frontend is connected.
 
+mod catalog;
+mod crawl;
 mod engine;
+mod indexer;
 mod server;
+mod watcher;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use ws_index::IndexStore;
 use ws_platform::identity;
 use ws_platform::paths;
 use ws_platform::pipe;
 use ws_platform::SingleInstanceGuard;
 
-use engine::EngineService;
+use engine::{EngineService, SharedEngine};
+use indexer::Indexer;
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().any(|a| a == "--version") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version") {
         println!("winsearchd {}", server::ENGINE_VERSION);
         return Ok(());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--bench-crawl") {
+        let count: usize = args
+            .get(pos + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+        return run_crawl_bench(count);
     }
 
     paths::ensure_layout()?;
@@ -38,8 +53,13 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    let store = IndexStore::open(&paths::index_db_path())?;
+    let indexer = Indexer::open(store, &default_roots())?;
+    indexer.start_background()?;
+
     let pipe_name = identity::pipe_name()?;
-    let engine = EngineService::new();
+    let engine = EngineService::new(Arc::clone(&indexer));
+    spawn_status_pusher(Arc::clone(&engine));
     let handler_engine = Arc::clone(&engine);
 
     info!(pipe = %pipe_name, "serving IPC");
@@ -48,6 +68,94 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Crawl-pipeline benchmark: synthetic tree on disk through the real
+/// scan → identity → upsert path. Prints the numbers quoted in
+/// `docs/benchmarks.md`. Run: `winsearchd --bench-crawl [files]`.
+fn run_crawl_bench(file_count: usize) -> anyhow::Result<()> {
+    use std::time::Instant;
+
+    let dir = std::env::temp_dir().join("winsearch-bench-crawl");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    let t_build = Instant::now();
+    for i in 0..file_count {
+        let sub = dir.join(format!("dir{:04}", i / 200));
+        std::fs::create_dir_all(&sub)?;
+        std::fs::write(sub.join(format!("file-{:06}.txt", i)), b"bench")?;
+    }
+    let build = t_build.elapsed();
+
+    let db_dir = std::env::temp_dir().join("winsearch-bench-crawl-db");
+    let _ = std::fs::remove_dir_all(&db_dir);
+    let mut store = IndexStore::open(&db_dir.join("bench.db"))?;
+    let root_id = store.ensure_root(&dir.to_string_lossy())?;
+
+    let run_pass = |store: &mut IndexStore| -> anyhow::Result<(std::time::Duration, usize)> {
+        let gen = store.begin_generation(root_id)?;
+        let started = Instant::now();
+        let mut queue = vec![dir.clone()];
+        let mut entries = 0usize;
+        while let Some(d) = queue.pop() {
+            let scan = crawl::scan_directory(root_id, &d.to_string_lossy(), None, 0)?;
+            entries += scan.entries.len();
+            queue.extend(scan.subdirs.iter().map(std::path::PathBuf::from));
+            store.apply_batch(root_id, gen, &scan.entries)?;
+        }
+        Ok((started.elapsed(), entries))
+    };
+
+    let (full, entries) = run_pass(&mut store)?;
+    let (incremental, _) = run_pass(&mut store)?;
+    let stats = store.stats()?;
+
+    println!("winsearch crawl-pipeline benchmark");
+    println!("files: {file_count}, dirs: {}, cpus: {}", file_count / 200, std::thread::available_parallelism().map(|p| p.get()).unwrap_or(0));
+    println!();
+    println!("tree creation:               {build:>10.2?}");
+    println!("full crawl (scan+identity+upsert, {entries} entries): {full:>8.2?}  ({:.0} files/s)", file_count as f64 / full.as_secs_f64());
+    println!("incremental crawl (unchanged): {incremental:>10.2?}  ({:.0} files/s)", file_count as f64 / incremental.as_secs_f64());
+    println!("index size: {:.1} MiB", stats.index_size_bytes as f64 / 1_048_576.0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&db_dir);
+    Ok(())
+}
+
+/// Default indexing roots: the user's standard content folders. Configurable
+/// roots land with the Settings "Folders" section (Phase 6).
+fn default_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        for dir in ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"] {
+            let path = PathBuf::from(&profile).join(dir);
+            if path.is_dir() {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
+/// Pushes an engine-status update to connected clients whenever the indexing
+/// picture changes (new files indexed, queue drained, ...).
+fn spawn_status_pusher(engine: SharedEngine) {
+    std::thread::Builder::new()
+        .name("winsearch-status".into())
+        .spawn(move || {
+            let mut last = engine.status();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let current = engine.status();
+                if current != last {
+                    last = current;
+                    engine.set_status(|_| {});
+                }
+            }
+        })
+        .ok();
 }
 
 fn init_logging() {
@@ -62,7 +170,7 @@ fn init_logging() {
     Box::leak(Box::new(guard));
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("winsearchd=info,ws_platform=info,ws_protocol=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("winsearchd=info,ws_platform=info,ws_protocol=warn,ws_index=warn"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

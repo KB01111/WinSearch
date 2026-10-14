@@ -1,0 +1,455 @@
+//! Retrieval: candidate generation (exact name, name prefix, trigram
+//! substring, FTS token match) and launcher-style ranking.
+//!
+//! Every candidate source is index-driven — there is no table scan on the
+//! query path, so latency stays flat as the index grows. Ranking is
+//! deterministic and explainable: exact name beats prefix beats substring
+//! beats token matches, with small boosts for applications and recency and a
+//! small penalty for deep paths. Every hit carries the reason it matched so
+//! the UI can show a match explanation.
+
+use rusqlite::params;
+
+use crate::model::{HitKind, SearchHit, SearchRequest};
+use crate::store::{EntryRow, IndexStore, StoreError};
+
+/// Hard cap on rows pulled from each candidate source before ranking. Keeps
+/// worst-case query cost bounded on very large indexes.
+const CANDIDATE_CAP: usize = 500;
+
+struct Candidate {
+    row: EntryRow,
+    /// True when the match came from the FTS token index (names or keywords)
+    /// rather than a whole-string name match.
+    via_fts: bool,
+}
+
+impl IndexStore {
+    /// Runs one retrieval pass. Results are ranked, filtered by the request's
+    /// mode/kinds, and truncated to `limit`.
+    pub fn search(&self, req: &SearchRequest) -> Result<Vec<SearchHit>, StoreError> {
+        let query = req.text.trim();
+        let query_lower = query.to_lowercase();
+        let tokens = tokenize(&query_lower);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidates = Vec::new();
+        let mut push_unique = |rows: Vec<EntryRow>, via_fts: bool| {
+            for row in rows {
+                if !candidates.iter().any(|c: &Candidate| c.row.id == row.id) {
+                    candidates.push(Candidate { row, via_fts });
+                }
+            }
+        };
+        push_unique(self.exact_candidates(&query_lower)?, false);
+        push_unique(self.prefix_candidates(&query_lower)?, false);
+        push_unique(self.substring_candidates(&query_lower)?, false);
+        push_unique(self.fts_candidates(&tokens)?, true);
+
+        let depth = |path: &str| path.matches('\\').count().max(path.matches('/').count());
+        let mut hits: Vec<SearchHit> = candidates
+            .into_iter()
+            .filter(|c| {
+                if c.row.missing {
+                    return false;
+                }
+                if req.apps_only && !c.row.is_app {
+                    return false;
+                }
+                if req.files_only && c.row.is_app {
+                    return false;
+                }
+                if !req.kinds.is_empty() {
+                    let kind = hit_kind(&c.row);
+                    if !req.kinds.contains(&kind) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .filter_map(|c| {
+                let (score, explanation) =
+                    rank(&c.row, &query_lower, &tokens, c.via_fts, depth(&c.row.path));
+                (score > 0.0).then(|| SearchHit {
+                    entry_id: c.row.id,
+                    kind: hit_kind(&c.row),
+                    name: c.row.name,
+                    path: c.row.path,
+                    is_dir: c.row.is_dir,
+                    score,
+                    explanation,
+                })
+            })
+            .collect();
+
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+        hits.truncate(req.limit.max(1));
+        Ok(hits)
+    }
+
+    /// Whole-name equality: an index point lookup.
+    fn exact_candidates(&self, query_lower: &str) -> Result<Vec<EntryRow>, StoreError> {
+        self.rows_by(
+            "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
+                    mtime, missing
+             FROM entries
+             WHERE missing = 0 AND name_lower = ?1
+             LIMIT 8",
+            params![query_lower],
+        )
+    }
+
+    /// Name prefix: a range seek on the name index. A `>= / <` pair (rather
+    /// than `LIKE 'x%'`) keeps the query index-eligible regardless of LIKE
+    /// optimization rules and wildcard characters in the query.
+    fn prefix_candidates(&self, query_lower: &str) -> Result<Vec<EntryRow>, StoreError> {
+        let Some(end) = prefix_upper_bound(query_lower) else {
+            return Ok(Vec::new());
+        };
+        self.rows_by(
+            "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
+                    mtime, missing
+             FROM entries
+             WHERE missing = 0 AND name_lower >= ?1 AND name_lower < ?2
+             LIMIT ?3",
+            params![query_lower, end, CANDIDATE_CAP as i64],
+        )
+    }
+
+    /// Whole-query substring (e.g. "code" inside "VSCode"): served by the
+    /// trigram FTS index. Trigrams need three characters; shorter queries rely
+    /// on prefix/token sources (mid-word two-character noise is excluded on
+    /// purpose).
+    fn substring_candidates(&self, query_lower: &str) -> Result<Vec<EntryRow>, StoreError> {
+        if query_lower.chars().count() < 3 {
+            return Ok(Vec::new());
+        }
+        let escaped = query_lower.replace('"', "\"\"");
+        self.rows_by(
+            "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
+                    mtime, missing
+             FROM entries
+             WHERE id IN (
+                 SELECT rowid FROM entries_tri WHERE entries_tri MATCH ?1 LIMIT ?2
+             )",
+            params![format!("\"{escaped}\""), CANDIDATE_CAP as i64],
+        )
+    }
+
+    /// All query tokens present as word prefixes (name or keywords column).
+    /// No ORDER BY rank here: the rank sort is the expensive part and our own
+    /// ranking decides the order anyway.
+    fn fts_candidates(&self, tokens: &[String]) -> Result<Vec<EntryRow>, StoreError> {
+        let match_expr = tokens
+            .iter()
+            .map(|t| format!("\"{t}\"*"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.rows_by(
+            "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
+                    mtime, missing
+             FROM entries
+             WHERE id IN (
+                 SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1 LIMIT ?2
+             )",
+            params![match_expr, CANDIDATE_CAP as i64],
+        )
+    }
+
+    fn rows_by(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<EntryRow>, StoreError> {
+        let mut stmt = self.conn().prepare_cached(sql)?;
+        let rows = stmt.query_map(params, row_to_entry)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+/// Deterministic score in (0, 1] plus a human-readable match reason.
+fn rank(
+    row: &EntryRow,
+    query: &str,
+    tokens: &[String],
+    via_fts: bool,
+    depth: usize,
+) -> (f64, String) {
+    let name = &row.name_lower;
+    let (base, explanation) = if name == query {
+        (1.0, "Exact name match")
+    } else if name.starts_with(query) {
+        (0.92, "Name starts with query")
+    } else if name.contains(query) {
+        (0.78, "Name contains query")
+    } else if tokens.len() > 1 && all_tokens_match_name(name, tokens) {
+        (0.74, "All words match the name")
+    } else if via_fts {
+        (0.5, "Matches name or keywords")
+    } else if row.path.to_lowercase().contains(query) {
+        (0.35, "Path matches query")
+    } else {
+        return (0.0, String::new());
+    };
+
+    let mut score = base;
+    if row.is_app {
+        score += 0.06;
+    }
+    // Very mild recency boost so equally named results prefer newer files.
+    if !row.is_dir && !row.is_app && row.mtime > 0 {
+        let age_days = (now_unix() - row.mtime).max(0) / 86_400;
+        score += match age_days {
+            0..=7 => 0.03,
+            8..=30 => 0.02,
+            31..=90 => 0.01,
+            _ => 0.0,
+        };
+    }
+    score -= 0.005 * depth.min(12) as f64;
+    (score.clamp(0.0, 1.0), explanation.to_string())
+}
+
+fn all_tokens_match_name(name: &str, tokens: &[String]) -> bool {
+    let name_tokens: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens.iter().all(|q| {
+        name_tokens
+            .iter()
+            .any(|n| n.starts_with(q.as_str()) || n.contains(q.as_str()))
+    })
+}
+
+fn hit_kind(row: &EntryRow) -> HitKind {
+    if row.is_app {
+        HitKind::Application
+    } else if row.is_dir {
+        HitKind::Folder
+    } else {
+        crate::model::kind_for_ext(&row.ext).hit_kind()
+    }
+}
+
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
+    Ok(EntryRow {
+        id: row.get(0)?,
+        root_id: row.get(1)?,
+        parent_id: row.get(2)?,
+        path: row.get(3)?,
+        name: row.get(4)?,
+        name_lower: row.get(5)?,
+        ext: row.get(6)?,
+        is_dir: row.get::<_, i64>(7)? != 0,
+        is_app: row.get::<_, i64>(8)? != 0,
+        mtime: row.get(9)?,
+        missing: row.get::<_, i64>(10)? != 0,
+    })
+}
+
+/// Splits query text into lowercase alphanumeric tokens.
+pub(crate) fn tokenize(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Exclusive upper bound of the string range covering everything with
+/// `prefix` as its start: the prefix with its last codepoint incremented.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let bumped = char::from_u32(last as u32 + 1)?;
+    chars.push(bumped);
+    Some(chars.into_iter().collect())
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::EntryRecord;
+    use crate::store::IndexStore;
+
+    fn rec(path: &str, name: &str, is_app: bool) -> EntryRecord {
+        EntryRecord {
+            root_id: 0,
+            parent_id: None,
+            path: path.into(),
+            name: name.into(),
+            ext: crate::model::extension_of(name),
+            is_dir: false,
+            size: 1,
+            mtime: now_unix(),
+            volume_serial: 1,
+            file_id: 0,
+            is_app,
+            app_target: String::new(),
+            keywords: if is_app {
+                "visual studio code editor".into()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn seeded_store() -> IndexStore {
+        let mut store = IndexStore::open_in_memory().unwrap();
+        let root = store.ensure_root("C:\\data").unwrap();
+        let gen = store.begin_generation(root).unwrap();
+        let records = vec![
+            rec("C:\\data\\notes.txt", "notes.txt", false),
+            rec("C:\\data\\meeting notes.txt", "meeting notes.txt", false),
+            rec("C:\\data\\VSCode.exe", "VSCode.exe", false),
+            rec("C:\\data\\Code.lnk", "Code.lnk", true),
+            rec("C:\\data\\codex.md", "codex.md", false),
+        ];
+        store.apply_batch(root, gen, &records).unwrap();
+        store
+    }
+
+    #[test]
+    fn exact_match_ranks_first() {
+        let store = seeded_store();
+        let hits = store
+            .search(&SearchRequest {
+                text: "notes.txt".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits[0].name, "notes.txt");
+        assert_eq!(hits[0].explanation, "Exact name match");
+    }
+
+    #[test]
+    fn substring_matches_inside_words() {
+        let store = seeded_store();
+        let hits = store
+            .search(&SearchRequest {
+                text: "code".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"VSCode.exe"), "got {names:?}");
+    }
+
+    #[test]
+    fn apps_can_be_filtered_and_rank_higher() {
+        let store = seeded_store();
+        let hits = store
+            .search(&SearchRequest {
+                text: "code".into(),
+                limit: 10,
+                apps_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, HitKind::Application);
+
+        let all = store
+            .search(&SearchRequest {
+                text: "code".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(all[0].kind, HitKind::Application); // app boost
+    }
+
+    #[test]
+    fn multi_word_queries_match_all_tokens() {
+        let store = seeded_store();
+        let hits = store
+            .search(&SearchRequest {
+                text: "meeting notes".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits[0].name, "meeting notes.txt");
+    }
+
+    #[test]
+    fn kind_filter_restricts_results() {
+        let store = seeded_store();
+        let hits = store
+            .search(&SearchRequest {
+                text: "code".into(),
+                limit: 10,
+                kinds: vec![HitKind::Application],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hits.iter().all(|h| h.kind == HitKind::Application));
+    }
+
+    #[test]
+    fn empty_and_punctuation_queries_return_nothing() {
+        let store = seeded_store();
+        for q in ["", "   ", "...", "---"] {
+            let hits = store
+                .search(&SearchRequest {
+                    text: q.into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(hits.is_empty(), "query {q:?} returned hits");
+        }
+    }
+
+    #[test]
+    fn limit_is_respected() {
+        let store = seeded_store();
+        let hits = store
+            .search(&SearchRequest {
+                text: "notes".into(),
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn wildcard_like_queries_do_not_match_everything() {
+        let mut store = IndexStore::open_in_memory().unwrap();
+        let root = store.ensure_root("C:\\data").unwrap();
+        let gen = store.begin_generation(root).unwrap();
+        store
+            .apply_batch(root, gen, &[rec("C:\\data\\100%_real.txt", "100%_real.txt", false)])
+            .unwrap();
+        let hits = store
+            .search(&SearchRequest {
+                text: "100%".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        // A query full of LIKE wildcards must not match everything.
+        let hits = store
+            .search(&SearchRequest {
+                text: "%_%".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+}

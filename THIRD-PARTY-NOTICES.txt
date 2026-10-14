@@ -1,0 +1,48 @@
+WinSearch third-party notices
+=============================
+
+WinSearch incorporates or references the following third-party software.
+
+1. DigUp
+   Project:  https://github.com/ARahim3/DigUp
+   License:  MIT
+   Copyright (c) 2024 ARahim3
+   Usage:    Reference implementation (macOS/Swift). WinSearch ports
+             architecture ideas, behaviors, and feature scope from DigUp;
+             no DigUp source code is redistributed in this repository.
+
+2. rusqlite (with bundled SQLite)
+   Project:  https://github.com/rusqlite/rusqlite
+   License:  MIT
+   Usage:    Index storage (SQLite with FTS5) in the engine.
+
+3. SQLite
+   Project:  https://sqlite.org/
+   License:  Public Domain
+   Usage:    Compiled into rusqlite (bundled feature).
+
+4. windows-rs
+   Project:  https://github.com/microsoft/windows-rs
+   License:  MIT OR Apache-2.0
+   Usage:    Win32 interop in the engine (named pipes, file watching,
+             shell shortcut resolution) and the Rust platform layer.
+
+5. serde / serde_json
+   Project:  https://github.com/serde-rs
+   License:  MIT OR Apache-2.0
+   Usage:    IPC message serialization.
+
+6. thiserror, anyhow, tracing, tracing-subscriber, tracing-appender
+   Project:  https://github.com/dtolnay/thiserror
+             https://github.com/dtolnay/anyhow
+             https://github.com/tokio-rs/tracing
+   License:  MIT OR Apache-2.0
+   Usage:    Error handling and logging in the engine.
+
+7. .NET / Windows App SDK / CommunityToolkit.Mvvm
+   Project:  https://dotnet.microsoft.com/
+             https://github.com/microsoft/WindowsAppSDK
+             https://github.com/CommunityToolkit/dotnet
+   License:  MIT
+   Usage:    WinUI 3 frontend (referenced as NuGet packages; not
+             redistributed in this repository).

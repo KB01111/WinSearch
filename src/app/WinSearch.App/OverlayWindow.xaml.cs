@@ -133,6 +133,9 @@ public sealed partial class OverlayWindow : Window
 
     private void OnSearchBoxKeyDown(object sender, KeyRoutedEventArgs e)
     {
+        var ctrlDown = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
+                        & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+
         switch (e.Key)
         {
             case VirtualKey.Escape:
@@ -148,9 +151,28 @@ public sealed partial class OverlayWindow : Window
                 e.Handled = true;
                 break;
 
+            case VirtualKey.Enter when ctrlDown:
+                // Ctrl+Enter: reveal the result in its folder instead of opening it.
+                if (ResultsList.SelectedItem is ResultItemViewModel revealItem)
+                {
+                    ResultActions.RevealInExplorer(revealItem.Result);
+                    HideOverlay();
+                }
+                e.Handled = true;
+                break;
+
             case VirtualKey.Enter:
                 OpenSelectedResult();
                 e.Handled = true;
+                break;
+
+            case VirtualKey.C when ctrlDown && string.IsNullOrEmpty(SearchBox.SelectedText):
+                // Ctrl+C with no text selection copies the selected result's path.
+                if (ResultsList.SelectedItem is ResultItemViewModel copyItem)
+                {
+                    ResultActions.CopyPath(copyItem.Result);
+                    e.Handled = true;
+                }
                 break;
 
             case VirtualKey.Down:
@@ -163,9 +185,7 @@ public sealed partial class OverlayWindow : Window
                 e.Handled = true;
                 break;
 
-            case VirtualKey.Space when
-                (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
-                 & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0:
+            case VirtualKey.Space when ctrlDown:
                 // Ctrl+Space reserved for preview (Phase 6).
                 break;
         }
