@@ -38,6 +38,8 @@ ws-index = { path = "crates/ws-index" }
 ws-modelmgr = { path = "crates/ws-modelmgr" }
 ws-embed = { path = "crates/ws-embed" }
 ws-embed-protocol = { path = "crates/ws-embed-protocol" }
+ws-code = { path = "crates/ws-code" }
+ignore = "0.4"
 
 [profile.release]
 lto = "thin"

@@ -68,3 +68,9 @@ WinSearch incorporates or references the following third-party software.
               https://github.com/KokaKiwi/rust-hex (hex)
     License:  MIT OR Apache-2.0
     Usage:    SHA-256 verification of downloaded/imported model files.
+
+11. ignore
+    Project:  https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore
+    License:  MIT OR Unlicense
+    Usage:    .gitignore-aware directory traversal (nested .gitignore and
+              negation rules) for the opt-in code index in ws-code.
