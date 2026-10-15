@@ -39,6 +39,11 @@ WinSearch incorporates or references the following third-party software.
    License:  MIT OR Apache-2.0
    Usage:    Error handling and logging in the engine.
 
+8. half
+   Project:  https://github.com/starkat99/half-rs
+   License:  MIT OR Apache-2.0
+   Usage:    FP16 vector storage (normalized embeddings) in ws-index.
+
 7. .NET / Windows App SDK / CommunityToolkit.Mvvm
    Project:  https://dotnet.microsoft.com/
              https://github.com/microsoft/WindowsAppSDK

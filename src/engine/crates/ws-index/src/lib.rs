@@ -12,8 +12,14 @@ pub mod model;
 pub mod search;
 pub mod settings;
 pub mod store;
+pub mod vectors;
 
 pub use calc::{evaluate, CalcError, CalcResult};
-pub use model::{EntryKind, EntryRecord, HitKind, SearchHit, SearchRequest, UpsertOutcome};
+pub use model::{
+    EntryKind, EntryRecord, ExtractJob, HitKind, NewSegment, ScoredSegment, SearchHit, SearchRequest,
+    UpsertOutcome, VectorFilter, Segment, EXTRACT_STATE_CLAIMED, EXTRACT_STATE_FAILED,
+    EXTRACT_STATE_PENDING, SEGMENT_KIND_NAME,
+};
 pub use settings::{search_settings, SettingsHit};
 pub use store::{IndexStats, IndexStore, Root, StoreError};
+pub use vectors::{VectorError, VectorHit, VectorIndex};
