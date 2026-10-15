@@ -32,6 +32,16 @@ use crate::watcher::{self, WatchEvent, Watcher};
 /// worker cap so one pipeline batch is always one worker job).
 pub const EMBED_BATCH: usize = EMBED_BATCH_SIZE;
 
+/// Poison-pill cap (fix round 1/5, I1): a name job that fails this many
+/// batch attempts (timeouts, transport errors, arity mismatches, repeated
+/// upsert errors) is marked `failed` instead of requeued, so a persistently
+/// hung worker or poison entry cannot spin the embed queue forever. Failed
+/// rows are never auto-claimed; they stay inspectable via
+/// `find_extract_job`. Mid-batch changes use the attempts-preserving
+/// `requeue_extract_job` path instead, so rapidly-changing files are never
+/// poisoned as "failing".
+pub const MAX_EMBED_ATTEMPTS: i64 = 5;
+
 /// Crawl worker count: bounded on purpose (indexing must never starve the
 /// interactive search path).
 const WORKER_THREADS: usize = 4;
@@ -63,6 +73,16 @@ pub struct IndexerStatus {
     pub embedding: bool,
 }
 
+/// One claimed name job with its claim-time snapshot (I2 lost-update token).
+struct ClaimedNameJob {
+    job_id: i64,
+    entry_id: i64,
+    name: String,
+    mtime: i64,
+    job_priority: i64,
+    attempts: i64,
+}
+
 /// Outcome of one [`Indexer::embed_once_with`] batch (test-observable).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbedBatchOutcome {
@@ -72,6 +92,11 @@ pub struct EmbedBatchOutcome {
     pub embedded: usize,
     /// Jobs released for retry (`fail_extract_job`, attempts+1).
     pub failed: usize,
+    /// Jobs requeued after a mid-batch change (fresh data embeds next batch;
+    /// attempts untouched).
+    pub requeued: usize,
+    /// Jobs poison-pilled (`mark_extract_failed`) at [`MAX_EMBED_ATTEMPTS`].
+    pub poisoned: usize,
 }
 
 struct RootInfo {
@@ -609,11 +634,24 @@ impl Indexer {
     /// Runs one embed batch synchronously: claims up to [`EMBED_BATCH`]
     /// `name` jobs, embeds their current entry names via `embed`, and upserts
     /// one `segments(kind='name', chunk 0)` per success (replacing the prior
-    /// vector for the entry, stable segment id). Failures release their claims
-    /// (`fail_extract_job`, attempts+1) for retry. Entries deleted between
-    /// claim and write complete their job without a segment. The store lock
-    /// is never held across the embed call, so crawl workers keep moving
-    /// while a batch (or its [`EMBED_JOB_TIMEOUT`] watchdog) is in flight.
+    /// vector for the entry, stable segment id).
+    ///
+    /// Correctness rules (fix round 1/5):
+    /// - I2 (lost-update): names are snapshotted at claim (`name`, `mtime`,
+    ///   job `priority`); after the embed each entry is re-resolved under
+    ///   lock and a mismatch requeues the job (`requeue_extract_job`,
+    ///   attempts untouched) instead of upserting the stale vector and
+    ///   consuming the change signal. Detection covers renames always, and
+    ///   content changes whenever the second write ticks `mtime` or escalates
+    ///   priority (same-second same-priority rewrites inside the claim window
+    ///   can still slip; the next future change re-embeds).
+    /// - I1 (poison cap): batch/row failures increment attempts; at
+    ///   [`MAX_EMBED_ATTEMPTS`] the job is `mark_extract_failed` (poison
+    ///   pill, never auto-claimed) with a health `warn!` instead of spinning
+    ///   forever. Entries deleted between claim and write complete their job
+    ///   without a segment. The store lock is never held across the embed
+    ///   call, so crawl workers keep moving while a batch (or its
+    ///   [`EMBED_JOB_TIMEOUT`] watchdog) is in flight.
     ///
     /// `embed` is injectable so tests use deterministic fake vectors without
     /// a worker process; production passes the supervisor's bounded call.
@@ -621,21 +659,19 @@ impl Indexer {
     where
         F: Fn(&[String]) -> Result<Vec<Vec<f32>>, String>,
     {
-        struct Claimed {
-            job_id: i64,
-            entry_id: i64,
-            name: String,
-        }
-        let claimed: Vec<Claimed> = {
+        let claimed: Vec<ClaimedNameJob> = {
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             let jobs = store.claim_extract_jobs_batch_for_kind(SEGMENT_KIND_NAME, EMBED_BATCH)?;
             let mut out = Vec::with_capacity(jobs.len());
             for job in jobs {
                 match store.get_entry(job.entry_id)? {
-                    Some(row) => out.push(Claimed {
+                    Some(row) => out.push(ClaimedNameJob {
                         job_id: job.id,
                         entry_id: job.entry_id,
                         name: row.name,
+                        mtime: row.mtime,
+                        job_priority: job.priority,
+                        attempts: job.attempts,
                     }),
                     None => {
                         // Entry vanished after enqueue (delete cascades the
@@ -656,45 +692,85 @@ impl Indexer {
             Err(e) => {
                 warn!(error = %e, batch = claimed.len(), "embed batch failed; releasing claims for retry");
                 let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                let mut failed = 0usize;
+                let mut poisoned = 0usize;
                 for c in &claimed {
                     // Best-effort: the entry may have been deleted mid-batch
                     // (cascade already removed the job → 0 rows touched).
-                    let _ = store.fail_extract_job(c.job_id);
+                    if Self::fail_job_capped(&mut store, c) {
+                        poisoned += 1;
+                    } else {
+                        failed += 1;
+                    }
                 }
                 return Ok(EmbedBatchOutcome {
                     claimed: claimed.len(),
                     embedded: 0,
-                    failed: claimed.len(),
+                    failed,
+                    requeued: 0,
+                    poisoned,
                 });
             }
         };
         if vecs.len() != claimed.len() {
             warn!(got = vecs.len(), want = claimed.len(), "embed arity mismatch; releasing batch for retry");
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut failed = 0usize;
+            let mut poisoned = 0usize;
             for c in &claimed {
-                let _ = store.fail_extract_job(c.job_id);
+                if Self::fail_job_capped(&mut store, c) {
+                    poisoned += 1;
+                } else {
+                    failed += 1;
+                }
             }
             return Ok(EmbedBatchOutcome {
                 claimed: claimed.len(),
                 embedded: 0,
-                failed: claimed.len(),
+                failed,
+                requeued: 0,
+                poisoned,
             });
         }
         let mut embedded = 0usize;
+        let mut failed = 0usize;
+        let mut requeued = 0usize;
+        let mut poisoned = 0usize;
         {
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             for (c, vec) in claimed.iter().zip(vecs.iter()) {
                 // The entry may have been deleted while embedding: then the
                 // job row is already gone via cascade; completing is a no-op.
-                if store.get_entry(c.entry_id)?.is_none() {
+                let fresh_entry = store.get_entry(c.entry_id)?;
+                let Some(fresh) = fresh_entry else {
                     let _ = store.complete_extract_job(c.job_id);
+                    continue;
+                };
+                // I2: the entry changed under our claimed batch (the
+                // concurrent write already bumped the job's priority via the
+                // `ON CONFLICT ... priority` path). Requeue the fresh data
+                // instead of upserting the stale vector and consuming the
+                // change signal. Attempts are untouched: churn is not failure.
+                let fresh_job = store.get_extract_job(c.job_id)?;
+                let changed = fresh.name != c.name
+                    || fresh.mtime != c.mtime
+                    || fresh_job
+                        .as_ref()
+                        .is_some_and(|j| j.priority != c.job_priority);
+                if changed {
+                    if fresh_job.is_some() {
+                        let _ = store.requeue_extract_job(c.job_id);
+                        requeued += 1;
+                    } else {
+                        let _ = store.complete_extract_job(c.job_id);
+                    }
                     continue;
                 }
                 match store.upsert_segment(NewSegment {
                     entry_id: c.entry_id,
                     kind: SEGMENT_KIND_NAME,
                     chunk_index: 0,
-                    text: &c.name,
+                    text: &fresh.name,
                     page: None,
                     start_ms: None,
                     end_ms: None,
@@ -707,17 +783,44 @@ impl Indexer {
                     }
                     Err(e) => {
                         warn!(job = c.job_id, error = %e, "segment upsert failed; releasing for retry");
-                        let _ = store.fail_extract_job(c.job_id);
+                        if Self::fail_job_capped(&mut store, c) {
+                            poisoned += 1;
+                        } else {
+                            failed += 1;
+                        }
                     }
                 }
             }
         }
-        let failed = claimed.len() - embedded;
         Ok(EmbedBatchOutcome {
             claimed: claimed.len(),
             embedded,
             failed,
+            requeued,
+            poisoned,
         })
+    }
+
+    /// Records one job failure under the poison-pill cap: at
+    /// [`MAX_EMBED_ATTEMPTS`] the job is `mark_extract_failed` (with a health
+    /// log carrying the entry) instead of requeued. Returns true when the job
+    /// was poisoned. Best-effort (vanished rows are no-ops).
+    fn fail_job_capped(store: &mut IndexStore, c: &ClaimedNameJob) -> bool {
+        if c.attempts + 1 >= MAX_EMBED_ATTEMPTS {
+            warn!(
+                job = c.job_id,
+                entry = c.entry_id,
+                name = %c.name,
+                attempts = c.attempts + 1,
+                "name job failing repeatedly; poison-pilled (failed, never auto-claimed)"
+            );
+            // Best-effort: a mid-batch delete cascades the row (0 rows).
+            let _ = store.mark_extract_failed(c.job_id);
+            true
+        } else {
+            let _ = store.fail_extract_job(c.job_id);
+            false
+        }
     }
 
     /// Production entry: one batch through the supervisor's bounded call
@@ -1345,11 +1448,125 @@ mod tests {
         assert!(out.claimed >= 1);
         assert_eq!(out.embedded, 0);
         assert_eq!(out.failed, out.claimed);
+        assert_eq!(out.poisoned, 0, "first failure must not poison");
         // Claims released: still pending, attempts bumped, embeddable after
         // the worker recovers.
+        let eid = entry_id_by_name(&indexer, "retry-me");
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let job = store.find_extract_job(eid, "name").unwrap().unwrap();
+            assert_eq!(job.attempts, 1);
+            assert_eq!(job.state, "pending");
+        }
         assert!(indexer.embed_queue_depth().unwrap() >= 1);
         let (embedded, _) = drain_embed_queue(&indexer);
         assert!(embedded >= 1);
+        assert_eq!(indexer.embed_queue_depth().unwrap(), 0);
+    }
+
+    #[test]
+    fn pipeline_attempt_cap_poisons_persistently_failing_job() {
+        // Fix round 1/5 (I1): a job failing MAX_EMBED_ATTEMPTS batches is
+        // poison-pilled (`failed`, never auto-claimed) with attempts recorded,
+        // so a persistently hung worker cannot spin the queue forever.
+        let tree = TempTree::new();
+        fs::write(tree.0.join("poison.txt"), b"x").unwrap();
+        let indexer = seeded(&tree);
+        let eid = entry_id_by_name(&indexer, "poison");
+        // Drain everything else first so only the poison target remains.
+        // (Two files max here: the target plus the root dir entry; keep the
+        // loop targeted by failing every batch — attempts accrue per job.)
+        for _ in 0..(MAX_EMBED_ATTEMPTS as usize + 2) {
+            let out = indexer
+                .embed_once_with(|_| Err("embed job timed out after 120s".to_string()))
+                .unwrap();
+            if out.claimed == 0 {
+                break;
+            }
+        }
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let job = store.find_extract_job(eid, "name").unwrap().unwrap();
+            assert_eq!(job.state, "failed", "job must be poison-pilled");
+            assert!(job.attempts >= MAX_EMBED_ATTEMPTS);
+        }
+        // Poisoned jobs are never auto-claimed: the scheduler idles on them.
+        let out = indexer.embed_once_with(fake_embed).unwrap();
+        assert_eq!(out.claimed, 0, "failed jobs must not be reclaimed");
+    }
+
+    #[test]
+    fn pipeline_mid_batch_change_requeues_instead_of_stale_upsert() {
+        // Fix round 1/5 (I2): a rename landing mid-batch must not be dropped —
+        // the stale vector is never upserted, the job requeues (attempts
+        // untouched), and the fresh name wins on the next batch.
+        use std::sync::atomic::{AtomicBool, Ordering as AO};
+        let tree = TempTree::new();
+        fs::write(tree.0.join("mid-batch.txt"), b"x").unwrap();
+        let indexer = seeded(&tree);
+        drain_embed_queue(&indexer);
+        let eid = entry_id_by_name(&indexer, "mid-batch");
+        let seg_v1_text = {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            store.list_segments_for_entry(eid).unwrap()[0].text.clone()
+        };
+        assert_eq!(seg_v1_text, "mid-batch.txt");
+
+        // Queue a re-embed (touch the file), then mutate DURING the embed:
+        // the fake performs a real on-disk rename + watcher event (which
+        // bumps the claimed row's priority) and returns vectors for the
+        // now-stale names. Closure borrows `indexer` shared — safe: the
+        // pipeline holds no store lock across the embed call.
+        fs::write(tree.0.join("mid-batch.txt"), b"longer contents here").unwrap();
+        let root_id = indexer.roots[0].id;
+        indexer.handle_event(root_id, WatchEvent::Modified(tree.0.join("mid-batch.txt")));
+        assert!(indexer.embed_queue_depth().unwrap() >= 1);
+
+        let mutated = AtomicBool::new(false);
+        let out = indexer
+            .embed_once_with(|texts| {
+                if !mutated.swap(true, AO::SeqCst) {
+                    let from = tree.0.join("mid-batch.txt");
+                    let to = tree.0.join("mid-batch-renamed.txt");
+                    fs::rename(&from, &to).unwrap();
+                    indexer.handle_event(root_id, WatchEvent::Renamed { from, to });
+                }
+                Ok(ws_embed_protocol::stub_embed_texts(
+                    texts,
+                    ws_embed_protocol::STUB_DIM,
+                ))
+            })
+            .unwrap();
+        assert!(out.claimed >= 1);
+        assert_eq!(out.embedded, 0, "stale vector must never be upserted");
+        assert_eq!(out.requeued, out.claimed, "changed jobs must requeue");
+        assert_eq!(out.failed, 0);
+        // No stale write: the segment still carries the pre-batch text, the
+        // job is pending again with attempts untouched (churn, not failure).
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let segs = store.list_segments_for_entry(eid).unwrap();
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0].text, seg_v1_text, "stale upsert must not land");
+            let job = store.find_extract_job(eid, "name").unwrap().unwrap();
+            assert_eq!(job.state, "pending");
+            assert_eq!(job.attempts, 0, "requeue must not bump attempts");
+        }
+        // Next batch embeds the fresh name and completes.
+        let out2 = indexer.embed_once_with(fake_embed).unwrap();
+        assert_eq!(out2.embedded, out.claimed);
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let segs = store.list_segments_for_entry(eid).unwrap();
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0].text, "mid-batch-renamed.txt");
+            let want = ws_embed_protocol::stub_vector(
+                "mid-batch-renamed.txt",
+                ws_embed_protocol::STUB_DIM,
+            );
+            let cos = ws_index::vectors::cosine_similarity(&segs[0].vector, &want);
+            assert!(cos > 0.99, "fresh vector must win, cosine {cos}");
+        }
         assert_eq!(indexer.embed_queue_depth().unwrap(), 0);
     }
 

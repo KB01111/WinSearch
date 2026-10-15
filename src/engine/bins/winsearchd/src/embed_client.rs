@@ -23,7 +23,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+use windows::Win32::System::IO::CancelSynchronousIo;
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenThread, THREAD_ALL_ACCESS,
+};
 use ws_embed_protocol::{
     EmbedErrorCode, EmbedRequest, EmbedResponse, EMBED_PROTOCOL_VERSION, MAX_TEXTS_PER_JOB,
 };
@@ -197,9 +201,20 @@ struct Slot {
 
 pub struct EmbedSupervisor {
     config: EmbedConfig,
-    /// Serializes whole requests: the worker sees one connection at a time.
+    /// Serializes whole requests on the legacy direct path (`transact`,
+    /// used by `embed_texts`/`ping`). The pipeline's bounded path
+    /// (`transact_bounded`) holds this only across ensure+connect+send —
+    /// never across the blocking reply read — so a hung worker cannot wedge
+    /// later batches behind a leaked holder.
     conn: Mutex<()>,
     slot: Mutex<Slot>,
+    /// Cancel registration for the single in-flight bounded read (if any):
+    /// `(os_thread_id, generation)`. The watchdog cancels exactly this
+    /// thread's synchronous pipe IO via `CancelSynchronousIo`, which unblocks
+    /// the helper even for foreign (unkillable-by-us) workers. Stale
+    /// generations are ignored so a recycled thread id is never cancelled.
+    inflight_tid: Mutex<Option<(u32, u64)>>,
+    cancel_seq: AtomicU64,
     next_id: AtomicU64,
     failures: AtomicU32,
     model_loaded: AtomicBool,
@@ -217,6 +232,8 @@ impl EmbedSupervisor {
             config,
             conn: Mutex::new(()),
             slot: Mutex::new(Slot { child: None }),
+            inflight_tid: Mutex::new(None),
+            cancel_seq: AtomicU64::new(1),
             next_id: AtomicU64::new(1),
             failures: AtomicU32::new(0),
             model_loaded: AtomicBool::new(false),
@@ -262,9 +279,15 @@ impl EmbedSupervisor {
 
     /// Kill our worker, if any, and forget it. The next request respawns.
     /// Test hook for the kill-mid-job test (and a future admin path).
+    /// Kill failures are logged explicitly (a wedged child that refuses to
+    /// die must be visible; the watchdog path depends on this break).
     pub fn terminate_worker(&self) {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        kill_locked(&mut slot);
+        match kill_locked(&mut slot) {
+            Ok(true) => info!("embed worker killed"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "embed worker kill failed"),
+        }
     }
 
     /// Embed texts, one job per [`MAX_TEXTS_PER_JOB`] chunk, in order.
@@ -324,15 +347,27 @@ impl EmbedSupervisor {
         Ok(all)
     }
 
-    /// Bounded [`Self::embed_texts`] for the semantic pipeline (Task2-I1).
+    /// Bounded embed path for the semantic pipeline (Task2-I1, fix round
+    /// 1/5: leak-free watchdog).
     ///
     /// Runs the whole call on a helper thread and waits `timeout`
     /// ([`EMBED_JOB_TIMEOUT`] in production). A hung worker — handshake done
     /// but no `embeddings` answer — surfaces as `Transport("... timed out
-    /// after ...")` instead of stalling the scheduler thread forever. On
-    /// timeout the owned child (if any) is killed to break the hung pipe IO;
-    /// the helper thread then unblocks with `Transport` and its late send is
-    /// dropped. Takes `Arc<Self>` so the helper thread owns a share.
+    /// after ...")` instead of stalling the scheduler thread forever.
+    /// Takes `Arc<Self>` so the helper thread owns a share.
+    ///
+    /// Leak-free guarantees (fix round 1/5):
+    /// - The helper uses [`Self::transact_bounded`], which holds the
+    ///   supervisor `conn` mutex only across ensure+connect+handshake+send
+    ///   and releases it before the blocking reply read. A timed-out helper
+    ///   therefore never wedges later batches behind a leaked `conn` holder.
+    /// - Before the blocking read the helper registers its OS thread id;
+    ///   the watchdog cancels exactly that thread's synchronous pipe IO via
+    ///   `CancelSynchronousIo`, so the helper unblocks even for foreign
+    ///   (unkillable-by-us) workers. Stale generations are ignored, so a
+    ///   recycled thread id is never cancelled.
+    /// - On timeout the owned child (if any) is still killed to break the
+    ///   hung pipe IO, with kill failures logged explicitly.
     ///
     /// `std::thread`-only (no async): one helper thread + `mpsc::recv_timeout`.
     pub fn embed_texts_bounded(
@@ -341,23 +376,34 @@ impl EmbedSupervisor {
         timeout: Duration,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
         use std::sync::mpsc;
+        if texts.is_empty() {
+            return Err(EmbedError::InvalidRequest(
+                "cannot embed an empty batch".into(),
+            ));
+        }
         let sup = std::sync::Arc::clone(self);
         let owned: Vec<String> = texts.to_vec();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel2 = std::sync::Arc::clone(&cancel);
+        let deadline = Instant::now() + timeout;
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("winsearch-embed-bounded".into())
             .spawn(move || {
-                let r = sup.embed_texts(&owned);
+                let r = sup.embed_texts_cancelable(&owned, &cancel2, deadline);
                 let _ = tx.send(r);
             })
             .map_err(|e| EmbedError::Transport(format!("cannot spawn embed helper: {e}")))?;
         match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Break the hung IO so the helper unblocks; its late result
-                // is dropped with the (now disconnected) sender.
+                // Stop the helper promptly: flag it (phase-A loops poll the
+                // flag) and cancel its in-flight synchronous read, then break
+                // the hung pipe by killing the owned child (if any).
+                cancel.store(true, Ordering::Relaxed);
+                self.cancel_inflight_read();
                 self.terminate_worker();
-                warn!("embed job timed out after {timeout:?}; worker killed, batch fails for retry");
+                warn!("embed job timed out after {timeout:?}; helper cancelled, batch fails for retry");
                 Err(EmbedError::Transport(format!(
                     "embed job timed out after {timeout:?}"
                 )))
@@ -366,6 +412,65 @@ impl EmbedSupervisor {
                 "embed helper died before answering".into(),
             )),
         }
+    }
+
+    /// Helper body for [`Self::embed_texts_bounded`]: like [`Self::embed_texts`]
+    /// (one job per chunk, exactly one restart+retry on transport failure) but
+    /// every job goes through [`Self::transact_bounded`], which never holds
+    /// `conn` across the blocking read and honors `cancel`/`deadline`.
+    fn embed_texts_cancelable(
+        &self,
+        texts: &[String],
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut all = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(MAX_TEXTS_PER_JOB) {
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(EmbedError::Transport("embed job cancelled".into()));
+            }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let req = EmbedRequest::EmbedTexts {
+                id,
+                texts: chunk.to_vec(),
+            };
+            match self.transact_bounded(req, cancel, deadline) {
+                Ok(EmbedResponse::Embeddings { vecs, .. }) => {
+                    self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
+                    all.extend(vecs);
+                }
+                Ok(other) => {
+                    return Err(EmbedError::Protocol(format!(
+                        "unexpected reply to embed_texts: {}",
+                        response_kind(&other)
+                    )));
+                }
+                Err(EmbedError::Transport(_)) => {
+                    self.stats.lock().unwrap_or_else(|p| p.into_inner()).retries += 1;
+                    info!("embed job interrupted; restarting worker and retrying once");
+                    let retry_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                    let retry = EmbedRequest::EmbedTexts {
+                        id: retry_id,
+                        texts: chunk.to_vec(),
+                    };
+                    match self.transact_bounded_after_restart(retry, cancel, deadline) {
+                        Ok(EmbedResponse::Embeddings { vecs, .. }) => {
+                            self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
+                            all.extend(vecs);
+                        }
+                        Ok(other) => {
+                            return Err(EmbedError::Protocol(format!(
+                                "unexpected reply to retried embed_texts: {}",
+                                response_kind(&other)
+                            )));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(all)
     }
 
     /// Health ping: handshake + `status` round-trip, spawning the worker if
@@ -434,7 +539,9 @@ impl EmbedSupervisor {
         let _conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-            kill_locked(&mut slot);
+            if let Err(e) = kill_locked(&mut slot) {
+                debug!(error = %e, "restart-path kill of presumed-dead child failed");
+            }
         }
         {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
@@ -514,6 +621,14 @@ impl EmbedSupervisor {
     /// the job, read the reply. Any IO/EOF problem is `Transport` (retryable);
     /// worker `Error` answers are definitive.
     fn round_trip(&self, req: &EmbedRequest) -> Result<EmbedResponse, EmbedError> {
+        let mut stream = self.connect_and_send(req)?;
+        Self::read_reply(&mut stream)
+    }
+
+    /// Phase A of a round trip: ensure a worker, connect, handshake, send.
+    /// Callers that hold `conn` across this must release it before the
+    /// blocking reply read (see `transact_bounded`).
+    fn connect_and_send(&self, req: &EmbedRequest) -> Result<PipeStream, EmbedError> {
         let mut stream = connect_with_retry(&self.config.pipe_name)?;
         let hello = EmbedRequest::Hello {
             protocol_version: EMBED_PROTOCOL_VERSION,
@@ -554,14 +669,163 @@ impl EmbedSupervisor {
             }
         }
         write_message(&mut stream, req).map_err(EmbedError::transport)?;
+        Ok(stream)
+    }
+
+    /// Phase B of a round trip: blocking read of the reply on an already-sent
+    /// stream. Never called with `conn` held on the bounded path.
+    fn read_reply(stream: &mut PipeStream) -> Result<EmbedResponse, EmbedError> {
         let reply: Option<EmbedResponse> =
-            read_message(&mut stream).map_err(EmbedError::transport)?;
+            read_message(stream).map_err(EmbedError::transport)?;
         match reply {
             Some(EmbedResponse::Error { code, message, .. }) => {
                 Err(EmbedError::from_worker(code, message))
             }
             Some(resp) => Ok(resp),
             None => Err(EmbedError::Transport("worker closed mid-job".into())),
+        }
+    }
+
+    /// Bounded single attempt: `conn` is held only across ensure + phase A
+    /// (connect/handshake/send, all internally bounded); the blocking reply
+    /// read runs WITHOUT `conn`, registered for watchdog cancellation, so a
+    /// hung worker never wedges later batches behind a leaked holder.
+    fn transact_bounded(
+        &self,
+        req: EmbedRequest,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<EmbedResponse, EmbedError> {
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(EmbedError::Transport("embed job cancelled".into()));
+        }
+        let mut stream = {
+            let _conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            {
+                let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                self.ensure_worker_locked(&mut slot)?;
+            }
+            self.connect_and_send(&req)?
+        };
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(EmbedError::Transport("embed job cancelled".into()));
+        }
+        let gen = self.register_inflight();
+        let out = match Self::read_reply(&mut stream) {
+            Ok(resp) => {
+                self.failures.store(0, Ordering::Relaxed);
+                Ok(resp)
+            }
+            Err(e) => {
+                if matches!(e, EmbedError::Transport(_)) {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        };
+        self.unregister_inflight(gen);
+        out
+    }
+
+    /// Bounded restart path: kill + ensure + send under `conn`, read outside
+    /// it (same leak-free shape as [`Self::transact_bounded`]). Used exactly
+    /// once per job after a transport failure.
+    fn transact_bounded_after_restart(
+        &self,
+        req: EmbedRequest,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<EmbedResponse, EmbedError> {
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(EmbedError::Transport("embed job cancelled".into()));
+        }
+        let mut stream = {
+            let _conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            {
+                let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = kill_locked(&mut slot) {
+                    debug!(error = %e, "bounded-restart kill of presumed-dead child failed");
+                }
+            }
+            {
+                let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                self.ensure_worker_locked(&mut slot)?;
+            }
+            self.connect_and_send(&req)?
+        };
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(EmbedError::Transport("embed job cancelled".into()));
+        }
+        let gen = self.register_inflight();
+        let out = match Self::read_reply(&mut stream) {
+            Ok(resp) => {
+                self.failures.store(0, Ordering::Relaxed);
+                Ok(resp)
+            }
+            Err(e) => {
+                if matches!(e, EmbedError::Transport(_)) {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        };
+        self.unregister_inflight(gen);
+        out
+    }
+
+    /// Registers the calling thread for watchdog cancellation of its in-flight
+    /// synchronous pipe read. Returns this registration's generation.
+    fn register_inflight(&self) -> u64 {
+        let gen = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
+        // `GetCurrentThreadId` is infallible and identifies this helper
+        // thread to `cancel_inflight_read` below.
+        let tid = unsafe { GetCurrentThreadId() };
+        *self.inflight_tid.lock().unwrap_or_else(|p| p.into_inner()) = Some((tid, gen));
+        gen
+    }
+
+    /// Clears our cancel registration (normal completion path). Only clears
+    /// when the generation still matches, so a late completion never erases a
+    /// newer registration.
+    fn unregister_inflight(&self, gen: u64) {
+        let mut guard = self.inflight_tid.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_some_and(|(_, g)| g == gen) {
+            *guard = None;
+        }
+    }
+
+    /// Watchdog: cancel the registered helper thread's synchronous pipe IO.
+    /// Takes (and clears) the registration so a recycled thread id is never
+    /// cancelled; every failure mode is logged explicitly. A no-op when no
+    /// read is registered (helper already finished or still in phase A).
+    fn cancel_inflight_read(&self) {
+        let reg: Option<(u32, u64)> = self
+            .inflight_tid
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let Some((tid, gen)) = reg else {
+            debug!("watchdog: no in-flight read registered; helper already settled");
+            return;
+        };
+        unsafe {
+            match OpenThread(THREAD_ALL_ACCESS, false, tid) {
+                Ok(handle) => {
+                    if let Err(e) = CancelSynchronousIo(handle) {
+                        warn!(tid, gen, error = %e, "watchdog: CancelSynchronousIo failed");
+                    } else {
+                        info!(tid, gen, "watchdog: cancelled hung pipe read");
+                    }
+                    if let Err(e) = windows::Win32::Foundation::CloseHandle(handle) {
+                        warn!(tid, gen, error = %e, "watchdog: CloseHandle(thread) failed");
+                    }
+                }
+                Err(e) => {
+                    // The helper already exited (id recycled or gone): nothing
+                    // to cancel; its result path already settled.
+                    debug!(tid, gen, error = %e, "watchdog: OpenThread failed, helper gone");
+                }
+            }
         }
     }
 }
@@ -666,11 +930,16 @@ impl EmbedSupervisor {
     }
 }
 
-fn kill_locked(slot: &mut Slot) {
+/// Kills the owned child (if any) and forgets it. Returns `Ok(true)` when a
+/// child was reaped, `Ok(false)` when there was nothing to kill. Kill/wait
+/// failures are returned (never swallowed) so watchdogs can log them.
+fn kill_locked(slot: &mut Slot) -> std::io::Result<bool> {
     if let Some(mut child) = slot.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill()?;
+        child.wait()?;
+        return Ok(true);
     }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -699,6 +968,9 @@ mod tests {
         /// Handshake then never answer the job (hung worker): the client
         /// blocks on the reply until the pipeline watchdog fires.
         Hang,
+        /// First job connection hangs (watchdog must fire and free `conn`
+        /// for the next batch); later ones serve stub vectors immediately.
+        HangFirst,
     }
 
     static PIPE_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -712,6 +984,8 @@ mod tests {
             let name2 = pipe_name.clone();
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped2 = Arc::clone(&dropped);
+            let hung = Arc::new(AtomicBool::new(false));
+            let hung2 = Arc::clone(&hung);
             let thread = std::thread::Builder::new()
                 .name("fake-embed-worker".into())
                 .spawn(move || {
@@ -755,6 +1029,16 @@ mod tests {
                                         // Hung worker: sleep past any test
                                         // watchdog, then close without
                                         // answering (client must time out).
+                                        let _ = id;
+                                        std::thread::sleep(Duration::from_secs(30));
+                                    }
+                                    Mode::HangFirst
+                                        if !hung2.swap(true, AtomicOrdering::SeqCst) =>
+                                    {
+                                        // First job hangs past the watchdog;
+                                        // later jobs serve immediately, so a
+                                        // second bounded batch must proceed
+                                        // while the first is still stuck.
                                         let _ = id;
                                         std::thread::sleep(Duration::from_secs(30));
                                     }
@@ -950,6 +1234,52 @@ mod tests {
         // The job reached the worker (it is hanging on it); the watchdog, not
         // a successful reply, ended the call.
         assert_eq!(fake.jobs_seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounded_second_batch_proceeds_while_first_hangs() {
+        // Fix round 1/5 (I1): the timed-out helper must not hold `conn`
+        // across its blocked read — a second bounded batch starts and
+        // completes while the first is still stuck, and the watchdog cancels
+        // the first helper's IO (no leaked holder wedges the pipeline).
+        let fake = FakeWorker::start(Mode::HangFirst);
+        let sup = Arc::new(test_supervisor(fake.pipe_name.clone()));
+
+        let sup2 = Arc::clone(&sup);
+        let first = std::thread::Builder::new()
+            .name("test-first-hung-batch".into())
+            .spawn(move || {
+                sup2.embed_texts_bounded(
+                    &["hung batch".to_string()],
+                    Duration::from_millis(800),
+                )
+            })
+            .unwrap();
+        // Let the first batch get through its handshake+send and block in the
+        // reply read (phase A is ms; the hang is 30 s).
+        std::thread::sleep(Duration::from_millis(1500));
+
+        let start = Instant::now();
+        let vecs = sup
+            .embed_texts_bounded(&["second batch".to_string()], Duration::from_secs(20))
+            .expect("second batch must proceed while the first hangs");
+        let elapsed = start.elapsed();
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(
+            vecs[0],
+            ws_embed_protocol::stub_vector("second batch", ws_embed_protocol::STUB_DIM)
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "second batch stalled behind the hung first batch for {elapsed:?}"
+        );
+
+        let err = first.join().expect("helper thread panicked").unwrap_err();
+        assert!(
+            matches!(err, EmbedError::Transport(ref msg) if msg.contains("timed out")),
+            "first batch must fail via the watchdog, got {err:?}"
+        );
+        assert_eq!(fake.jobs_seen.lock().unwrap().len(), 2);
     }
 
     #[test]

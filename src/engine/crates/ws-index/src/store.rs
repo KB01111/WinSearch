@@ -1066,6 +1066,35 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Releases a claim WITHOUT recording a failure (mid-batch change path:
+    /// the entry changed under a claimed batch, so the fresh data — already
+    /// re-enqueued with its priority bump — embeds next batch; attempts is
+    /// untouched so a rapidly-changing file is never poisoned as "failing").
+    pub fn requeue_extract_job(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE extract_jobs SET claimed = 0, state = 'pending' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Looks up one `(entry_id, kind)` job (poison-pill inspection, tests).
+    pub fn find_extract_job(
+        &self,
+        entry_id: i64,
+        kind: &str,
+    ) -> Result<Option<ExtractJob>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, entry_id, kind, state, claimed, attempts, priority
+                 FROM extract_jobs WHERE entry_id = ?1 AND kind = ?2",
+                params![entry_id, kind],
+                map_extract_job_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Records a permanent failure (kept for inspection, never auto-claimed).
     pub fn mark_extract_failed(&mut self, id: i64) -> Result<(), StoreError> {
         self.conn.execute(

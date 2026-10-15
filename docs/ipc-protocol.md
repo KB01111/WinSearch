@@ -117,9 +117,13 @@ per scheduler round-trip through the supervisor's bounded call; larger
 chunk. The `extract_jobs` claim order is `priority DESC, id DESC` (new files
 first, LIFO within priority). Every scheduler batch is bounded by
 **`EMBED_JOB_TIMEOUT` = 120 s** (`embed_texts_bounded`: helper thread +
-`recv_timeout`; timeout kills the owned worker to break hung pipe IO and
-fails the batch as `Transport` so claims release for retry instead of
-stalling the scheduler).
+`recv_timeout`, `conn` held only across ensure+connect+send; on timeout the
+watchdog cancels the helper's registered pipe read and kills the owned
+worker, failing the batch as `Transport` so claims release for retry instead
+of stalling the scheduler). Batch failures increment attempts; at
+**5 attempts** the job is poison-pilled (`failed`, never auto-claimed). A
+mid-batch entry change requeues the fresh data (attempts untouched) instead
+of upserting a stale vector.
 
 | direction | `type` | fields | description |
 |---|---|---|---|

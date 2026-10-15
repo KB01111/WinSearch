@@ -91,9 +91,18 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
   within priority). One scheduler thread (`winsearch-embed-sched`) drains the
   queue in batches of 128 names through the supervisor's bounded call
   (**120 s** job-IO watchdog: a hung worker fails the batch as `Transport`,
-  claims are released for retry, the scheduler never stalls). Results upsert
+  claims are released for retry, the scheduler never stalls). The bounded
+  path holds the supervisor `conn` mutex only across ensure+connect+send and
+  releases it before the blocking reply read, so a timed-out helper never
+  wedges later batches; the watchdog cancels the stuck helper's synchronous
+  pipe IO (`CancelSynchronousIo` on exactly the registered thread) even for
+  foreign workers, with owned-child kill failures logged. Results upsert
   `segments(kind='name', chunk 0)` idempotently (stable id, replace prior
-  vector). Deletes cascade via FK (`sweep`/`remove_tree`); claims left by a
+  vector). After each embed the entry is re-resolved under lock and a
+  mid-batch change (name/`mtime`/priority mismatch) requeues the fresh data
+  instead of upserting a stale vector. Batch failures increment attempts;
+  at **5 attempts** the job is poison-pilled (`failed`, never auto-claimed)
+  with a health log. Deletes cascade via FK (`sweep`/`remove_tree`); claims left by a
   crash are released on open (`release_extract_claims`). A model swap
   (`check_compat == Incompatible`) purges `segments(kind='name')` and
   requeues one name job per entry at startup.
@@ -116,8 +125,11 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
   Definitive worker errors are never retried. Links no native inference code.
   The pipeline never calls `embed_texts` directly: `embed_texts_bounded`
   (helper thread + `recv_timeout`, **`EMBED_JOB_TIMEOUT` = 120 s**) bounds
-  every scheduler batch; on timeout the owned child is killed to break the
-  hung pipe IO and the batch fails for retry.
+  every scheduler batch; the bounded transaction holds `conn` only across
+  ensure+connect+handshake+send and reads the reply without it, and on
+  timeout the watchdog cancels the helper's registered pipe read
+  (`CancelSynchronousIo`) plus kills the owned child (kill failures logged),
+  so the batch fails for retry with no leaked holder and no stuck thread.
 
 ### `winsearch-embed` (bins/winsearch-embed) + `ws-embed-protocol`
 
