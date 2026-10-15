@@ -265,7 +265,7 @@ public sealed class ModelStatus
     public ulong TotalBytes { get; set; }
     public string? Error { get; set; }
 
-    /// <summary>Fraction downloaded in [0, 1]; 1 when the total is unknown-but-complete.</summary>
+    /// <summary>Fraction downloaded in [0, 1]; 0.0 when <see cref="TotalBytes"/> is zero.</summary>
     public double Fraction => TotalBytes == 0 ? 0 : (double)Bytes / TotalBytes;
 }
 

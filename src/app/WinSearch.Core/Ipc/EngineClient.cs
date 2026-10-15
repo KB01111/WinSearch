@@ -159,6 +159,7 @@ public sealed class EngineClient : IEngineClient
                 ErrorCode.ProtocolVersionMismatch,
                 $"engine speaks protocol v{ack.ProtocolVersion}, client speaks v{ProtocolJson.Version}");
         }
+        Reconnected?.Invoke(this, EventArgs.Empty);
         return ack;
     }
 
@@ -471,7 +472,6 @@ public sealed class EngineClient : IEngineClient
             {
                 await Task.Delay(500);
                 await ConnectAsync(_lifetime.Token);
-                Reconnected?.Invoke(this, EventArgs.Empty);
                 return;
             }
             catch (OperationCanceledException)

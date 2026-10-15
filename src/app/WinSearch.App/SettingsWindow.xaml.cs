@@ -250,11 +250,7 @@ internal sealed partial class SettingsWindow : Window
         var file = await picker.PickSingleFileAsync();
         if (file is not null && !string.IsNullOrWhiteSpace(file.Path))
         {
-            // Importing from the containing directory lets ModelManager import
-            // both GGUF files if present, or the single selected file.
-            var parentDir = Path.GetDirectoryName(file.Path);
-            var importTarget = !string.IsNullOrWhiteSpace(parentDir) ? parentDir : file.Path;
-            await _viewModel.ImportModelFromPathAsync(importTarget);
+            await _viewModel.ImportModelFromPathAsync(file.Path);
         }
     }
 

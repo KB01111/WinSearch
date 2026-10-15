@@ -216,30 +216,97 @@ fn detect_cell_language(
         let t = first_line.trim();
         if let Some(magic) = t.strip_prefix("%%") {
             let magic_cmd = magic.split_whitespace().next().unwrap_or("");
-            if !magic_cmd.is_empty() {
-                return normalize_lang(magic_cmd);
+            if let Some(lang) = detect_cell_magic_language(magic_cmd) {
+                return lang;
             }
         }
     }
     default_lang.to_string()
 }
 
+fn detect_cell_magic_language(magic_cmd: &str) -> Option<String> {
+    let lower = magic_cmd.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "python" | "python2" | "python3" | "py" | "pypy" | "r" | "ruby" | "perl" | "sh"
+        | "bash" | "zsh" | "sql" | "html" | "svg" | "js" | "javascript" | "ts"
+        | "typescript" | "rust" | "c" | "cpp" | "c++" | "cython" | "go" | "java"
+        | "scala" | "julia" | "lua" | "markdown" | "md" | "latex" | "tex" => {
+            Some(normalize_lang(&lower))
+        }
+        _ => None,
+    }
+}
+
 fn normalize_lang(raw: &str) -> String {
     let lower = raw.trim().to_ascii_lowercase();
     match lower.as_str() {
-        "py" | "python" | "python3" | "ipython" => "python".into(),
+        "py" | "python" | "python2" | "python3" | "pypy" | "ipython" => "python".into(),
         "rs" | "rust" | "evcxr" => "rust".into(),
         "js" | "javascript" | "node" => "javascript".into(),
         "ts" | "typescript" | "deno" => "typescript".into(),
-        "sh" | "bash" | "shell" => "bash".into(),
+        "sh" | "bash" | "zsh" | "shell" => "bash".into(),
         "ps1" | "pwsh" | "powershell" => "powershell".into(),
         "c#" | "csharp" | "dotnet-csharp" => "csharp".into(),
         "c++" | "cpp" => "cpp".into(),
         "sql" => "sql".into(),
-        "html" => "html".into(),
+        "html" | "svg" => "html".into(),
         "css" => "css".into(),
         "ruby" | "rb" => "ruby".into(),
         "go" | "golang" => "go".into(),
+        "markdown" | "md" => "markdown".into(),
+        "latex" | "tex" => "latex".into(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SymbolRole;
+
+    #[test]
+    fn non_language_cell_magics_preserve_default_notebook_language() {
+        let raw_ipynb = r##"{
+  "metadata": {
+    "language_info": { "name": "python" }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "source": [
+        "%%time\n",
+        "def timed_worker(x):\n",
+        "    return run_step(x)\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "%%capture\n",
+        "def captured_worker(y):\n",
+        "    return y\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "%%sql\n",
+        "CREATE TABLE metrics (id INT);\n"
+      ]
+    }
+  ]
+}"##;
+
+        let nb = parse_notebook(raw_ipynb).unwrap();
+        assert_eq!(nb.cells.len(), 3);
+        assert_eq!(nb.cells[0].language, "python");
+        assert_eq!(nb.cells[1].language, "python");
+        assert_eq!(nb.cells[2].language, "sql");
+        assert!(nb.parsed.symbols.iter().any(|s| {
+            s.name == "timed_worker" && s.role == SymbolRole::Definition
+        }));
+        assert!(nb.parsed.symbols.iter().any(|s| {
+            s.name == "captured_worker" && s.role == SymbolRole::Definition
+        }));
     }
 }

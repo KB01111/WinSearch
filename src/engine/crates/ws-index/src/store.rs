@@ -164,7 +164,6 @@ CREATE TABLE IF NOT EXISTS extract_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_entry ON extract_jobs(entry_id);
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_state ON extract_jobs(state, claimed);
-CREATE INDEX IF NOT EXISTS idx_extract_jobs_priority ON extract_jobs(state, claimed, priority, id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
     entry_id UNINDEXED,
@@ -214,20 +213,12 @@ impl IndexStore {
         conn.execute_batch(SCHEMA_CONFIG)?;
         // Additive migration for pre-priority v2 files: v2 DBs created before
         // the `priority` column gain it here (fresh DBs already have it from
-        // SCHEMA_V2 above). `schema_version` stays "2": the column is a
-        // queue-ordering hint, not a format break.
-        {
-            let cols: Vec<String> = conn
-                .prepare("PRAGMA table_info(extract_jobs)")?
-                .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<Result<_, _>>()?;
-            if !cols.iter().any(|c| c == "priority") {
-                conn.execute(
-                    "ALTER TABLE extract_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-        }
+        // SCHEMA_V2 above) BEFORE creating the priority index. `schema_version`
+        // stays "2": the column is a queue-ordering hint, not a format break.
+        Self::ensure_extract_jobs_priority_column(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_extract_jobs_priority ON extract_jobs(state, claimed, priority, id);",
+        )?;
         {
             let entry_cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(entries)")?
@@ -276,6 +267,20 @@ impl IndexStore {
             |r| r.get(0),
         )?;
         Ok(v)
+    }
+
+    fn ensure_extract_jobs_priority_column(conn: &Connection) -> Result<(), StoreError> {
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(extract_jobs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        if !cols.iter().any(|c| c == "priority") {
+            conn.execute(
+                "ALTER TABLE extract_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     // ---- roots ----
@@ -355,6 +360,30 @@ impl IndexStore {
         Ok(n as u64)
     }
 
+    /// Stamps `scan_generation` onto `dir_path` and all of its indexed
+    /// descendants under `root_id` so a transient directory scan failure (e.g.
+    /// `PermissionDenied`) does not cause [`Self::sweep_generation`] to delete
+    /// previously indexed children.
+    pub fn touch_subtree_generation(
+        &mut self,
+        root_id: i64,
+        dir_path: &str,
+        scan_generation: i64,
+    ) -> Result<u64, StoreError> {
+        let prefix = dir_path.trim_end_matches(['\\', '/']);
+        let prefix_len = prefix.chars().count() as i64;
+        let n = self.conn.execute(
+            "UPDATE entries SET scan_generation = ?3
+             WHERE root_id = ?1
+               AND (path = ?2
+                    OR (length(path) > ?5
+                        AND substr(path, 1, ?5) = ?4
+                        AND substr(path, ?5 + 1, 1) IN ('\\', '/')))",
+            params![root_id, dir_path, scan_generation, prefix, prefix_len],
+        )?;
+        Ok(n as u64)
+    }
+
     // ---- entries ----
 
     /// Upserts a batch of entries in one transaction. `scan_generation` is
@@ -369,7 +398,10 @@ impl IndexStore {
         let tx = self.conn.transaction()?;
         let mut outcomes = Vec::with_capacity(records.len());
         {
-            let mut select = tx.prepare_cached("SELECT id, size, mtime, name_lower FROM entries WHERE path = ?1")?;
+            let mut select = tx.prepare_cached(
+                "SELECT id, size, mtime, name_lower, is_app, app_target, name, root_id, scan_generation
+                 FROM entries WHERE path = ?1",
+            )?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO entries(root_id, parent_id, path, name, name_lower, ext, is_dir,
                                      size, mtime, volume_serial, file_id, is_app, app_target,
@@ -377,9 +409,9 @@ impl IndexStore {
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14)",
             )?;
             let mut update = tx.prepare_cached(
-                "UPDATE entries SET parent_id=?2, name=?3, name_lower=?4, ext=?5, is_dir=?6,
-                                    size=?7, mtime=?8, volume_serial=?9, file_id=?10, is_app=?11,
-                                    app_target=?12, missing=0, scan_generation=?13
+                "UPDATE entries SET root_id=?2, parent_id=?3, name=?4, name_lower=?5, ext=?6,
+                                    is_dir=?7, size=?8, mtime=?9, volume_serial=?10, file_id=?11,
+                                    is_app=?12, app_target=?13, missing=0, scan_generation=?14
                  WHERE id=?1",
             )?;
             let mut fts_insert = tx.prepare_cached(
@@ -395,47 +427,111 @@ impl IndexStore {
             for rec in records {
                 let name_lower = rec.name.to_lowercase();
                 let keywords = fts_keywords(rec);
-                let existing: Option<(i64, i64, i64, String)> = select
-                    .query_row(params![rec.path], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                    })
-                    .optional()?;
+                let existing: Option<(i64, i64, i64, String, bool, String, String, i64, i64)> =
+                    select
+                        .query_row(params![rec.path], |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get::<_, i64>(4)? != 0,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                            ))
+                        })
+                        .optional()?;
 
                 match existing {
-                    Some((id, size, mtime, old_name_lower))
-                        if size == rec.size as i64
-                            && mtime == rec.mtime
-                            && old_name_lower == name_lower =>
-                    {
-                        // Unchanged: keep it alive for the sweep and clear a
-                        // stale missing flag (the row was seen on disk).
-                        tx.execute(
-                            "UPDATE entries SET scan_generation = ?2, missing = 0 WHERE id = ?1",
-                            params![id, scan_generation],
-                        )?;
-                        outcomes.push(UpsertOutcome::Unchanged);
-                    }
-                    Some((id, ..)) => {
-                        update.execute(params![
-                            id,
-                            rec.parent_id,
-                            rec.name,
-                            name_lower,
-                            rec.ext,
-                            rec.is_dir as i64,
-                            rec.size as i64,
-                            rec.mtime,
-                            rec.volume_serial as i64,
-                            rec.file_id as i64,
-                            rec.is_app as i64,
-                            rec.app_target,
-                            scan_generation,
-                        ])?;
-                        fts_delete.execute(params![id])?;
-                        fts_insert.execute(params![id, rec.name, keywords])?;
-                        tri_delete.execute(params![id])?;
-                        tri_insert.execute(params![id, name_lower])?;
-                        outcomes.push(UpsertOutcome::Updated);
+                    Some((
+                        id,
+                        existing_size,
+                        existing_mtime,
+                        existing_name_lower,
+                        existing_is_app,
+                        existing_app_target,
+                        existing_name,
+                        existing_root_id,
+                        existing_scan_gen,
+                    )) => {
+                        let preserve_app = existing_is_app && !rec.is_app;
+                        let eff_is_app = if preserve_app { true } else { rec.is_app };
+                        let eff_app_target = if preserve_app {
+                            existing_app_target.as_str()
+                        } else {
+                            rec.app_target.as_str()
+                        };
+                        let eff_name = if preserve_app {
+                            existing_name.as_str()
+                        } else {
+                            rec.name.as_str()
+                        };
+                        let eff_name_lower = if preserve_app {
+                            existing_name_lower.as_str()
+                        } else {
+                            name_lower.as_str()
+                        };
+                        let eff_size = if rec.is_app && rec.size == 0 {
+                            existing_size
+                        } else {
+                            rec.size as i64
+                        };
+                        let eff_mtime = if rec.is_app && rec.mtime == 0 {
+                            existing_mtime
+                        } else {
+                            rec.mtime
+                        };
+                        let eff_root_id = if preserve_app {
+                            existing_root_id
+                        } else {
+                            root_id
+                        };
+                        let eff_scan_gen = if preserve_app && existing_root_id != root_id {
+                            existing_scan_gen
+                        } else {
+                            scan_generation
+                        };
+
+                        if existing_size == eff_size
+                            && existing_mtime == eff_mtime
+                            && existing_name_lower == eff_name_lower
+                            && existing_is_app == eff_is_app
+                            && existing_app_target == eff_app_target
+                        {
+                            // Unchanged: keep it alive for the sweep and clear a
+                            // stale missing flag (the row was seen on disk).
+                            tx.execute(
+                                "UPDATE entries SET root_id = ?2, scan_generation = ?3, missing = 0 WHERE id = ?1",
+                                params![id, eff_root_id, eff_scan_gen],
+                            )?;
+                            outcomes.push(UpsertOutcome::Unchanged);
+                        } else {
+                            update.execute(params![
+                                id,
+                                eff_root_id,
+                                rec.parent_id,
+                                eff_name,
+                                eff_name_lower,
+                                rec.ext,
+                                rec.is_dir as i64,
+                                eff_size,
+                                eff_mtime,
+                                rec.volume_serial as i64,
+                                rec.file_id as i64,
+                                eff_is_app as i64,
+                                eff_app_target,
+                                eff_scan_gen,
+                            ])?;
+                            if !preserve_app {
+                                fts_delete.execute(params![id])?;
+                                fts_insert.execute(params![id, eff_name, keywords])?;
+                                tri_delete.execute(params![id])?;
+                                tri_insert.execute(params![id, eff_name_lower])?;
+                            }
+                            outcomes.push(UpsertOutcome::Updated);
+                        }
                     }
                     None => {
                         insert.execute(params![
@@ -644,19 +740,60 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Rewrites descendant paths after a directory rename. The renamed row
-    /// itself is moved via [`Self::move_entry`]; only subtree paths change
-    /// here (names are untouched).
+    /// Rewrites descendant paths and FTS keywords after a directory rename.
+    /// The renamed row itself is moved via [`Self::move_entry`]; only subtree
+    /// paths and path-derived keywords change here (names are untouched).
     pub fn rename_tree_paths(&mut self, old_prefix: &str, new_prefix: &str) -> Result<u64, StoreError> {
         let old_len = old_prefix.chars().count() as i64;
-        let n = self.conn.execute(
-            "UPDATE entries SET path = ?1 || substr(path, ?3 + 1)
-             WHERE length(path) > ?3
-               AND substr(path, 1, ?3) = ?2
-               AND substr(path, ?3 + 1, 1) IN ('\\', '/')",
-            params![new_prefix, old_prefix, old_len],
-        )?;
-        Ok(n as u64)
+        let tx = self.conn.transaction()?;
+        let descendants: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, ext, app_target, (?1 || substr(path, ?3 + 1)) AS new_path
+                 FROM entries
+                 WHERE length(path) > ?3
+                   AND substr(path, 1, ?3) = ?2
+                   AND substr(path, ?3 + 1, 1) IN ('\\', '/')",
+            )?;
+            let rows = stmt.query_map(params![new_prefix, old_prefix, old_len], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let n = descendants.len() as u64;
+        if n > 0 {
+            let mut update_path = tx.prepare_cached("UPDATE entries SET path = ?2 WHERE id = ?1")?;
+            let mut fts_delete = tx.prepare_cached("DELETE FROM entries_fts WHERE rowid = ?1")?;
+            let mut fts_insert = tx.prepare_cached(
+                "INSERT INTO entries_fts(rowid, name, keywords) VALUES(?1, ?2, ?3)",
+            )?;
+            for (id, name, ext, app_target, new_path) in descendants {
+                update_path.execute(params![id, new_path])?;
+                let keywords = fts_keywords(&EntryRecord {
+                    root_id: 0,
+                    parent_id: None,
+                    path: new_path,
+                    name: name.clone(),
+                    ext,
+                    keywords: app_target,
+                    ..Default::default()
+                });
+                fts_delete.execute(params![id])?;
+                fts_insert.execute(params![id, name, keywords])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Alias for [`Self::rename_tree_paths`].
+    pub fn rename_subtree(&mut self, old_prefix: &str, new_prefix: &str) -> Result<u64, StoreError> {
+        self.rename_tree_paths(old_prefix, new_prefix)
     }
 
     /// Number of queued (unfinished) directories for a root.
@@ -924,6 +1061,16 @@ impl IndexStore {
         Ok(n as u64)
     }
 
+    /// Deletes all `content_fts` rows for `entry_id` (used when re-extraction
+    /// returns `Unsupported` or `Failed`).
+    pub fn delete_content_text(&mut self, entry_id: i64) -> Result<u64, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM content_fts WHERE entry_id = ?1",
+            params![entry_id],
+        )?;
+        Ok(n as u64)
+    }
+
     /// Replaces the FTS-indexed content text for `(entry_id, kind)` with
     /// `texts` (non-empty strings are concatenated and indexed in
     /// `content_fts`, making extracted document text and OCR searchable via
@@ -1015,6 +1162,20 @@ impl IndexStore {
         let kinds_owned: Vec<String>;
         let entries_owned: Vec<i64>;
         let mut clauses: Vec<String> = Vec::new();
+        let mut heap: std::collections::BinaryHeap<WorstFirstScored> =
+            std::collections::BinaryHeap::with_capacity(top_k.min(1024));
+        let push_bounded = |heap: &mut std::collections::BinaryHeap<WorstFirstScored>,
+                            cand: ScoredSegment| {
+            let item = WorstFirstScored(cand);
+            if heap.len() < top_k {
+                heap.push(item);
+            } else if let Some(worst) = heap.peek() {
+                if item < *worst {
+                    heap.pop();
+                    heap.push(item);
+                }
+            }
+        };
         if let Some(f) = filter {
             if !f.kinds.is_empty() {
                 kinds_owned = f.kinds.clone();
@@ -1054,7 +1215,6 @@ impl IndexStore {
                 params_vec.push(e);
             }
             let rows = stmt.query_map(params_vec.as_slice(), map_segment_row_raw)?;
-            let mut scored = Vec::new();
             for row in rows {
                 let raw: RawSegmentRow = row?;
                 if raw.bytes.len() != query.len() * 2 {
@@ -1064,23 +1224,25 @@ impl IndexStore {
                     continue; // mirrors VectorIndex::search (unreachable via upsert)
                 }
                 let cos = dot_fp16_row_vs_normalized(&raw.bytes, &normed_query);
-                scored.push(ScoredSegment {
-                    segment: raw.segment,
-                    cosine: cos,
-                });
+                push_bounded(
+                    &mut heap,
+                    ScoredSegment {
+                        segment: raw.segment,
+                        cosine: cos,
+                    },
+                );
             }
+            let mut scored: Vec<ScoredSegment> = heap.into_iter().map(|w| w.0).collect();
             scored.sort_by(|a, b| {
                 b.cosine
                     .total_cmp(&a.cosine)
                     .then_with(|| a.segment.id.cmp(&b.segment.id))
             });
-            scored.truncate(top_k);
             return Ok(scored);
         }
         // No filter: full scan.
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_segment_row_raw)?;
-        let mut scored = Vec::new();
         for row in rows {
             let raw: RawSegmentRow = row?;
             if raw.bytes.len() != query.len() * 2 {
@@ -1090,17 +1252,20 @@ impl IndexStore {
                 continue; // mirrors VectorIndex::search (unreachable via upsert)
             }
             let cos = dot_fp16_row_vs_normalized(&raw.bytes, &normed_query);
-            scored.push(ScoredSegment {
-                segment: raw.segment,
-                cosine: cos,
-            });
+            push_bounded(
+                &mut heap,
+                ScoredSegment {
+                    segment: raw.segment,
+                    cosine: cos,
+                },
+            );
         }
+        let mut scored: Vec<ScoredSegment> = heap.into_iter().map(|w| w.0).collect();
         scored.sort_by(|a, b| {
             b.cosine
                 .total_cmp(&a.cosine)
                 .then_with(|| a.segment.id.cmp(&b.segment.id))
         });
-        scored.truncate(top_k);
         Ok(scored)
     }
 
@@ -1443,6 +1608,35 @@ fn map_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
 
 fn map_segment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Segment> {
     map_segment_row_raw(row).map(|raw| raw.segment)
+}
+
+/// Wrapper ordering `ScoredSegment` with the *worst* element considered
+/// `Greater`, so `BinaryHeap::peek()` exposes the eviction candidate in a
+/// bounded top-K heap.
+struct WorstFirstScored(ScoredSegment);
+
+impl PartialEq for WorstFirstScored {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for WorstFirstScored {}
+
+impl PartialOrd for WorstFirstScored {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstFirstScored {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .cosine
+            .total_cmp(&self.0.cosine)
+            .then_with(|| self.0.segment.id.cmp(&other.0.segment.id))
+    }
 }
 
 /// A segment row carrying both the decoded payload and the raw FP16 bytes.
@@ -2342,5 +2536,137 @@ mod tests {
         let reclaimed = store.claim_content_extract_job().unwrap().unwrap();
         assert_eq!(reclaimed.id, claimed.id);
         assert_eq!(reclaimed.entry_id, eid);
+    }
+
+    #[test]
+    fn migration_from_pre_priority_v2_adds_column_before_priority_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "winsearch-prepri-v2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(super::SCHEMA).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE segments (
+                    id          INTEGER PRIMARY KEY,
+                    entry_id    INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                    kind        TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL DEFAULT 0,
+                    text        TEXT NOT NULL DEFAULT '',
+                    page        INTEGER NULL,
+                    start_ms    INTEGER NULL,
+                    end_ms      INTEGER NULL,
+                    line        INTEGER NULL,
+                    vector      BLOB NOT NULL,
+                    norm        REAL NOT NULL DEFAULT 0,
+                    UNIQUE(entry_id, kind, chunk_index)
+                );
+                CREATE TABLE extract_jobs (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                    kind     TEXT NOT NULL,
+                    state    TEXT NOT NULL DEFAULT 'pending',
+                    claimed  INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(entry_id, kind)
+                );
+                INSERT INTO meta(key, value) VALUES('schema_version', '2');
+                "#,
+            )
+            .unwrap();
+        }
+        let mut store = IndexStore::open(&db_path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), "2");
+        let root = store.ensure_root("C:\\data").unwrap();
+        let eid = entry_id_for(&mut store, root, "C:\\data\\p.txt", "p.txt", 950);
+        store.enqueue_extract_job_with_priority(eid, "name", 42).unwrap();
+        let claimed = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(claimed.priority, 42);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_tree_paths_updates_descendant_fts_keywords() {
+        use crate::model::SearchRequest;
+        let (mut store, root) = setup();
+        let gen = store.begin_generation(root).unwrap();
+        let mut folder = rec("C:\\data\\oldparent", "oldparent", 0, 1);
+        folder.is_dir = true;
+        let child = rec(
+            "C:\\data\\oldparent\\quarterly.txt",
+            "quarterly.txt",
+            10,
+            1,
+        );
+        store.apply_batch(root, gen, &[folder, child]).unwrap();
+        let folder_id = store.find_by_path("C:\\data\\oldparent").unwrap().unwrap().id;
+
+        store
+            .move_entry(folder_id, None, "C:\\data\\newparent", "newparent", "")
+            .unwrap();
+        let updated = store
+            .rename_tree_paths("C:\\data\\oldparent", "C:\\data\\newparent")
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let hits_new = store
+            .search(&SearchRequest {
+                text: "newparent quarterly".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits_new.len(), 1);
+        assert_eq!(hits_new[0].path, "C:\\data\\newparent\\quarterly.txt");
+
+        let hits_old = store
+            .search(&SearchRequest {
+                text: "oldparent quarterly".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(hits_old.is_empty(), "old folder keyword must not match after rename");
+    }
+
+    #[test]
+    fn apply_batch_detects_app_target_change_and_preserves_catalog_apps_on_crawl() {
+        let (mut store, desktop_root) = setup();
+        let catalog_root = store.ensure_root("@apps").unwrap();
+
+        // 1. Catalog indexes a shortcut on Desktop.
+        let g_cat1 = store.begin_generation(catalog_root).unwrap();
+        let mut app_rec = rec("C:\\data\\Acme.lnk", "Acme", 0, 0);
+        app_rec.is_app = true;
+        app_rec.app_target = "C:\\Program Files\\Acme\\v1\\acme.exe".into();
+        app_rec.keywords = "acme --v1".into();
+        let out = store.apply_batch(catalog_root, g_cat1, &[app_rec.clone()]).unwrap();
+        assert_eq!(out, vec![UpsertOutcome::Inserted]);
+
+        // 2. Shortcut target changes -> Updated, not Unchanged.
+        let g_cat2 = store.begin_generation(catalog_root).unwrap();
+        app_rec.app_target = "C:\\Program Files\\Acme\\v2\\acme.exe".into();
+        let out = store.apply_batch(catalog_root, g_cat2, &[app_rec.clone()]).unwrap();
+        assert_eq!(out, vec![UpsertOutcome::Updated]);
+
+        // 3. Filesystem crawl visits Desktop and sees `Acme.lnk` as a regular file (`is_app = false`).
+        let g_desk = store.begin_generation(desktop_root).unwrap();
+        let crawl_rec = rec("C:\\data\\Acme.lnk", "Acme.lnk", 512, 1700);
+        let out = store.apply_batch(desktop_root, g_desk, &[crawl_rec]).unwrap();
+        assert_eq!(out, vec![UpsertOutcome::Updated]);
+
+        let row = store.find_by_path("C:\\data\\Acme.lnk").unwrap().unwrap();
+        assert!(row.is_app, "catalog app classification must be preserved when Desktop is crawled");
+        assert_eq!(row.name, "Acme", "catalog display name must be preserved");
+        assert_eq!(row.root_id, catalog_root, "catalog root_id must be preserved");
     }
 }

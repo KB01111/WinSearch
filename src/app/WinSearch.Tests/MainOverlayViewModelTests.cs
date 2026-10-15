@@ -119,15 +119,20 @@ public sealed class MainOverlayViewModelTests
         fake.PushModelStatus(new ModelStatus { State = ModelState.Ready, Bytes = 100, TotalBytes = 100 });
         Assert.Equal("", vm.SemanticHintText);
 
-        // Model deleted -> hint reappears
+        // Model deleted -> hint reappears even if a status snapshot reports ModelLoaded = true
         fake.PushModelStatus(new ModelStatus { State = ModelState.NotDownloaded });
+        fake.PushStatus(new EngineStatus { State = EngineRunState.Idle, ModelLoaded = true });
         Assert.Equal(MainOverlayViewModel.MissingModelHintText, vm.SemanticHintText);
 
         // User disables semantic search in Settings -> hint disappears and SearchQuery.IncludeSemantic is false
         fake.PushConfig(new EngineConfig { SemanticEnabled = false, PreferredBackend = "auto" });
         Assert.Equal("", vm.SemanticHintText);
 
-        await vm.RunSearchAsync("budget report");
+        // Typing arms HasPendingSearch; SearchNowAsync flushes immediately and clears HasPendingSearch
+        vm.QueryText = "immediate query";
+        Assert.True(vm.HasPendingSearch);
+        await vm.SearchNowAsync();
+        Assert.False(vm.HasPendingSearch);
         Assert.False(fake.SearchCalls.Last().IncludeSemantic);
     }
 

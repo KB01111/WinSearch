@@ -353,12 +353,26 @@ fn cmd_eval(suite_name: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_model(sub: ModelSubcommand) -> anyhow::Result<()> {
-    let model_dir = resolve_model_dir();
+    let pipe = std::env::var("WS_PIPE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            ws_platform::identity::pipe_name()
+                .unwrap_or_else(|_| r"\\.\pipe\winsearch-local".to_string())
+        });
+    cmd_model_with_pipe(sub, &pipe, resolve_model_dir())
+}
+
+fn cmd_model_with_pipe(
+    sub: ModelSubcommand,
+    pipe_name: &str,
+    model_dir: PathBuf,
+) -> anyhow::Result<()> {
     let mgr = ModelManager::new(model_dir.clone());
 
     match sub {
         ModelSubcommand::Status => {
-            if let Ok(mut client) = DaemonClient::connect() {
+            if let Ok(mut client) = DaemonClient::connect_pipe(pipe_name) {
                 if let Ok(status) = client.get_model_status() {
                     println!("source:      daemon ({})", client.pipe_name());
                     println!("model_dir:   {}", model_dir.display());
@@ -415,46 +429,103 @@ fn cmd_model(sub: ModelSubcommand) -> anyhow::Result<()> {
                 )
             }
         }
-        ModelSubcommand::Download => {
-            println!("downloading EmbeddingGemma 2 into {}...", model_dir.display());
-            let cancel = AtomicBool::new(false);
-            let last_pct = std::sync::Mutex::new(0u64);
-            let progress = |done: u64, total: u64| {
-                if total == 0 {
-                    return;
-                }
-                let pct = (done * 100) / total;
-                let mut guard = last_pct.lock().unwrap_or_else(|p| p.into_inner());
-                if pct >= *guard + 10 || done == total {
-                    *guard = pct;
-                    println!("  progress: {pct}% ({done}/{total} bytes)");
-                }
-            };
-            mgr.download_all(&progress, &cancel)?;
-            let status = mgr.status();
-            println!("download complete: {:?}", status.state);
-            Ok(())
-        }
-        ModelSubcommand::Import { path } => {
-            println!(
-                "importing model from {} into {}...",
-                path.display(),
-                model_dir.display()
-            );
-            let cancel = AtomicBool::new(false);
-            let status = mgr.import(&path, &cancel)?;
-            println!(
-                "import complete: state={:?} ({}/{} bytes)",
-                status.state, status.bytes, status.total_bytes
-            );
-            if status.state != ModelState::Ready {
+        ModelSubcommand::Download => match DaemonClient::connect_pipe(pipe_name) {
+            Ok(mut client) => {
                 println!(
-                    "note: partial import ({} of {} total bytes present); import remaining manifest file(s) to reach Ready",
-                    status.bytes, status.total_bytes
+                    "downloading EmbeddingGemma 2 via daemon ({})...",
+                    client.pipe_name()
                 );
+                let mut last_pct = 0u64;
+                let status = client.start_model_download(|s| {
+                    if s.total_bytes > 0 {
+                        let pct = (s.bytes * 100) / s.total_bytes;
+                        if pct >= last_pct + 10 || s.bytes == s.total_bytes {
+                            last_pct = pct;
+                            println!("  progress: {pct}% ({}/{} bytes)", s.bytes, s.total_bytes);
+                        }
+                    }
+                })?;
+                match status.state {
+                    ModelState::Ready => {
+                        println!("download complete: {:?}", status.state);
+                        Ok(())
+                    }
+                    other => {
+                        let detail = status.error.unwrap_or_else(|| format!("state={other:?}"));
+                        anyhow::bail!("daemon model download did not reach Ready: {detail}")
+                    }
+                }
             }
-            Ok(())
-        }
+            Err(IpcError::NotConnected { .. }) => {
+                println!("downloading EmbeddingGemma 2 into {}...", model_dir.display());
+                let cancel = AtomicBool::new(false);
+                let last_pct = std::sync::Mutex::new(0u64);
+                let progress = |done: u64, total: u64| {
+                    if total == 0 {
+                        return;
+                    }
+                    let pct = (done * 100) / total;
+                    let mut guard = last_pct.lock().unwrap_or_else(|p| p.into_inner());
+                    if pct >= *guard + 10 || done == total {
+                        *guard = pct;
+                        println!("  progress: {pct}% ({done}/{total} bytes)");
+                    }
+                };
+                mgr.download_all(&progress, &cancel)?;
+                let status = mgr.status();
+                println!("download complete: {:?}", status.state);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        },
+        ModelSubcommand::Import { path } => match DaemonClient::connect_pipe(pipe_name) {
+            Ok(mut client) => {
+                println!(
+                    "importing model from {} via daemon ({})...",
+                    path.display(),
+                    client.pipe_name()
+                );
+                let status = client.import_model(path.to_string_lossy().into_owned(), |s| {
+                    if s.total_bytes > 0 && s.state == ModelState::Downloading {
+                        println!("  progress: {}/{} bytes", s.bytes, s.total_bytes);
+                    }
+                })?;
+                match status.state {
+                    ModelState::Ready => {
+                        println!(
+                            "import complete: state={:?} ({}/{} bytes)",
+                            status.state, status.bytes, status.total_bytes
+                        );
+                        Ok(())
+                    }
+                    other => {
+                        let detail = status.error.unwrap_or_else(|| format!("state={other:?}"));
+                        anyhow::bail!("daemon model import did not reach Ready: {detail}")
+                    }
+                }
+            }
+            Err(IpcError::NotConnected { .. }) => {
+                println!(
+                    "importing model from {} into {}...",
+                    path.display(),
+                    model_dir.display()
+                );
+                let cancel = AtomicBool::new(false);
+                let status = mgr.import(&path, &cancel)?;
+                println!(
+                    "import complete: state={:?} ({}/{} bytes)",
+                    status.state, status.bytes, status.total_bytes
+                );
+                if status.state != ModelState::Ready {
+                    println!(
+                        "note: partial import ({} of {} total bytes present); import remaining manifest file(s) to reach Ready",
+                        status.bytes, status.total_bytes
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        },
     }
 }
 
@@ -665,5 +736,143 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "hit-for-budget");
         assert_eq!(hits[1].title, "semantic-hit.xlsx");
+    }
+
+    #[test]
+    fn cmd_model_routes_download_and_import_through_connected_daemon_pipe() {
+        use std::sync::{Arc, Mutex};
+        use ws_protocol::ModelStatus;
+
+        let pipe = format!(
+            r"\\.\pipe\winsearch-cli-model-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let server_pipe = pipe.clone();
+        let seen: Arc<Mutex<Vec<ClientMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_server = Arc::clone(&seen);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let _ = ws_platform::pipe::serve(&server_pipe, move |mut stream| {
+                let hello: Option<ClientMessage> = read_message(&mut stream).unwrap();
+                assert!(matches!(hello, Some(ClientMessage::Hello { .. })));
+                write_message(
+                    &mut stream,
+                    &ServerMessage::HelloAck {
+                        protocol_version: PROTOCOL_VERSION,
+                        engine_version: "0.1.0-test".into(),
+                        features: vec!["search.exact".into(), "search.semantic".into()],
+                    },
+                )
+                .unwrap();
+
+                if let Ok(Some(msg)) = read_message::<_, ClientMessage>(&mut stream) {
+                    seen_server.lock().unwrap().push(msg.clone());
+                    match msg {
+                        ClientMessage::ModelDownloadStart { id } => {
+                            write_message(
+                                &mut stream,
+                                &ServerMessage::ModelStatus {
+                                    id: Some(id),
+                                    status: ModelStatus {
+                                        state: ModelState::Downloading,
+                                        bytes: 0,
+                                        total_bytes: 100,
+                                        error: None,
+                                    },
+                                },
+                            )
+                            .unwrap();
+                            write_message(
+                                &mut stream,
+                                &ServerMessage::ModelStatus {
+                                    id: None,
+                                    status: ModelStatus {
+                                        state: ModelState::Downloading,
+                                        bytes: 50,
+                                        total_bytes: 100,
+                                        error: None,
+                                    },
+                                },
+                            )
+                            .unwrap();
+                            write_message(
+                                &mut stream,
+                                &ServerMessage::ModelStatus {
+                                    id: None,
+                                    status: ModelStatus {
+                                        state: ModelState::Ready,
+                                        bytes: 100,
+                                        total_bytes: 100,
+                                        error: None,
+                                    },
+                                },
+                            )
+                            .unwrap();
+                        }
+                        ClientMessage::ModelImport { id, .. } => {
+                            write_message(
+                                &mut stream,
+                                &ServerMessage::ModelStatus {
+                                    id: Some(id),
+                                    status: ModelStatus {
+                                        state: ModelState::Downloading,
+                                        bytes: 0,
+                                        total_bytes: 100,
+                                        error: None,
+                                    },
+                                },
+                            )
+                            .unwrap();
+                            write_message(
+                                &mut stream,
+                                &ServerMessage::ModelStatus {
+                                    id: None,
+                                    status: ModelStatus {
+                                        state: ModelState::Ready,
+                                        bytes: 100,
+                                        total_bytes: 100,
+                                        error: None,
+                                    },
+                                },
+                            )
+                            .unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let dummy_dir = std::env::temp_dir().join(format!(
+            "winsearch-cli-model-test-dir-{}",
+            std::process::id()
+        ));
+        cmd_model_with_pipe(ModelSubcommand::Download, &pipe, dummy_dir.clone())
+            .expect("daemon model download");
+        cmd_model_with_pipe(
+            ModelSubcommand::Import {
+                path: PathBuf::from(r"C:\fake\models"),
+            },
+            &pipe,
+            dummy_dir,
+        )
+        .expect("daemon model import");
+
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(matches!(
+            recorded[0],
+            ClientMessage::ModelDownloadStart { .. }
+        ));
+        assert!(matches!(
+            &recorded[1],
+            ClientMessage::ModelImport { path, .. } if path == r"C:\fake\models"
+        ));
     }
 }

@@ -4,10 +4,13 @@
 //! broadcast) lives in `winsearchd`'s model service; everything here is
 //! blocking and borrow-free so it runs on a plain worker thread.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,10 +56,12 @@ pub enum ManagerError {
 
 /// Owns the model directory. `options` carries the download tuning; tests
 /// point `base_url_override` at a local fixture server.
+#[derive(Clone)]
 pub struct ModelManager {
     dir: PathBuf,
     options: DownloadOptions,
     files: Vec<ExpectedFile>,
+    verified: Arc<Mutex<HashMap<String, (u64, SystemTime)>>>,
 }
 
 impl ModelManager {
@@ -65,6 +70,7 @@ impl ModelManager {
             dir,
             options: DownloadOptions::default(),
             files: EXPECTED_FILES.to_vec(),
+            verified: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -73,12 +79,18 @@ impl ModelManager {
             dir,
             options,
             files: EXPECTED_FILES.to_vec(),
+            verified: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Custom file list (tests serve tiny stand-ins for the real GGUFs).
     pub fn with_files(dir: PathBuf, options: DownloadOptions, files: Vec<ExpectedFile>) -> Self {
-        Self { dir, options, files }
+        Self {
+            dir,
+            options,
+            files,
+            verified: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -102,7 +114,7 @@ impl ModelManager {
         for f in &self.files {
             let dest = self.dir.join(f.name);
             match dest.metadata() {
-                Ok(m) if m.len() == f.size && verify_file(&dest, f).is_ok() => {
+                Ok(m) if self.is_verified_meta(&dest, f, &m) => {
                     bytes += f.size;
                 }
                 Ok(m) => {
@@ -110,6 +122,7 @@ impl ModelManager {
                     complete = false;
                 }
                 Err(_) => {
+                    self.invalidate_verified(f.name);
                     complete = false;
                     if self.dir.join(format!("{}.part", f.name)).exists() {
                         partial = true;
@@ -160,8 +173,14 @@ impl ModelManager {
             let done = done_before;
             let combined = |d: u64, _t: u64| progress(done + d, total);
             match download_file(f, &self.dir, &self.options, &combined, cancel) {
-                Ok(_) => done_before += f.size,
-                Err(e) => return Err(e),
+                Ok(dest) => {
+                    self.record_verified(f.name, &dest);
+                    done_before += f.size;
+                }
+                Err(e) => {
+                    self.invalidate_verified(f.name);
+                    return Err(e);
+                }
             }
         }
         progress(total, total);
@@ -224,9 +243,12 @@ impl ModelManager {
         Ok(self.status())
     }
 
-    /// Deletes every manifest file (plus stale `.part` files). Missing files
-    /// are not an error.
+    /// Deletes every manifest file (plus stale `.part` and `.import-tmp` files).
+    /// Missing files are not an error.
     pub fn delete(&self) -> Result<ModelStatus, ManagerError> {
+        if let Ok(mut cache) = self.verified.lock() {
+            cache.clear();
+        }
         for f in &self.files {
             let dest = self.dir.join(f.name);
             if dest.exists() {
@@ -235,6 +257,10 @@ impl ModelManager {
             let part = self.dir.join(format!("{}.part", f.name));
             if part.exists() {
                 fs::remove_file(&part)?;
+            }
+            let import_tmp = self.dir.join(format!("{}.import-tmp", f.name));
+            if import_tmp.exists() {
+                fs::remove_file(&import_tmp)?;
             }
         }
         Ok(self.status())
@@ -263,40 +289,47 @@ impl ModelManager {
         let dest = self.dir.join(expected.name);
         let tmp = self.dir.join(format!("{}.import-tmp", expected.name));
         let mut reader = fs::File::open(src)?;
-        let mut out = fs::File::create(&tmp)?;
-        let mut hasher: Option<Sha256> = expected.sha256.map(|_| Sha256::new());
-        let mut chunk = vec![0u8; 1024 * 1024];
-        let mut copied = 0u64;
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                drop(out);
-                let _ = fs::remove_file(&tmp);
-                return Err(ManagerError::Download(DownloadError::Cancelled(
-                    copied,
-                    expected.size,
+        let copy_res = (|| -> Result<Option<Sha256>, ManagerError> {
+            let mut out = fs::File::create(&tmp)?;
+            let mut hasher: Option<Sha256> = expected.sha256.map(|_| Sha256::new());
+            let mut chunk = vec![0u8; 1024 * 1024];
+            let mut copied = 0u64;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(ManagerError::Download(DownloadError::Cancelled(
+                        copied,
+                        expected.size,
+                    )));
+                }
+                let n = reader.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&chunk[..n])?;
+                if let Some(h) = hasher.as_mut() {
+                    h.update(&chunk[..n]);
+                }
+                copied += n as u64;
+            }
+            out.flush()?;
+            drop(out);
+            // Verify what was written (size always, hash when pinned) before the
+            // rename commits it.
+            if copied != expected.size || tmp.metadata()?.len() != expected.size {
+                return Err(ManagerError::Import(format!(
+                    "{}: short copy ({copied} of {} bytes)",
+                    expected.name, expected.size
                 )));
             }
-            let n = reader.read(&mut chunk)?;
-            if n == 0 {
-                break;
+            Ok(hasher)
+        })();
+        let hasher = match copy_res {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
             }
-            out.write_all(&chunk[..n])?;
-            if let Some(h) = hasher.as_mut() {
-                h.update(&chunk[..n]);
-            }
-            copied += n as u64;
-        }
-        out.flush()?;
-        drop(out);
-        // Verify what was written (size always, hash when pinned) before the
-        // rename commits it.
-        if copied != expected.size || tmp.metadata()?.len() != expected.size {
-            let _ = fs::remove_file(&tmp);
-            return Err(ManagerError::Import(format!(
-                "{}: short copy ({copied} of {} bytes)",
-                expected.name, expected.size
-            )));
-        }
+        };
         if let (Some(hasher), Some(pinned)) = (hasher, expected.sha256) {
             let got = hex::encode(hasher.finalize());
             if got != pinned {
@@ -307,13 +340,60 @@ impl ModelManager {
                 )));
             }
         }
-        fs::rename(&tmp, &dest)?;
+        if let Err(e) = fs::rename(&tmp, &dest) {
+            let _ = fs::remove_file(&tmp);
+            return Err(ManagerError::Io(e));
+        }
+        self.record_verified(expected.name, &dest);
         Ok(())
     }
 
     fn is_file_valid(&self, f: &ExpectedFile) -> bool {
         let dest = self.dir.join(f.name);
-        dest.is_file() && verify_file(&dest, f).is_ok()
+        match dest.metadata() {
+            Ok(m) if m.is_file() => self.is_verified_meta(&dest, f, &m),
+            _ => {
+                self.invalidate_verified(f.name);
+                false
+            }
+        }
+    }
+
+    fn is_verified_meta(&self, dest: &Path, f: &ExpectedFile, meta: &fs::Metadata) -> bool {
+        if meta.len() != f.size {
+            self.invalidate_verified(f.name);
+            return false;
+        }
+        let stamp = (meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        if let Ok(cache) = self.verified.lock() {
+            if cache.get(f.name).copied() == Some(stamp) {
+                return true;
+            }
+        }
+        if verify_file(dest, f).is_ok() {
+            if let Ok(mut cache) = self.verified.lock() {
+                cache.insert(f.name.to_string(), stamp);
+            }
+            true
+        } else {
+            self.invalidate_verified(f.name);
+            false
+        }
+    }
+
+    fn record_verified(&self, name: &str, dest: &Path) {
+        if let Ok(meta) = dest.metadata() {
+            let stamp = (meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+            if let Ok(mut cache) = self.verified.lock() {
+                cache.insert(name.to_string(), stamp);
+            }
+        }
+    }
+
+    fn invalidate_verified(&self, name: &str) {
+        if let Ok(mut cache) = self.verified.lock() {
+            cache.remove(name);
+        }
     }
 }
 
@@ -363,6 +443,7 @@ mod tests {
         for f in &EXPECTED_FILES {
             fs::write(dir.join(f.name), vec![0u8; 8]).unwrap();
             fs::write(dir.join(format!("{}.part", f.name)), vec![0u8; 8]).unwrap();
+            fs::write(dir.join(format!("{}.import-tmp", f.name)), vec![0u8; 8]).unwrap();
         }
         let mgr = ModelManager::new(dir.clone());
         let s = mgr.delete().unwrap();
@@ -371,6 +452,50 @@ mod tests {
 
         // Deleting again is a no-op.
         mgr.delete().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_caches_verification_and_invalidates_on_change() {
+        use sha2::{Digest, Sha256};
+        let dir = temp_dir("status-cache");
+        let name = leak("cached.gguf");
+        let body = vec![42u8; 4096];
+        let files = vec![ExpectedFile {
+            name,
+            size: body.len() as u64,
+            sha256: Some(Box::leak(
+                format!("{:x}", Sha256::digest(&body)).into_boxed_str(),
+            )),
+        }];
+        let path = dir.join(name);
+        fs::write(&path, &body).unwrap();
+
+        let mgr = ModelManager::with_files(dir.clone(), DownloadOptions::default(), files);
+        assert!(mgr.verified.lock().unwrap().is_empty());
+
+        // First status call verifies and populates the cache.
+        assert_eq!(mgr.status().state, ModelState::Ready);
+        let cached_stamp = mgr.verified.lock().unwrap().get(name).copied();
+        assert!(cached_stamp.is_some());
+
+        // Cloned manager shares the verification cache.
+        let mgr_clone = mgr.clone();
+        assert_eq!(mgr_clone.status().state, ModelState::Ready);
+        assert_eq!(mgr_clone.verified.lock().unwrap().get(name).copied(), cached_stamp);
+
+        // Corrupt the file with a new mtime (same length): cache must invalidate and reject.
+        let mut corrupt = body.clone();
+        corrupt[0] ^= 0xff;
+        let bumped_mtime = cached_stamp.unwrap().1 + Duration::from_secs(2);
+        {
+            let mut f = fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+            f.write_all(&corrupt).unwrap();
+            f.set_modified(bumped_mtime).unwrap();
+        }
+        assert_eq!(mgr.status().state, ModelState::NotDownloaded);
+        assert!(!mgr.verified.lock().unwrap().contains_key(name));
+
         let _ = fs::remove_dir_all(&dir);
     }
 

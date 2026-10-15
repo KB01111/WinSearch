@@ -50,9 +50,12 @@ pub struct ExpectedFile {
 }
 
 impl ExpectedFile {
-    /// `https://huggingface.co/<MODEL_ID>/resolve/main/<name>`.
+    /// `https://huggingface.co/<MODEL_ID>/resolve/<REPO_COMMIT>/<name>`.
     pub fn url(&self) -> String {
-        format!("https://huggingface.co/{MODEL_ID}/resolve/main/{}", self.name)
+        format!(
+            "https://huggingface.co/{MODEL_ID}/resolve/{REPO_COMMIT}/{}",
+            self.name
+        )
     }
 }
 
@@ -130,6 +133,7 @@ mod tests {
         for f in &EXPECTED_FILES {
             assert!(f.url().ends_with(f.name));
             assert!(f.url().contains(MODEL_ID));
+            assert!(f.url().contains(REPO_COMMIT));
             // Real SHA-256 pins: 64 lowercase hex chars, both present.
             let hash = f.sha256.expect("production GGUFs must pin SHA-256");
             assert_eq!(hash.len(), 64);

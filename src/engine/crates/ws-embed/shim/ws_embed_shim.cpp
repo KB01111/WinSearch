@@ -169,7 +169,7 @@ int32_t wse_tokenize(const struct llama_model * model, const char * text, int32_
 // tokens: all sequences concatenated; seq_lens[i] = token count of sequence i.
 // Returns 0 on success, non-zero llama_decode code on failure, -1 on bad args.
 int32_t wse_embed_batch(struct llama_context * ctx, const int32_t * tokens, const int32_t * seq_lens, int32_t n_seqs, int32_t n_embd, float * out) {
-    if (!ctx || !tokens || !seq_lens || n_seqs <= 0 || n_embd <= 0 || !out) {
+    if (!ctx || !tokens || !seq_lens || n_seqs <= 0 || n_seqs > WSE_N_SEQ_MAX || n_embd <= 0 || !out) {
         return -1;
     }
     int32_t n_total = 0;
@@ -178,6 +178,12 @@ int32_t wse_embed_batch(struct llama_context * ctx, const int32_t * tokens, cons
             return -1;
         }
         n_total += seq_lens[s];
+    }
+    const uint32_t max_batch = llama_n_batch(ctx);
+    const uint32_t max_ubatch = llama_n_ubatch(ctx);
+    if ((max_batch > 0 && (uint32_t) n_total > max_batch) ||
+        (max_ubatch > 0 && (uint32_t) n_total > max_ubatch)) {
+        return -1;
     }
 
     llama_memory_clear(llama_get_memory(ctx), true);

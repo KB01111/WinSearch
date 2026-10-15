@@ -114,11 +114,15 @@ pub fn extract_symbols_with_offset(
     }
 
     let mut out = Vec::new();
-    let mut in_block_comment = false;
+    let mut lex_state = LexState::default();
+    let clean_lines: Vec<String> = lines
+        .iter()
+        .map(|&raw_line| strip_line_comments(raw_line, grammar, &mut lex_state))
+        .collect();
 
     for (idx, &raw_line) in lines.iter().enumerate() {
         let line_no = base_line + idx as u32;
-        let code_line = strip_line_comments(raw_line, grammar, &mut in_block_comment);
+        let code_line = &clean_lines[idx];
         let trimmed = code_line.trim();
         if trimmed.is_empty() {
             continue;
@@ -127,7 +131,8 @@ pub fn extract_symbols_with_offset(
         // 1. Check for a top-level or member definition on this line.
         let mut defined_name_on_line: Option<String> = None;
         if let Some((name, kind)) = match_definition(trimmed, raw_line, grammar) {
-            let end_line = compute_definition_end_line(&lines, idx, grammar, base_line);
+            let end_line =
+                compute_definition_end_line_clean(&lines, &clean_lines, idx, grammar, base_line);
             defined_name_on_line = Some(name.clone());
             out.push(ExtractedSymbol {
                 name,
@@ -167,9 +172,24 @@ fn clean_signature(raw: &str) -> String {
     }
 }
 
-/// Strips single-line and C-style `/* ... */` comments so comment words are
-/// never mistaken for definitions or call sites.
-fn strip_line_comments(line: &str, grammar: GrammarKind, in_block: &mut bool) -> String {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LexState {
+    in_block_comment: bool,
+    in_multiline_str: Option<MultilineQuote>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultilineQuote {
+    TripleDouble,
+    TripleSingle,
+    Backtick,
+}
+
+/// Strips single-line and C-style `/* ... */` comments as well as string
+/// literals (including multiline `"""`, `'''`, and `` ` `` literals) so comment
+/// or literal words/braces are never mistaken for definitions, block ends, or
+/// call sites.
+fn strip_line_comments(line: &str, grammar: GrammarKind, state: &mut LexState) -> String {
     let supports_slash_comments = matches!(
         grammar,
         GrammarKind::Rust
@@ -196,6 +216,17 @@ fn strip_line_comments(line: &str, grammar: GrammarKind, in_block: &mut bool) ->
             | GrammarKind::Php
     );
     let supports_sql_comments = matches!(grammar, GrammarKind::Sql);
+    let supports_triple_quotes = matches!(
+        grammar,
+        GrammarKind::Python
+            | GrammarKind::Kotlin
+            | GrammarKind::Swift
+            | GrammarKind::Toml
+    );
+    let supports_backtick_strings = matches!(
+        grammar,
+        GrammarKind::JavaScript | GrammarKind::TypeScript | GrammarKind::Go
+    );
 
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
@@ -203,14 +234,68 @@ fn strip_line_comments(line: &str, grammar: GrammarKind, in_block: &mut bool) ->
     let mut in_str: Option<u8> = None;
 
     while i < bytes.len() {
-        if *in_block {
+        if state.in_block_comment {
             if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                *in_block = false;
+                state.in_block_comment = false;
                 i += 2;
             } else {
                 i += 1;
             }
             continue;
+        }
+        if let Some(mq) = state.in_multiline_str {
+            match mq {
+                MultilineQuote::TripleDouble => {
+                    if i + 2 < bytes.len()
+                        && bytes[i] == b'"'
+                        && bytes[i + 1] == b'"'
+                        && bytes[i + 2] == b'"'
+                    {
+                        state.in_multiline_str = None;
+                        out.push_str("   ");
+                        i += 3;
+                    } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        out.push_str("  ");
+                        i += 2;
+                    } else {
+                        out.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                MultilineQuote::TripleSingle => {
+                    if i + 2 < bytes.len()
+                        && bytes[i] == b'\''
+                        && bytes[i + 1] == b'\''
+                        && bytes[i + 2] == b'\''
+                    {
+                        state.in_multiline_str = None;
+                        out.push_str("   ");
+                        i += 3;
+                    } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        out.push_str("  ");
+                        i += 2;
+                    } else {
+                        out.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                MultilineQuote::Backtick => {
+                    if bytes[i] == b'`' {
+                        state.in_multiline_str = None;
+                        out.push(' ');
+                        i += 1;
+                    } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        out.push_str("  ");
+                        i += 2;
+                    } else {
+                        out.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
         }
         let b = bytes[i];
         if let Some(q) = in_str {
@@ -226,6 +311,26 @@ fn strip_line_comments(line: &str, grammar: GrammarKind, in_block: &mut bool) ->
             i += 1;
             continue;
         }
+        if supports_triple_quotes && i + 2 < bytes.len() {
+            if b == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                state.in_multiline_str = Some(MultilineQuote::TripleDouble);
+                out.push_str("   ");
+                i += 3;
+                continue;
+            }
+            if b == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                state.in_multiline_str = Some(MultilineQuote::TripleSingle);
+                out.push_str("   ");
+                i += 3;
+                continue;
+            }
+        }
+        if supports_backtick_strings && b == b'`' {
+            state.in_multiline_str = Some(MultilineQuote::Backtick);
+            out.push(' ');
+            i += 1;
+            continue;
+        }
         if b == b'"' || b == b'\'' {
             in_str = Some(b);
             out.push(' ');
@@ -237,7 +342,7 @@ fn strip_line_comments(line: &str, grammar: GrammarKind, in_block: &mut bool) ->
                 break;
             }
             if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                *in_block = true;
+                state.in_block_comment = true;
                 i += 2;
                 continue;
             }
@@ -262,11 +367,26 @@ pub fn compute_definition_end_line(
     grammar: GrammarKind,
     base_line: u32,
 ) -> u32 {
+    let mut lex_state = LexState::default();
+    let clean_lines: Vec<String> = lines
+        .iter()
+        .map(|&l| strip_line_comments(l, grammar, &mut lex_state))
+        .collect();
+    compute_definition_end_line_clean(lines, &clean_lines, start_idx, grammar, base_line)
+}
+
+fn compute_definition_end_line_clean(
+    lines: &[&str],
+    clean_lines: &[String],
+    start_idx: usize,
+    grammar: GrammarKind,
+    base_line: u32,
+) -> u32 {
     let start_line_no = base_line + start_idx as u32;
     if grammar.uses_brace_blocks() {
         let mut depth = 0i32;
         let mut seen_open = false;
-        for (offset, &l) in lines[start_idx..].iter().enumerate().take(200) {
+        for (offset, l) in clean_lines[start_idx..].iter().enumerate().take(200) {
             for ch in l.chars() {
                 if ch == '{' {
                     depth += 1;
@@ -304,9 +424,9 @@ pub fn compute_definition_end_line(
 
     if matches!(grammar, GrammarKind::Ruby) {
         let mut depth = 1i32;
-        for (offset, &l) in lines[start_idx + 1..].iter().enumerate().take(200) {
+        for (offset, l) in clean_lines[start_idx + 1..].iter().enumerate().take(200) {
             let t = l.trim();
-            if t.starts_with("def ") || t.starts_with("class ") || t.starts_with("module ") {
+            if is_ruby_block_opener(t) {
                 depth += 1;
             } else if t == "end" || t.starts_with("end ") {
                 depth -= 1;
@@ -318,7 +438,7 @@ pub fn compute_definition_end_line(
     }
 
     if matches!(grammar, GrammarKind::Sql) {
-        for (offset, &l) in lines[start_idx..].iter().enumerate().take(100) {
+        for (offset, l) in clean_lines[start_idx..].iter().enumerate().take(100) {
             if l.contains(';') {
                 return base_line + (start_idx + offset) as u32;
             }
@@ -326,6 +446,24 @@ pub fn compute_definition_end_line(
     }
 
     start_line_no
+}
+
+fn is_ruby_block_opener(t: &str) -> bool {
+    let starts_block = t.starts_with("def ")
+        || t == "def"
+        || t.starts_with("class ")
+        || t.starts_with("module ")
+        || t.starts_with("if ")
+        || t.starts_with("unless ")
+        || t.starts_with("case ")
+        || t == "case"
+        || t.starts_with("while ")
+        || t.starts_with("until ")
+        || t.starts_with("for ")
+        || t == "begin"
+        || t.starts_with("begin ");
+    let has_do_block = t.ends_with(" do") || (t.contains(" do |") && t.ends_with('|'));
+    starts_block || has_do_block
 }
 
 fn leading_indent(line: &str) -> usize {
@@ -371,9 +509,8 @@ fn strip_modifiers<'a>(mut s: &'a str, mods: &[&str]) -> &'a str {
         let mut matched = false;
         // Strip leading attributes/annotations like `@Override` or `#[inline]`
         if s.starts_with('@') {
-            if let Some(rest) = s.split_whitespace().nth(1) {
-                let offset = s.len() - rest.len();
-                s = &s[offset..];
+            if let Some((_, rest)) = s.split_once(char::is_whitespace) {
+                s = rest;
                 continue;
             }
         }
@@ -1146,9 +1283,6 @@ fn is_keyword(ident: &str) -> bool {
             | "super"
             | "self"
             | "this"
-            | "some"
-            | "ok"
-            | "err"
             | "vec"
             | "print"
             | "println"
@@ -1188,4 +1322,77 @@ fn is_bash_builtin(ident: &str) -> bool {
             | "false"
             | "test"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotation_skip_detects_method_and_handles_multibyte() {
+        let src = "@Override public void run() { // café\n    work();\n}\n";
+        let syms = extract_symbols(src, "java");
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "run" && s.role == SymbolRole::Definition),
+            "got {syms:?}"
+        );
+    }
+
+    #[test]
+    fn brace_end_ignores_braces_in_strings_and_comments() {
+        let src = "fn demo() {\n    let s = \"}\"; // }\n    let x = 1;\n}\n";
+        let syms = extract_symbols(src, "rust");
+        let def = syms
+            .iter()
+            .find(|s| s.name == "demo" && s.role == SymbolRole::Definition)
+            .expect("demo definition");
+        assert_eq!(def.line, 1);
+        assert_eq!(def.end_line, 4);
+    }
+
+    #[test]
+    fn ruby_end_counts_nested_blocks() {
+        let src = "def compute(x)\n  if x > 0\n    items.each do |i|\n      puts(i)\n    end\n  end\n  x + 1\nend\n";
+        let syms = extract_symbols(src, "ruby");
+        let def = syms
+            .iter()
+            .find(|s| s.name == "compute" && s.role == SymbolRole::Definition)
+            .expect("compute definition");
+        assert_eq!(def.line, 1);
+        assert_eq!(def.end_line, 8);
+    }
+
+    #[test]
+    fn multiline_docstring_does_not_emit_false_symbols() {
+        let src = "def real_fn():\n    \"\"\"\n    def hidden_in_docstring():\n        fake_call()\n    \"\"\"\n    return helper_call()\n";
+        let syms = extract_symbols(src, "python");
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "real_fn" && s.role == SymbolRole::Definition)
+        );
+        assert!(
+            !syms.iter().any(|s| s.name == "hidden_in_docstring"),
+            "docstring code should not be indexed: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s.name == "fake_call"),
+            "docstring calls should not be indexed: {syms:?}"
+        );
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "helper_call" && s.role == SymbolRole::Reference)
+        );
+    }
+
+    #[test]
+    fn callable_some_is_indexed_as_reference() {
+        let src = "const ok = items.some(pred);\n";
+        let syms = extract_symbols(src, "typescript");
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "some" && s.role == SymbolRole::Reference),
+            "expected 'some' call reference, got {syms:?}"
+        );
+    }
 }

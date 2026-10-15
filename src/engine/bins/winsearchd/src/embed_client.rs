@@ -17,9 +17,10 @@
 //! setups). Production never sets the stub flag, so the overlay hint logic
 //! is unaffected there.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -208,12 +209,15 @@ pub struct EmbedSupervisor {
     /// later batches behind a leaked holder.
     conn: Mutex<()>,
     slot: Mutex<Slot>,
-    /// Cancel registration for the single in-flight bounded read (if any):
-    /// `(os_thread_id, generation)`. The watchdog cancels exactly this
-    /// thread's synchronous pipe IO via `CancelSynchronousIo`, which unblocks
-    /// the helper even for foreign (unkillable-by-us) workers. Stale
-    /// generations are ignored so a recycled thread id is never cancelled.
-    inflight_tid: Mutex<Option<(u32, u64)>>,
+    /// Cancel registrations for in-flight bounded calls, keyed by `call_id`
+    /// (`call_id -> os_thread_id`). The watchdog cancels only the timed-out
+    /// caller's thread via `CancelSynchronousIo`, which unblocks the helper
+    /// even for foreign (unkillable-by-us) workers without disrupting other
+    /// concurrent bounded callers.
+    inflight_tids: Mutex<HashMap<u64, u32>>,
+    active_bounded: AtomicUsize,
+    worker_gen: AtomicU64,
+    preferred_backend: Mutex<Option<String>>,
     cancel_seq: AtomicU64,
     next_id: AtomicU64,
     failures: AtomicU32,
@@ -232,13 +236,43 @@ impl EmbedSupervisor {
             config,
             conn: Mutex::new(()),
             slot: Mutex::new(Slot { child: None }),
-            inflight_tid: Mutex::new(None),
+            inflight_tids: Mutex::new(HashMap::new()),
+            active_bounded: AtomicUsize::new(0),
+            worker_gen: AtomicU64::new(1),
+            preferred_backend: Mutex::new(None),
             cancel_seq: AtomicU64::new(1),
             next_id: AtomicU64::new(1),
             failures: AtomicU32::new(0),
             model_loaded: AtomicBool::new(false),
             stub: AtomicBool::new(false),
             stats: Mutex::new(EmbedStats::default()),
+        }
+    }
+
+    /// Updates the preferred inference backend (`auto|cuda|vulkan|cpu`) to pass
+    /// to spawned workers when `--backend` is not already hardcoded in
+    /// `config.worker_args`. If the preference changes and no bounded calls are
+    /// in flight, any idle owned worker is terminated so the next request
+    /// launches with the new backend.
+    pub fn set_preferred_backend(&self, backend: &str) {
+        let normalized = backend.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut guard = self
+                .preferred_backend
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if guard.as_deref() == Some(normalized.as_str()) {
+                false
+            } else {
+                *guard = Some(normalized);
+                true
+            }
+        };
+        if changed && self.active_bounded.load(Ordering::Acquire) == 0 {
+            self.terminate_worker();
         }
     }
 
@@ -284,7 +318,10 @@ impl EmbedSupervisor {
     pub fn terminate_worker(&self) {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
         match kill_locked(&mut slot) {
-            Ok(true) => info!("embed worker killed"),
+            Ok(true) => {
+                self.worker_gen.fetch_add(1, Ordering::Release);
+                info!("embed worker killed");
+            }
             Ok(false) => {}
             Err(e) => warn!(error = %e, "embed worker kill failed"),
         }
@@ -381,28 +418,40 @@ impl EmbedSupervisor {
                 "cannot embed an empty batch".into(),
             ));
         }
+        let call_id = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
+        self.active_bounded.fetch_add(1, Ordering::AcqRel);
         let sup = std::sync::Arc::clone(self);
         let owned: Vec<String> = texts.to_vec();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let cancel2 = std::sync::Arc::clone(&cancel);
         let deadline = Instant::now() + timeout;
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("winsearch-embed-bounded".into())
             .spawn(move || {
-                let r = sup.embed_texts_cancelable(&owned, &cancel2, deadline);
+                let r = sup.embed_texts_cancelable(call_id, &owned, &cancel2, deadline);
                 let _ = tx.send(r);
-            })
-            .map_err(|e| EmbedError::Transport(format!("cannot spawn embed helper: {e}")))?;
-        match rx.recv_timeout(timeout) {
+            });
+        if let Err(e) = spawned {
+            self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+            return Err(EmbedError::Transport(format!(
+                "cannot spawn embed helper: {e}"
+            )));
+        }
+        let outcome = rx.recv_timeout(timeout);
+        let remaining = self.active_bounded.fetch_sub(1, Ordering::AcqRel) - 1;
+        match outcome {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Stop the helper promptly: flag it (phase-A loops poll the
-                // flag) and cancel its in-flight synchronous read, then break
-                // the hung pipe by killing the owned child (if any).
+                // Stop the helper promptly: flag it and cancel only this
+                // caller's synchronous pipe IO. Only kill the owned child when
+                // no other bounded caller is in flight so a short interactive
+                // query timeout never kills a healthy background batch.
                 cancel.store(true, Ordering::Relaxed);
-                self.cancel_inflight_read();
-                self.terminate_worker();
+                self.cancel_inflight_read_for(call_id);
+                if remaining == 0 {
+                    self.terminate_worker();
+                }
                 warn!("embed job timed out after {timeout:?}; helper cancelled, batch fails for retry");
                 Err(EmbedError::Transport(format!(
                     "embed job timed out after {timeout:?}"
@@ -420,6 +469,7 @@ impl EmbedSupervisor {
     /// `conn` across the blocking read and honors `cancel`/`deadline`.
     fn embed_texts_cancelable(
         &self,
+        call_id: u64,
         texts: &[String],
         cancel: &AtomicBool,
         deadline: Instant,
@@ -434,7 +484,8 @@ impl EmbedSupervisor {
                 id,
                 texts: chunk.to_vec(),
             };
-            match self.transact_bounded(req, cancel, deadline) {
+            let observed_gen = self.worker_gen.load(Ordering::Acquire);
+            match self.transact_bounded(call_id, req, cancel, deadline) {
                 Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                     self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
                     all.extend(vecs);
@@ -453,7 +504,13 @@ impl EmbedSupervisor {
                         id: retry_id,
                         texts: chunk.to_vec(),
                     };
-                    match self.transact_bounded_after_restart(retry, cancel, deadline) {
+                    match self.transact_bounded_after_restart(
+                        call_id,
+                        retry,
+                        cancel,
+                        deadline,
+                        observed_gen,
+                    ) {
                         Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                             self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
                             all.extend(vecs);
@@ -486,24 +543,35 @@ impl EmbedSupervisor {
         if path_str.is_empty() {
             return Err(EmbedError::InvalidRequest("empty image path".into()));
         }
+        let call_id = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
+        self.active_bounded.fetch_add(1, Ordering::AcqRel);
         let sup = std::sync::Arc::clone(self);
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let cancel2 = std::sync::Arc::clone(&cancel);
         let deadline = Instant::now() + timeout;
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("winsearch-embed-img".into())
             .spawn(move || {
-                let r = sup.embed_image_cancelable(&path_str, &cancel2, deadline);
+                let r = sup.embed_image_cancelable(call_id, &path_str, &cancel2, deadline);
                 let _ = tx.send(r);
-            })
-            .map_err(|e| EmbedError::Transport(format!("cannot spawn image embed helper: {e}")))?;
-        match rx.recv_timeout(timeout) {
+            });
+        if let Err(e) = spawned {
+            self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+            return Err(EmbedError::Transport(format!(
+                "cannot spawn image embed helper: {e}"
+            )));
+        }
+        let outcome = rx.recv_timeout(timeout);
+        let remaining = self.active_bounded.fetch_sub(1, Ordering::AcqRel) - 1;
+        match outcome {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 cancel.store(true, Ordering::Relaxed);
-                self.cancel_inflight_read();
-                self.terminate_worker();
+                self.cancel_inflight_read_for(call_id);
+                if remaining == 0 {
+                    self.terminate_worker();
+                }
                 warn!("image embed job timed out after {timeout:?}; helper cancelled");
                 Err(EmbedError::Transport(format!(
                     "image embed job timed out after {timeout:?}"
@@ -517,6 +585,7 @@ impl EmbedSupervisor {
 
     fn embed_image_cancelable(
         &self,
+        call_id: u64,
         path: &str,
         cancel: &AtomicBool,
         deadline: Instant,
@@ -534,7 +603,8 @@ impl EmbedSupervisor {
                 EmbedError::Protocol("embed_image returned empty vector list".into())
             })
         };
-        match self.transact_bounded(req, cancel, deadline) {
+        let observed_gen = self.worker_gen.load(Ordering::Acquire);
+        match self.transact_bounded(call_id, req, cancel, deadline) {
             Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                 self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
                 extract_first(vecs)
@@ -551,7 +621,13 @@ impl EmbedSupervisor {
                     id: retry_id,
                     path: path.to_string(),
                 };
-                match self.transact_bounded_after_restart(retry, cancel, deadline) {
+                match self.transact_bounded_after_restart(
+                    call_id,
+                    retry,
+                    cancel,
+                    deadline,
+                    observed_gen,
+                ) {
                     Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                         self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
                         extract_first(vecs)
@@ -683,6 +759,15 @@ impl EmbedSupervisor {
         }
         let mut cmd = Command::new(&self.config.worker_bin);
         cmd.args(&self.config.worker_args);
+        if !self.config.worker_args.iter().any(|a| a == "--backend") {
+            if let Some(ref pref) = *self
+                .preferred_backend
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+            {
+                cmd.arg("--backend").arg(pref);
+            }
+        }
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -701,6 +786,7 @@ impl EmbedSupervisor {
         };
         info!(bin = %self.config.worker_bin.display(), "embed worker spawned");
         slot.child = Some(child);
+        self.worker_gen.fetch_add(1, Ordering::Release);
         {
             let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
             stats.spawns += 1;
@@ -782,10 +868,12 @@ impl EmbedSupervisor {
 
     /// Bounded single attempt: `conn` is held only across ensure + phase A
     /// (connect/handshake/send, all internally bounded); the blocking reply
-    /// read runs WITHOUT `conn`, registered for watchdog cancellation, so a
-    /// hung worker never wedges later batches behind a leaked holder.
+    /// read runs WITHOUT `conn`, registered for watchdog cancellation across
+    /// both Phase A and Phase B, so a hung worker never wedges later batches
+    /// behind a leaked holder.
     fn transact_bounded(
         &self,
+        call_id: u64,
         req: EmbedRequest,
         cancel: &AtomicBool,
         deadline: Instant,
@@ -793,18 +881,30 @@ impl EmbedSupervisor {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return Err(EmbedError::Transport("embed job cancelled".into()));
         }
-        let mut stream = {
+        self.register_inflight_for(call_id);
+        let phase_a = {
             let _conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            {
-                let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-                self.ensure_worker_locked(&mut slot)?;
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                Err(EmbedError::Transport("embed job cancelled".into()))
+            } else {
+                let ensure = {
+                    let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                    self.ensure_worker_locked(&mut slot)
+                };
+                ensure.and_then(|()| self.connect_and_send(&req))
             }
-            self.connect_and_send(&req)?
+        };
+        let mut stream = match phase_a {
+            Ok(s) => s,
+            Err(e) => {
+                self.unregister_inflight(call_id);
+                return Err(e);
+            }
         };
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            self.unregister_inflight(call_id);
             return Err(EmbedError::Transport("embed job cancelled".into()));
         }
-        let gen = self.register_inflight();
         let out = match Self::read_reply(&mut stream) {
             Ok(resp) => {
                 self.failures.store(0, Ordering::Relaxed);
@@ -817,40 +917,62 @@ impl EmbedSupervisor {
                 Err(e)
             }
         };
-        self.unregister_inflight(gen);
+        self.unregister_inflight(call_id);
         out
     }
 
     /// Bounded restart path: kill + ensure + send under `conn`, read outside
     /// it (same leak-free shape as [`Self::transact_bounded`]). Used exactly
-    /// once per job after a transport failure.
+    /// once per job after a transport failure. Only kills the child if
+    /// `worker_gen` still matches `failed_worker_gen` (preventing a stale
+    /// retry from killing a replacement worker another caller already started).
     fn transact_bounded_after_restart(
         &self,
+        call_id: u64,
         req: EmbedRequest,
         cancel: &AtomicBool,
         deadline: Instant,
+        failed_worker_gen: u64,
     ) -> Result<EmbedResponse, EmbedError> {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return Err(EmbedError::Transport("embed job cancelled".into()));
         }
-        let mut stream = {
+        self.register_inflight_for(call_id);
+        let phase_a = {
             let _conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            {
-                let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(e) = kill_locked(&mut slot) {
-                    debug!(error = %e, "bounded-restart kill of presumed-dead child failed");
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                Err(EmbedError::Transport("embed job cancelled".into()))
+            } else {
+                if self.worker_gen.load(Ordering::Acquire) == failed_worker_gen {
+                    let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                    match kill_locked(&mut slot) {
+                        Ok(true) => {
+                            self.worker_gen.fetch_add(1, Ordering::Release);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            debug!(error = %e, "bounded-restart kill of presumed-dead child failed");
+                        }
+                    }
                 }
+                let ensure = {
+                    let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+                    self.ensure_worker_locked(&mut slot)
+                };
+                ensure.and_then(|()| self.connect_and_send(&req))
             }
-            {
-                let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-                self.ensure_worker_locked(&mut slot)?;
+        };
+        let mut stream = match phase_a {
+            Ok(s) => s,
+            Err(e) => {
+                self.unregister_inflight(call_id);
+                return Err(e);
             }
-            self.connect_and_send(&req)?
         };
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            self.unregister_inflight(call_id);
             return Err(EmbedError::Transport("embed job cancelled".into()));
         }
-        let gen = self.register_inflight();
         let out = match Self::read_reply(&mut stream) {
             Ok(resp) => {
                 self.failures.store(0, Ordering::Relaxed);
@@ -863,61 +985,55 @@ impl EmbedSupervisor {
                 Err(e)
             }
         };
-        self.unregister_inflight(gen);
+        self.unregister_inflight(call_id);
         out
     }
 
     /// Registers the calling thread for watchdog cancellation of its in-flight
-    /// synchronous pipe read. Returns this registration's generation.
-    fn register_inflight(&self) -> u64 {
-        let gen = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
-        // `GetCurrentThreadId` is infallible and identifies this helper
-        // thread to `cancel_inflight_read` below.
+    /// synchronous pipe IO under `call_id`.
+    fn register_inflight_for(&self, call_id: u64) {
         let tid = unsafe { GetCurrentThreadId() };
-        *self.inflight_tid.lock().unwrap_or_else(|p| p.into_inner()) = Some((tid, gen));
-        gen
-    }
-
-    /// Clears our cancel registration (normal completion path). Only clears
-    /// when the generation still matches, so a late completion never erases a
-    /// newer registration.
-    fn unregister_inflight(&self, gen: u64) {
-        let mut guard = self.inflight_tid.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.is_some_and(|(_, g)| g == gen) {
-            *guard = None;
-        }
-    }
-
-    /// Watchdog: cancel the registered helper thread's synchronous pipe IO.
-    /// Takes (and clears) the registration so a recycled thread id is never
-    /// cancelled; every failure mode is logged explicitly. A no-op when no
-    /// read is registered (helper already finished or still in phase A).
-    fn cancel_inflight_read(&self) {
-        let reg: Option<(u32, u64)> = self
-            .inflight_tid
+        self.inflight_tids
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take();
-        let Some((tid, gen)) = reg else {
-            debug!("watchdog: no in-flight read registered; helper already settled");
+            .insert(call_id, tid);
+    }
+
+    /// Clears `call_id`'s cancel registration (normal completion path).
+    fn unregister_inflight(&self, call_id: u64) {
+        self.inflight_tids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&call_id);
+    }
+
+    /// Watchdog: cancel the registered helper thread's synchronous pipe IO for
+    /// `call_id`. Removes only `call_id`'s entry so other concurrent bounded
+    /// callers are unaffected and a recycled thread id is never cancelled.
+    fn cancel_inflight_read_for(&self, call_id: u64) {
+        let tid = self
+            .inflight_tids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&call_id);
+        let Some(tid) = tid else {
+            debug!(call_id, "watchdog: no in-flight read registered; helper already settled");
             return;
         };
         unsafe {
             match OpenThread(THREAD_ALL_ACCESS, false, tid) {
                 Ok(handle) => {
                     if let Err(e) = CancelSynchronousIo(handle) {
-                        warn!(tid, gen, error = %e, "watchdog: CancelSynchronousIo failed");
+                        warn!(tid, call_id, error = %e, "watchdog: CancelSynchronousIo failed");
                     } else {
-                        info!(tid, gen, "watchdog: cancelled hung pipe read");
+                        info!(tid, call_id, "watchdog: cancelled hung pipe read");
                     }
                     if let Err(e) = windows::Win32::Foundation::CloseHandle(handle) {
-                        warn!(tid, gen, error = %e, "watchdog: CloseHandle(thread) failed");
+                        warn!(tid, call_id, error = %e, "watchdog: CloseHandle(thread) failed");
                     }
                 }
                 Err(e) => {
-                    // The helper already exited (id recycled or gone): nothing
-                    // to cancel; its result path already settled.
-                    debug!(tid, gen, error = %e, "watchdog: OpenThread failed, helper gone");
+                    debug!(tid, call_id, error = %e, "watchdog: OpenThread failed, helper gone");
                 }
             }
         }

@@ -151,7 +151,7 @@ public sealed partial class OverlayWindow : Window
         }
     }
 
-    private void OnSearchBoxKeyDown(object sender, KeyRoutedEventArgs e)
+    private async void OnSearchBoxKeyDown(object sender, KeyRoutedEventArgs e)
     {
         var ctrlDown = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
                         & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
@@ -163,6 +163,7 @@ public sealed partial class OverlayWindow : Window
                 {
                     SearchBox.Text = "";
                     _viewModel.QueryText = "";
+                    _ = _viewModel.SearchNowAsync();
                 }
                 else
                 {
@@ -173,17 +174,15 @@ public sealed partial class OverlayWindow : Window
 
             case VirtualKey.Enter when ctrlDown:
                 // Ctrl+Enter: reveal the result in its folder instead of opening it.
-                if (ResultsList.SelectedItem is ResultItemViewModel revealItem)
-                {
-                    ResultActions.RevealInExplorer(revealItem.Result);
-                    HideOverlay();
-                }
                 e.Handled = true;
+                await FlushPendingQueryAsync();
+                RevealSelectedResult();
                 break;
 
             case VirtualKey.Enter:
-                OpenSelectedResult();
                 e.Handled = true;
+                await FlushPendingQueryAsync();
+                OpenSelectedResult();
                 break;
 
             case VirtualKey.C when ctrlDown && string.IsNullOrEmpty(SearchBox.SelectedText):
@@ -239,9 +238,40 @@ public sealed partial class OverlayWindow : Window
         }
     }
 
+    private async Task FlushPendingQueryAsync()
+    {
+        var queryMismatch = _viewModel.QueryText != SearchBox.Text;
+        if (queryMismatch)
+        {
+            _viewModel.QueryText = SearchBox.Text;
+        }
+
+        if (queryMismatch || _viewModel.HasPendingSearch)
+        {
+            await _viewModel.SearchNowAsync();
+            if (ResultsList.SelectedIndex < 0 && _viewModel.Results.Count > 0)
+            {
+                ResultsList.SelectedIndex = 0;
+            }
+        }
+    }
+
+    private void RevealSelectedResult()
+    {
+        var item = ResultsList.SelectedItem as ResultItemViewModel
+            ?? (_viewModel.Results.Count > 0 ? _viewModel.Results[0] : null);
+        if (item is not null)
+        {
+            ResultActions.RevealInExplorer(item.Result);
+            HideOverlay();
+        }
+    }
+
     private void OpenSelectedResult()
     {
-        if (ResultsList.SelectedItem is ResultItemViewModel item)
+        var item = ResultsList.SelectedItem as ResultItemViewModel
+            ?? (_viewModel.Results.Count > 0 ? _viewModel.Results[0] : null);
+        if (item is not null)
         {
             ResultActions.Open(item.Result);
             HideOverlay();

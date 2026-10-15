@@ -703,7 +703,7 @@ pub fn strip_rtf(input: &str, budget: &ExtractBudget) -> Result<String, ExtractE
                                 | "object"
                                 | "header"
                                 | "footer"
-                                | " headerl"
+                                | "headerl"
                                 | "headerr"
                                 | "footerl"
                                 | "footerr"
@@ -1019,6 +1019,10 @@ mod tests {
 {\fonttbl{\f0 Arial;}{\f1 Courier New;}}
 {\colortbl;\red0\green0\blue0;}
 {\*\generator CustomRtf 1.0;}
+{\headerl Left Page Header Secret}
+{\headerr Right Page Header Secret}
+{\footerl Left Page Footer Secret}
+{\footerr Right Page Footer Secret}
 \pard\f0\fs24 Confidential Merger Proposal\par
 Purchase price is \'8042 million \u8212? subject to board approval.\par
 }"#;
@@ -1034,6 +1038,10 @@ Purchase price is \'8042 million \u8212? subject to board approval.\par
         assert!(text.contains("€42 million — subject to board approval"), "got {text:?}");
         assert!(!text.contains("Arial"));
         assert!(!text.contains("CustomRtf"));
+        assert!(!text.contains("Left Page Header Secret"), "headerl must be skipped: {text:?}");
+        assert!(!text.contains("Right Page Header Secret"), "headerr must be skipped: {text:?}");
+        assert!(!text.contains("Left Page Footer Secret"), "footerl must be skipped: {text:?}");
+        assert!(!text.contains("Right Page Footer Secret"), "footerr must be skipped: {text:?}");
     }
 
     #[test]

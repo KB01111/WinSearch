@@ -51,7 +51,6 @@ pub const EXCLUDED_CODE_DIRS: &[&str] = &[
     ".rustup",
     "bin",
     "obj",
-    "packages",
 ];
 
 /// Exact file names (case-insensitive) never indexed in `code.db`: secrets,
@@ -136,7 +135,7 @@ pub fn detect_repos_with_depth(root: &Path, max_depth: usize) -> io::Result<Vec<
     if !root.exists() {
         return Ok(Vec::new());
     }
-    if has_git_marker(root) {
+    if has_git_marker(root)? {
         return Ok(vec![DetectedRepo {
             root_path: root.to_string_lossy().into_owned(),
             name: dir_name(root),
@@ -196,7 +195,7 @@ fn find_git_repos_recursive(
             continue;
         }
         let sub = entry.path();
-        if has_git_marker(&sub) {
+        if has_git_marker(&sub)? {
             out.push(DetectedRepo {
                 root_path: sub.to_string_lossy().into_owned(),
                 name,
@@ -209,10 +208,16 @@ fn find_git_repos_recursive(
     Ok(())
 }
 
-/// Returns `true` if `dir/.git` exists (either a standard `.git/` directory or
+/// Returns `Ok(true)` if `dir/.git` exists (either a standard `.git/` directory or
 /// a git worktree/submodule `.git` file).
-pub fn has_git_marker(dir: &Path) -> bool {
-    dir.join(".git").exists()
+pub fn has_git_marker(dir: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(dir.join(".git")) {
+        Ok(_) => Ok(true),
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Crawls a single repository (or code folder) root, honoring `.gitignore`
@@ -537,6 +542,9 @@ mod tests {
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0].name, "repo-a");
         assert!(direct[0].has_git);
+        assert!(has_git_marker(&repo_a).unwrap());
+        assert!(has_git_marker(&repo_b).unwrap());
+        assert!(!has_git_marker(&workspace.0).unwrap());
     }
 
     #[test]

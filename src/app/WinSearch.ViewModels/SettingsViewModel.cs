@@ -25,6 +25,7 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
     private readonly Func<DateTimeOffset> _clock;
 
     private bool _suppressConfigPush;
+    private EngineConfig _lastAppliedConfig = new();
     private ulong _lastProgressBytes;
     private DateTimeOffset? _lastProgressTime;
     private double _smoothedBytesPerSec;
@@ -47,6 +48,7 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
         {
             _client.ModelStatusChanged += OnModelStatusChanged;
             _client.ConfigChanged += OnConfigChanged;
+            _client.Reconnected += OnReconnected;
         }
     }
 
@@ -194,9 +196,23 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
             });
             Dispatch(() => ApplyConfig(updated));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Dispatch(() => ModelErrorText = ex.Message);
+            var fallback = _lastAppliedConfig;
+            try
+            {
+                fallback = await _client.GetConfigAsync();
+            }
+            catch
+            {
+                // Fall back to the last applied config if GetConfigAsync also fails.
+            }
+
+            Dispatch(() =>
+            {
+                ApplyConfig(fallback);
+                ModelErrorText = $"Settings sync failed: {ex.Message}";
+            });
         }
     }
 
@@ -209,6 +225,12 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
         {
             normalizedBackend = "auto";
         }
+
+        _lastAppliedConfig = new EngineConfig
+        {
+            SemanticEnabled = config.SemanticEnabled,
+            PreferredBackend = normalizedBackend,
+        };
 
         _suppressConfigPush = true;
         try
@@ -448,6 +470,14 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
         Dispatch(() => ApplyConfig(config));
     }
 
+    private void OnReconnected(object? sender, EventArgs e)
+    {
+        if (!_disposed)
+        {
+            _ = InitializeAsync();
+        }
+    }
+
     private void Dispatch(Action action)
     {
         if (_ui is null || SynchronizationContext.Current == _ui)
@@ -471,6 +501,7 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
         {
             _client.ModelStatusChanged -= OnModelStatusChanged;
             _client.ConfigChanged -= OnConfigChanged;
+            _client.Reconnected -= OnReconnected;
         }
     }
 }

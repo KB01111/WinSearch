@@ -90,6 +90,7 @@ fn llama_source_dir() -> PathBuf {
     if dest.join("CMakeLists.txt").is_file() {
         return dest;
     }
+    let _ = fs::remove_dir_all(&dest);
     fs::create_dir_all(&dest).expect("create llama.cpp cache dir");
     // Fetch exactly the pinned commit (shallow, no full history).
     let git = |args: &[&str]| {

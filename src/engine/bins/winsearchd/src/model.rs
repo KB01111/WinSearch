@@ -194,11 +194,13 @@ impl ModelService {
 
     /// Deletes the model files. Refused while an op runs.
     pub fn delete(&self) -> Result<ModelStatus, String> {
-        if self.active.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+        let active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.is_some() {
             return Err("a model download/import is already running".into());
         }
         *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let status = self.manager.delete().map_err(|e| e.to_string())?;
+        drop(active);
         info!("model files deleted");
         self.push(&status);
         Ok(status)
@@ -236,10 +238,13 @@ impl ModelService {
         kind: OpKind,
         path: Option<PathBuf>,
     ) -> Result<ModelStatus, String> {
-        if self.active.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.is_some() {
             return match kind {
                 // A second start is the same resumable work: idempotent.
-                OpKind::Download => Ok(self.status()),
+                OpKind::Download => {
+                    Ok(self.progress.lock().unwrap_or_else(|p| p.into_inner()).clone())
+                }
                 // Import is not idempotent (it copies), so a concurrent
                 // import is refused and surfaces as Error{invalid_request}.
                 OpKind::Import => Err("a model download/import is already running".into()),
@@ -255,25 +260,37 @@ impl ModelService {
             *next += 1;
             id
         };
-        *self.active.lock().unwrap_or_else(|p| p.into_inner()) = Some(ActiveOp {
-            id,
-            cancel: Arc::clone(&cancel),
-        });
         *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let total = self.manager.total_bytes();
-        *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = ModelStatus {
+        let started = ModelStatus {
             state: ModelState::Downloading,
             total_bytes: total,
             ..Default::default()
         };
+        *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = started.clone();
 
         let this = Arc::clone(self);
-        let started = self.status();
-        self.push(&started);
-        std::thread::Builder::new()
+        let thread_cancel = Arc::clone(&cancel);
+        if let Err(e) = std::thread::Builder::new()
             .name("winsearch-model".into())
-            .spawn(move || this.run_op(id, kind, path.as_deref(), &cancel))
-            .map_err(|e| format!("cannot spawn model thread: {e}"))?;
+            .spawn(move || this.run_op(id, kind, path.as_deref(), &thread_cancel))
+        {
+            let msg = format!("cannot spawn model thread: {e}");
+            *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = ModelStatus {
+                state: ModelState::Error,
+                total_bytes: total,
+                error: Some(msg.clone()),
+                ..Default::default()
+            };
+            *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(Outcome::Failed(msg.clone()));
+            *active = None;
+            return Err(msg);
+        }
+        *active = Some(ActiveOp { id, cancel });
+        drop(active);
+
+        self.push(&started);
         info!(?kind, "model operation started");
         Ok(started)
     }

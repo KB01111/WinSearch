@@ -194,4 +194,52 @@ impl DaemonClient {
             }
         }
     }
+
+    pub fn start_model_download(
+        &mut self,
+        progress: impl FnMut(&ModelStatus),
+    ) -> Result<ModelStatus, IpcError> {
+        let id = self.alloc_id();
+        write_message(&mut self.stream, &ClientMessage::ModelDownloadStart { id })?;
+        self.await_model_terminal(id, progress)
+    }
+
+    pub fn import_model(
+        &mut self,
+        path: String,
+        progress: impl FnMut(&ModelStatus),
+    ) -> Result<ModelStatus, IpcError> {
+        let id = self.alloc_id();
+        write_message(&mut self.stream, &ClientMessage::ModelImport { id, path })?;
+        self.await_model_terminal(id, progress)
+    }
+
+    fn await_model_terminal(
+        &mut self,
+        id: u64,
+        mut progress: impl FnMut(&ModelStatus),
+    ) -> Result<ModelStatus, IpcError> {
+        loop {
+            match read_message::<_, ServerMessage>(&mut self.stream)? {
+                Some(ServerMessage::ModelStatus {
+                    id: resp_id,
+                    status,
+                }) if resp_id.is_none() || resp_id == Some(id) => {
+                    progress(&status);
+                    if status.state != ws_modelmgr::ModelState::Downloading {
+                        return Ok(status);
+                    }
+                }
+                Some(ServerMessage::Error {
+                    id: resp_id,
+                    code,
+                    message,
+                }) if resp_id.is_none() || resp_id == Some(id) => {
+                    return Err(IpcError::ServerError { code, message });
+                }
+                Some(_) => continue,
+                None => return Err(IpcError::UnexpectedEof),
+            }
+        }
+    }
 }

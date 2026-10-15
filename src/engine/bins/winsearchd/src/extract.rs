@@ -20,7 +20,7 @@ use ws_extract::{
     DocumentExtractor, ExtractBudget, ExtractError, ExtractOutput, ExtractionStatus, Extractor,
     ImageExtractor, SegmentDraft,
 };
-use ws_index::model::{NewSegment, SEGMENT_KIND_DOC, SEGMENT_KIND_IMAGE};
+use ws_index::model::{NewSegment, SEGMENT_KIND_DOC, SEGMENT_KIND_IMAGE, SEGMENT_KIND_OCR};
 use ws_index::{ExtractJob, StoreError};
 
 use crate::embed_client::{EmbedSupervisor, EMBED_JOB_TIMEOUT};
@@ -153,7 +153,10 @@ impl Indexer {
         // the file remains searchable by exact/semantic name.
         let Some(extractor) = registry.get(&job.kind) else {
             let mut store = self.store_lock();
+            clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
             store.complete_extract_job(job.id)?;
+            drop(store);
+            self.invalidate_vector_cache();
             return Ok(ExtractStepOutcome {
                 claimed: true,
                 status: Some(ExtractionStatus::Unsupported),
@@ -190,7 +193,10 @@ impl Indexer {
                 );
                 let mut store = self.store_lock();
                 if permanent {
+                    clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
                     let _ = store.mark_extract_failed(job.id);
+                    drop(store);
+                    self.invalidate_vector_cache();
                     return Ok(ExtractStepOutcome {
                         claimed: true,
                         status: Some(ExtractionStatus::Failed(err.to_string())),
@@ -199,6 +205,13 @@ impl Indexer {
                     });
                 }
                 let poisoned = Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                if poisoned {
+                    clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
+                }
+                drop(store);
+                if poisoned {
+                    self.invalidate_vector_cache();
+                }
                 return Ok(ExtractStepOutcome {
                     claimed: true,
                     status: Some(ExtractionStatus::Failed(err.to_string())),
@@ -214,11 +227,14 @@ impl Indexer {
             ExtractionStatus::Unsupported | ExtractionStatus::Failed(_)
         ) {
             let mut store = self.store_lock();
+            clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
             if matches!(output.status, ExtractionStatus::Failed(_)) {
                 let _ = store.mark_extract_failed(job.id);
             } else {
                 store.complete_extract_job(job.id)?;
             }
+            drop(store);
+            self.invalidate_vector_cache();
             return Ok(ExtractStepOutcome {
                 claimed: true,
                 status: Some(output.status),
@@ -350,6 +366,9 @@ impl Indexer {
 
         store.replace_content_fts(job.entry_id, &job.kind, &fts_texts)?;
         store.remove_segments_for_entry_and_kind(job.entry_id, &job.kind)?;
+        if job.kind == SEGMENT_KIND_IMAGE {
+            store.remove_segments_for_entry_and_kind(job.entry_id, SEGMENT_KIND_OCR)?;
+        }
 
         if let Some(thumb) = output
             .segments
@@ -382,7 +401,7 @@ impl Indexer {
         for (draft, vec) in embeddable.iter().zip(vectors.iter()) {
             let kind_str = draft.kind.as_str();
             let chunk_idx = next_chunk_by_kind.entry(kind_str).or_insert(0);
-            if *chunk_idx == 0 && kind_str != job.kind {
+            if *chunk_idx == 0 && kind_str != job.kind && kind_str != SEGMENT_KIND_OCR {
                 store.remove_segments_for_entry_and_kind(job.entry_id, kind_str)?;
             }
             store.upsert_segment(NewSegment {
@@ -401,6 +420,8 @@ impl Indexer {
         }
 
         store.complete_extract_job(job.id)?;
+        drop(store);
+        self.invalidate_vector_cache();
         Ok(ExtractStepOutcome {
             claimed: true,
             status: Some(output.status),
@@ -490,6 +511,19 @@ impl Indexer {
             false
         }
     }
+}
+
+fn clear_modality_artifacts(
+    store: &mut ws_index::IndexStore,
+    entry_id: i64,
+    job_kind: &str,
+) -> Result<(), StoreError> {
+    store.delete_content_text(entry_id)?;
+    store.remove_segments_for_entry_and_kind(entry_id, job_kind)?;
+    if job_kind == SEGMENT_KIND_IMAGE {
+        store.remove_segments_for_entry_and_kind(entry_id, SEGMENT_KIND_OCR)?;
+    }
+    Ok(())
 }
 
 fn run_extractor_with_budget(
@@ -928,6 +962,137 @@ mod tests {
         assert!(!sem_hits.is_empty());
         assert_eq!(sem_hits[0].segment.entry_id, cam_hits[0].entry_id);
         assert!(sem_hits[0].cosine > 0.99);
+    }
+
+    #[test]
+    fn unsupported_or_failed_reextraction_clears_stale_content_fts_and_segments() {
+        let tree = TempTree::new();
+        let file = tree.0.join("mutable.txt");
+        fs::write(&file, "unique_stale_keyword_alpha in document").unwrap();
+
+        let indexer = seeded_indexer(&tree);
+        let registry = ExtractorRegistry::default();
+        let out = indexer.extract_once_with(&registry, fake_embed).unwrap();
+        assert_eq!(out.status, Some(ExtractionStatus::Extracted));
+        assert!(out.segments_stored >= 1);
+
+        let hits = indexer
+            .search(&SearchRequest {
+                text: "unique_stale_keyword_alpha".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let entry_id = hits[0].entry_id;
+
+        // Re-enqueue the content job and run against an extractor that returns Unsupported.
+        struct UnsupportedDocExtractor;
+        impl Extractor for UnsupportedDocExtractor {
+            fn extract(
+                &self,
+                _path: &Path,
+                _budget: &ExtractBudget,
+            ) -> Result<ExtractOutput, ExtractError> {
+                Ok(ExtractOutput::unsupported())
+            }
+        }
+
+        {
+            let mut store = indexer.store_lock();
+            store.enqueue_extract_job(entry_id, SEGMENT_KIND_DOC).unwrap();
+        }
+        let mut unsup_reg = ExtractorRegistry::default();
+        unsup_reg.register(SEGMENT_KIND_DOC, Arc::new(UnsupportedDocExtractor));
+        let out2 = indexer.extract_once_with(&unsup_reg, fake_embed).unwrap();
+        assert_eq!(out2.status, Some(ExtractionStatus::Unsupported));
+
+        assert!(
+            indexer
+                .search(&SearchRequest {
+                    text: "unique_stale_keyword_alpha".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "stale content_fts must be cleared on Unsupported"
+        );
+        {
+            let store = indexer.store_lock();
+            let segs = store.list_segments_for_entry(entry_id).unwrap();
+            assert!(
+                segs.iter().all(|s| s.kind != SEGMENT_KIND_DOC),
+                "stale doc segments must be cleared on Unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn image_reextraction_without_ocr_clears_stale_ocr_segments() {
+        struct StubImageExtractor {
+            with_ocr: bool,
+        }
+        impl Extractor for StubImageExtractor {
+            fn extract(
+                &self,
+                _path: &Path,
+                _budget: &ExtractBudget,
+            ) -> Result<ExtractOutput, ExtractError> {
+                let mut segments = vec![SegmentDraft::text(
+                    SEGMENT_KIND_IMAGE,
+                    "Camera: Canon EOS",
+                )];
+                if self.with_ocr {
+                    segments.push(SegmentDraft::text(
+                        SEGMENT_KIND_OCR,
+                        "STALE_OCR_TOKEN_999",
+                    ));
+                }
+                Ok(ExtractOutput {
+                    status: ExtractionStatus::Extracted,
+                    segments,
+                })
+            }
+        }
+
+        let tree = TempTree::new();
+        let img = tree.0.join("screen.png");
+        fs::write(&img, b"fake-png").unwrap();
+
+        let indexer = seeded_indexer(&tree);
+        let mut reg1 = ExtractorRegistry::default();
+        reg1.register(SEGMENT_KIND_IMAGE, Arc::new(StubImageExtractor { with_ocr: true }));
+        let out1 = indexer.extract_once_with(&reg1, fake_embed).unwrap();
+        assert_eq!(out1.status, Some(ExtractionStatus::Extracted));
+
+        let entry_id = {
+            let store = indexer.store_lock();
+            let row = store.find_by_path(&img.to_string_lossy()).unwrap().unwrap();
+            let segs = store.list_segments_for_entry(row.id).unwrap();
+            assert!(segs.iter().any(|s| s.kind == SEGMENT_KIND_OCR));
+            row.id
+        };
+
+        // Re-extract the same image when the new extraction produces NO OCR draft.
+        {
+            let mut store = indexer.store_lock();
+            store.enqueue_extract_job(entry_id, SEGMENT_KIND_IMAGE).unwrap();
+        }
+        let mut reg2 = ExtractorRegistry::default();
+        reg2.register(SEGMENT_KIND_IMAGE, Arc::new(StubImageExtractor { with_ocr: false }));
+        let out2 = indexer.extract_once_with(&reg2, fake_embed).unwrap();
+        assert_eq!(out2.status, Some(ExtractionStatus::Extracted));
+
+        {
+            let store = indexer.store_lock();
+            let segs = store.list_segments_for_entry(entry_id).unwrap();
+            assert!(
+                segs.iter().all(|s| s.kind != SEGMENT_KIND_OCR),
+                "stale OCR segment must be removed when re-extraction produces no OCR draft"
+            );
+            assert!(segs.iter().any(|s| s.kind == SEGMENT_KIND_IMAGE));
+        }
     }
 }
 

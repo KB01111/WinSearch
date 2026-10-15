@@ -11,6 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde::Deserialize;
 use ws_embed_protocol::STUB_DIM;
@@ -170,14 +173,14 @@ pub trait EvalEmbedder {
 
 /// Deterministic concept-aware semantic embedder used when no real GGUF is
 /// configured. Maps domain/multilingual concept clusters into dedicated
-/// orthogonal subspaces (dimensions 0..64) plus weak per-token hashed features
-/// (dimensions 64..768) so unrelated queries stay below `MIN_SEMANTIC_COSINE`
+/// orthogonal subspaces (dimensions 0..32) plus weak per-token hashed features
+/// (dimensions 32..768) so unrelated queries stay below `MIN_SEMANTIC_COSINE`
 /// while genuine semantic paraphrases and cross-lingual synonyms score high.
 pub struct ConceptStubEmbedder;
 
 impl EvalEmbedder for ConceptStubEmbedder {
     fn label(&self) -> &str {
-        "concept-stub-768d (deterministic CI fallback)"
+        "ConceptStubEmbedder (pipeline smoke test; deterministic 768d CI fallback)"
     }
 
     fn embed_texts(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -185,16 +188,92 @@ impl EvalEmbedder for ConceptStubEmbedder {
     }
 }
 
+static WORKER_PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Worker-backed embedder used when `WS_EMBED_TEST_MODEL` points to a real GGUF.
 pub struct WorkerModelEmbedder {
     model_path: PathBuf,
+    pipe_name: String,
     label: String,
+    child: Mutex<Option<Child>>,
+    next_id: AtomicU64,
 }
 
 impl WorkerModelEmbedder {
     pub fn new(model_path: PathBuf) -> Self {
-        let label = format!("winsearch-embed ({})", model_path.display());
-        Self { model_path, label }
+        let label = format!(
+            "WorkerModelEmbedder (live model; winsearch-embed: {})",
+            model_path.display()
+        );
+        let pipe_name = format!(
+            r"\\.\pipe\winsearch-cli-eval-{}-{}-{}",
+            std::process::id(),
+            WORKER_PIPE_SEQ.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        Self {
+            model_path,
+            pipe_name,
+            label,
+            child: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn ensure_child(&self) -> anyhow::Result<()> {
+        let mut guard = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(child) = guard.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return Ok(()),
+                _ => {
+                    *guard = None;
+                }
+            }
+        }
+
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut worker_bin = exe_dir.join(format!("winsearch-embed{}", std::env::consts::EXE_SUFFIX));
+        if !worker_bin.is_file() {
+            if let Some(parent) = exe_dir.parent() {
+                let candidate = parent.join(format!("winsearch-embed{}", std::env::consts::EXE_SUFFIX));
+                if candidate.is_file() {
+                    worker_bin = candidate;
+                }
+            }
+        }
+        if !worker_bin.is_file() {
+            anyhow::bail!(
+                "WS_EMBED_TEST_MODEL is set ({}), but worker binary {} was not found",
+                self.model_path.display(),
+                worker_bin.display()
+            );
+        }
+
+        let child = Command::new(&worker_bin)
+            .arg("--pipe")
+            .arg(&self.pipe_name)
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--idle-secs")
+            .arg("60")
+            .spawn()?;
+        *guard = Some(child);
+        Ok(())
+    }
+}
+
+impl Drop for WorkerModelEmbedder {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -204,79 +283,56 @@ impl EvalEmbedder for WorkerModelEmbedder {
     }
 
     fn embed_texts(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        // If `winsearch-embed` binary is available next to our binary, drive it
-        // over a dedicated temporary pipe; otherwise fall back cleanly if not built.
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let worker_bin = exe_dir.join(format!("winsearch-embed{}", std::env::consts::EXE_SUFFIX));
-        if !worker_bin.is_file() {
-            anyhow::bail!(
-                "WS_EMBED_TEST_MODEL is set ({}), but worker binary {} was not found",
-                self.model_path.display(),
-                worker_bin.display()
-            );
-        }
-        let pipe = format!(
-            r"\\.\pipe\winsearch-cli-eval-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let mut child = std::process::Command::new(&worker_bin)
-            .arg("--pipe")
-            .arg(&pipe)
-            .arg("--model")
-            .arg(&self.model_path)
-            .arg("--idle-secs")
-            .arg("10")
-            .spawn()?;
+        self.ensure_child()?;
 
-        let res = (|| -> anyhow::Result<Vec<Vec<f32>>> {
-            let start = std::time::Instant::now();
-            let mut stream = loop {
-                match ws_platform::pipe::PipeStream::connect(&pipe) {
-                    Ok(s) => break s,
-                    Err(_) if start.elapsed() < std::time::Duration::from_secs(15) => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(e) => anyhow::bail!("failed to connect to eval worker pipe: {e}"),
+        let start = std::time::Instant::now();
+        let mut stream = loop {
+            match ws_platform::pipe::PipeStream::connect(&self.pipe_name) {
+                Ok(s) => break s,
+                Err(_) if start.elapsed() < std::time::Duration::from_secs(15) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-            };
-            ws_protocol::write_message(
-                &mut stream,
-                &ws_embed_protocol::EmbedRequest::Hello {
-                    protocol_version: ws_embed_protocol::EMBED_PROTOCOL_VERSION,
-                    client: "winsearch-cli".into(),
-                    client_version: env!("CARGO_PKG_VERSION").into(),
-                },
-            )?;
-            let _ack: Option<ws_embed_protocol::EmbedResponse> =
-                ws_protocol::read_message(&mut stream)?;
-            ws_protocol::write_message(
-                &mut stream,
-                &ws_embed_protocol::EmbedRequest::EmbedTexts {
-                    id: 1,
-                    texts: texts.to_vec(),
-                },
-            )?;
-            let reply: Option<ws_embed_protocol::EmbedResponse> =
-                ws_protocol::read_message(&mut stream)?;
-            match reply {
-                Some(ws_embed_protocol::EmbedResponse::Embeddings { vecs, .. }) => Ok(vecs),
-                Some(ws_embed_protocol::EmbedResponse::Error { code, message, .. }) => {
-                    anyhow::bail!("worker error {code:?}: {message}")
-                }
-                other => anyhow::bail!("unexpected worker reply: {other:?}"),
+                Err(e) => anyhow::bail!("failed to connect to eval worker pipe {}: {e}", self.pipe_name),
             }
-        })();
+        };
 
-        let _ = child.kill();
-        let _ = child.wait();
-        res
+        ws_protocol::write_message(
+            &mut stream,
+            &ws_embed_protocol::EmbedRequest::Hello {
+                protocol_version: ws_embed_protocol::EMBED_PROTOCOL_VERSION,
+                client: "winsearch-cli".into(),
+                client_version: env!("CARGO_PKG_VERSION").into(),
+            },
+        )?;
+        let ack: Option<ws_embed_protocol::EmbedResponse> =
+            ws_protocol::read_message(&mut stream)?;
+        match ack {
+            Some(ws_embed_protocol::EmbedResponse::HelloAck { .. }) => {}
+            Some(ws_embed_protocol::EmbedResponse::Error { code, message, .. }) => {
+                anyhow::bail!("worker handshake error {code:?}: {message}");
+            }
+            other => {
+                anyhow::bail!("unexpected worker handshake reply: {other:?}");
+            }
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        ws_protocol::write_message(
+            &mut stream,
+            &ws_embed_protocol::EmbedRequest::EmbedTexts {
+                id,
+                texts: texts.to_vec(),
+            },
+        )?;
+        let reply: Option<ws_embed_protocol::EmbedResponse> =
+            ws_protocol::read_message(&mut stream)?;
+        match reply {
+            Some(ws_embed_protocol::EmbedResponse::Embeddings { vecs, .. }) => Ok(vecs),
+            Some(ws_embed_protocol::EmbedResponse::Error { code, message, .. }) => {
+                anyhow::bail!("worker error {code:?}: {message}")
+            }
+            other => anyhow::bail!("unexpected worker reply: {other:?}"),
+        }
     }
 }
 
@@ -584,7 +640,7 @@ fn hybrid_score(cosine: f32, query_text: &str, name_lower: &str, mtime: i64, now
 /// Concept clusters for the deterministic semantic-concept stub embedder.
 /// Each cluster maps synonyms, paraphrases, and multilingual equivalents into
 /// dedicated basis dimensions `0..32`, while individual tokens hash into
-/// dimensions `64..dim` with low weight so unrelated queries remain nearly
+/// dimensions `32..dim` with low weight so unrelated queries remain nearly
 /// orthogonal (`cosine < 0.15`, well below `MIN_SEMANTIC_COSINE = 0.35`).
 const CONCEPT_CLUSTERS: &[(&[&str], usize, f32)] = &[
     // 0: Finance / budget / spreadsheets (EN + JA)

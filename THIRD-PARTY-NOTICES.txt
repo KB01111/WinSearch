@@ -39,50 +39,58 @@ WinSearch incorporates or references the following third-party software.
    License:  MIT OR Apache-2.0
    Usage:    Error handling and logging in the engine.
 
-8. half
+7. half
    Project:  https://github.com/starkat99/half-rs
    License:  MIT OR Apache-2.0
    Usage:    FP16 vector storage (normalized embeddings) in ws-index.
 
-7. .NET / Windows App SDK / CommunityToolkit.Mvvm
-    Project:  https://dotnet.microsoft.com/
-              https://github.com/microsoft/WindowsAppSDK
-              https://github.com/CommunityToolkit/dotnet
-    License:  MIT
-    Usage:    WinUI 3 frontend (referenced as NuGet packages; not
-              redistributed in this repository).
+8. .NET / Windows App SDK / CommunityToolkit.Mvvm
+   Project:  https://dotnet.microsoft.com/
+             https://github.com/microsoft/WindowsAppSDK
+             https://github.com/CommunityToolkit/dotnet
+   License:  MIT
+   Usage:    WinUI 3 frontend (referenced as NuGet packages; not
+             redistributed in this repository).
 
-8. ureq (with rustls)
-    Project:  https://github.com/algesten/ureq
-    License:  MIT OR Apache-2.0
-    Usage:    Embedding-model download in ws-modelmgr (blocking HTTP with
-              Range resume; TLS via rustls with platform roots).
+9. ureq (with rustls)
+   Project:  https://github.com/algesten/ureq
+   License:  MIT OR Apache-2.0
+   Usage:    Embedding-model download in ws-modelmgr (blocking HTTP with
+             Range resume; TLS via rustls with platform roots).
 
-9. rustls
+10. rustls
     Project:  https://github.com/rustls/rustls
     License:  MIT OR Apache-2.0 OR ISC
     Usage:    TLS for model downloads (pulled in via ureq).
 
-10. sha2, hex
+11. sha2, hex
     Project:  https://github.com/RustCrypto/hashes (sha2)
               https://github.com/KokaKiwi/rust-hex (hex)
     License:  MIT OR Apache-2.0
     Usage:    SHA-256 verification of downloaded/imported model files.
 
-11. quick-xml
+12. quick-xml
     Project:  https://github.com/tafia/quick-xml
     License:  MIT
     Usage:    Streaming XML/HTML text extraction for `.html`, `.xml`, `.docx`,
               and `.odt` documents in ws-extract.
 
-12. zip
+13. zip
     Project:  https://github.com/zip-rs/zip2
     License:  MIT
     Usage:    Archive reading for `.docx` and `.odt` document containers in
               ws-extract.
 
-13. ignore
+14. ignore
     Project:  https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore
     License:  MIT OR Unlicense
     Usage:    .gitignore-aware directory traversal (nested .gitignore and
               negation rules) for the opt-in code index in ws-code.
+
+15. llama.cpp / ggml / mtmd
+    Project:  https://github.com/ggml-org/llama.cpp
+    License:  MIT
+    Copyright (c) 2023-2026 Georgi Gerganov and llama.cpp contributors
+    Usage:    Native inference runtime for text and multimodal embeddings in
+              ws-embed (fetched at build time at a pinned commit and linked via
+              a flat C ABI shim).

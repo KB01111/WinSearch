@@ -133,19 +133,21 @@ where
     };
     let handle = Arc::new(OwnedHandle(handle, AtomicBool::new(false)));
     let thread_handle = Arc::clone(&handle);
+    let root_buf = root.to_path_buf();
+    let thread_root = root_buf.clone();
 
     let thread = std::thread::Builder::new()
         .name("winsearch-watcher".into())
-        .spawn(move || watch_loop(thread_handle, &on_event))?;
+        .spawn(move || watch_loop(&thread_root, thread_handle, &on_event))?;
 
     Ok(Watcher {
-        root: root.to_path_buf(),
+        root: root_buf,
         handle,
         thread: Some(thread),
     })
 }
 
-fn watch_loop(handle: Arc<OwnedHandle>, on_event: &(dyn Fn(WatchEvent) + Send)) {
+fn watch_loop(root: &Path, handle: Arc<OwnedHandle>, on_event: &(dyn Fn(WatchEvent) + Send)) {
     let mut buffer = vec![0u8; NOTIFY_BUFFER_BYTES];
     let filter = FILE_NOTIFY_CHANGE_FILE_NAME
         | FILE_NOTIFY_CHANGE_DIR_NAME
@@ -177,7 +179,17 @@ fn watch_loop(handle: Arc<OwnedHandle>, on_event: &(dyn Fn(WatchEvent) + Send)) 
             continue;
         }
         for event in parse_notifications(&buffer[..returned as usize]) {
-            on_event(event);
+            let full_event = match event {
+                WatchEvent::Created(p) => WatchEvent::Created(root.join(p)),
+                WatchEvent::Deleted(p) => WatchEvent::Deleted(root.join(p)),
+                WatchEvent::Modified(p) => WatchEvent::Modified(root.join(p)),
+                WatchEvent::Renamed { from, to } => WatchEvent::Renamed {
+                    from: root.join(from),
+                    to: root.join(to),
+                },
+                WatchEvent::Overflow => WatchEvent::Overflow,
+            };
+            on_event(full_event);
         }
     }
 }
@@ -328,13 +340,18 @@ mod tests {
             && !(saw_create && saw_rename && saw_delete)
         {
             match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(WatchEvent::Created(p)) if p.ends_with("hello.txt") => saw_create = true,
-                Ok(WatchEvent::Renamed { from, to })
-                    if from.ends_with("hello.txt") && to.ends_with("renamed.txt") =>
+                Ok(WatchEvent::Created(ref p)) if p == &tree.0.join("hello.txt") => {
+                    saw_create = true
+                }
+                Ok(WatchEvent::Renamed { ref from, ref to })
+                    if from == &tree.0.join("hello.txt")
+                        && to == &tree.0.join("renamed.txt") =>
                 {
                     saw_rename = true
                 }
-                Ok(WatchEvent::Deleted(p)) if p.ends_with("renamed.txt") => saw_delete = true,
+                Ok(WatchEvent::Deleted(ref p)) if p == &tree.0.join("renamed.txt") => {
+                    saw_delete = true
+                }
                 Ok(_) => {}
                 Err(_) => {}
             }

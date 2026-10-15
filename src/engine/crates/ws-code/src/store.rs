@@ -577,6 +577,28 @@ impl CodeStore {
         Ok(id)
     }
 
+    /// Deletes any chunks (and their `code_chunks_fts` entries) for `file_id`
+    /// with `chunk_index >= keep`.
+    pub fn truncate_chunks_for_file(
+        &mut self,
+        file_id: i64,
+        keep: i64,
+    ) -> Result<(), CodeStoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM code_chunks_fts WHERE rowid IN (
+                 SELECT id FROM code_chunks WHERE file_id = ?1 AND chunk_index >= ?2
+             )",
+            params![file_id, keep],
+        )?;
+        tx.execute(
+            "DELETE FROM code_chunks WHERE file_id = ?1 AND chunk_index >= ?2",
+            params![file_id, keep],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Updates only the embedding vector of an existing chunk.
     pub fn set_chunk_vector(
         &mut self,

@@ -3,8 +3,10 @@
 //! filters).
 //!
 //! Uses `LoadIFilter` (`query.dll`) + `IFilter::Init` + `GetChunk` / `GetText`
+//! on a dedicated helper thread waited on via `mpsc::Receiver::recv_timeout`
 //! to stream plain text chunks with a strict character cap and wall-clock
-//! deadline so buggy or hung third-party COM filters cannot stall extraction.
+//! deadline so buggy or hung third-party COM filters cannot stall extraction
+//! even if a single COM call blocks indefinitely.
 //! If no filter is registered for the file extension (`E_FAIL` /
 //! `FILTER_E_UNKNOWNFORMAT` / `REGDB_E_CLASSNOTREG`), returns
 //! [`IFilterOutcome::Unsupported`] so the caller degrades cleanly to
@@ -13,14 +15,15 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Instant;
 
 use windows::core::{HRESULT, Interface, IUnknown, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::Storage::IndexServer::{
-    IFilter, LoadIFilter, CHUNK_TEXT, FILTER_E_END_OF_CHUNKS, FILTER_E_NO_MORE_TEXT,
-    FILTER_E_NO_TEXT, FILTER_E_NO_VALUES, FILTER_S_LAST_TEXT,
-    IFILTER_INIT_APPLY_INDEX_ATTRIBUTES, IFILTER_INIT_CANON_HYPHENS,
+    IFilter, LoadIFilter, CHUNK_TEXT, FILTER_E_EMBEDDING_UNAVAILABLE, FILTER_E_END_OF_CHUNKS,
+    FILTER_E_LINK_UNAVAILABLE, FILTER_E_NO_MORE_TEXT, FILTER_E_NO_TEXT, FILTER_E_NO_VALUES,
+    FILTER_S_LAST_TEXT, IFILTER_INIT_APPLY_INDEX_ATTRIBUTES, IFILTER_INIT_CANON_HYPHENS,
     IFILTER_INIT_CANON_PARAGRAPHS, IFILTER_INIT_CANON_SPACES, IFILTER_INIT_HARD_LINE_BREAKS,
     STAT_CHUNK,
 };
@@ -66,7 +69,60 @@ impl Drop for ComGuard {
 
 /// Extracts plain text from `path` via Windows `LoadIFilter`, collecting at
 /// most `max_chars` characters and aborting if `Instant::now() >= deadline`.
+///
+/// The COM filter runs on a dedicated helper thread waited on with
+/// `recv_timeout` so a third-party `IFilter` that blocks inside `LoadIFilter`,
+/// `Init`, `GetChunk`, or `GetText` cannot stall the caller past `deadline`.
 pub fn extract_text_via_ifilter(
+    path: &Path,
+    max_chars: usize,
+    deadline: Instant,
+) -> IFilterOutcome {
+    if Instant::now() >= deadline {
+        return IFilterOutcome::DeadlineExceeded;
+    }
+    if !path.is_file() {
+        return IFilterOutcome::Unsupported;
+    }
+
+    let path_buf = path.to_path_buf();
+    run_with_deadline(deadline, move || {
+        extract_text_via_ifilter_blocking(&path_buf, max_chars, deadline)
+    })
+}
+
+fn run_with_deadline<F>(deadline: Instant, work: F) -> IFilterOutcome
+where
+    F: FnOnce() -> IFilterOutcome + Send + 'static,
+{
+    let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+        return IFilterOutcome::DeadlineExceeded;
+    };
+    if timeout.is_zero() {
+        return IFilterOutcome::DeadlineExceeded;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let spawn_res = std::thread::Builder::new()
+        .name("ws-ifilter".into())
+        .spawn(move || {
+            let outcome = work();
+            let _ = tx.send(outcome);
+        });
+    if let Err(e) = spawn_res {
+        return IFilterOutcome::Failed(format!("failed to spawn IFilter worker thread: {e}"));
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Timeout) => IFilterOutcome::DeadlineExceeded,
+        Err(RecvTimeoutError::Disconnected) => {
+            IFilterOutcome::Failed("IFilter worker thread terminated unexpectedly".into())
+        }
+    }
+}
+
+fn extract_text_via_ifilter_blocking(
     path: &Path,
     max_chars: usize,
     deadline: Instant,
@@ -136,11 +192,15 @@ pub fn extract_text_via_ifilter(
         if chunk_hr == FILTER_E_END_OF_CHUNKS {
             break;
         }
-        if chunk_hr == FILTER_E_NO_TEXT || chunk_hr == FILTER_E_NO_VALUES {
+        if chunk_hr == FILTER_E_NO_TEXT
+            || chunk_hr == FILTER_E_NO_VALUES
+            || chunk_hr == FILTER_E_EMBEDDING_UNAVAILABLE
+            || chunk_hr == FILTER_E_LINK_UNAVAILABLE
+        {
             continue;
         }
         if chunk_hr.is_err() {
-            break;
+            return IFilterOutcome::Failed(format!("IFilter::GetChunk failed: {chunk_hr:?}"));
         }
 
         if (stat.flags.0 & CHUNK_TEXT.0) == 0 {
@@ -189,3 +249,42 @@ pub fn extract_text_via_ifilter(
 
 /// Alias for [`extract_text_via_ifilter`].
 pub use extract_text_via_ifilter as extract_text_ifilter;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn expired_deadline_returns_deadline_exceeded() {
+        let past = Instant::now() - Duration::from_millis(10);
+        let res = extract_text_via_ifilter(Path::new("nonexistent.doc"), 1024, past);
+        assert_eq!(res, IFilterOutcome::DeadlineExceeded);
+    }
+
+    #[test]
+    fn missing_file_returns_unsupported() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let res = extract_text_via_ifilter(
+            Path::new(r"C:\nonexistent-winsearch-ifilter-test.doc"),
+            1024,
+            deadline,
+        );
+        assert_eq!(res, IFilterOutcome::Unsupported);
+    }
+
+    #[test]
+    fn hung_worker_times_out_at_deadline_without_stalling_caller() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(50);
+        let outcome = run_with_deadline(deadline, || {
+            std::thread::sleep(Duration::from_secs(5));
+            IFilterOutcome::Extracted("never".into())
+        });
+        assert_eq!(outcome, IFilterOutcome::DeadlineExceeded);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "caller must return promptly on deadline timeout"
+        );
+    }
+}

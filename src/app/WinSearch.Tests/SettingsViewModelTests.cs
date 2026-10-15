@@ -137,6 +137,92 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task RejectedSetConfig_RevertsUiToEngineConfig_AndSetsErrorText()
+    {
+        var fake = new FakeEngineClient
+        {
+            CurrentConfig = new EngineConfig
+            {
+                SemanticEnabled = true,
+                PreferredBackend = "vulkan",
+            },
+            SetConfigHandler = (_, _) =>
+                Task.FromException<EngineConfig>(new EngineException(ErrorCode.InvalidRequest, "backend rejected")),
+        };
+        using var vm = new SettingsViewModel(new AppSettings(), fake);
+
+        await vm.InitializeAsync();
+        Assert.True(vm.EnableSemanticSearch);
+        Assert.Equal("vulkan", vm.SelectedBackend);
+
+        // User selects a backend that the engine rejects -> UI reverts to engine's config via GetConfigAsync
+        vm.SelectedBackend = "cuda";
+        Assert.Single(fake.SetConfigCalls);
+        Assert.Equal("vulkan", vm.SelectedBackend);
+        Assert.True(vm.EnableSemanticSearch);
+        Assert.Equal("Settings sync failed: backend rejected", vm.ModelErrorText);
+
+        // If GetConfigAsync also fails during recovery, UI falls back to the last applied config
+        fake.GetConfigHandler = _ => Task.FromException<EngineConfig>(new IOException("pipe broken"));
+        vm.EnableSemanticSearch = false;
+        Assert.Equal(2, fake.SetConfigCalls.Count);
+        Assert.True(vm.EnableSemanticSearch);
+        Assert.Equal("vulkan", vm.SelectedBackend);
+        Assert.Equal("Settings sync failed: backend rejected", vm.ModelErrorText);
+    }
+
+    [Fact]
+    public async Task InitializeBeforeConnected_RefreshesAndClearsErrorOnReconnected()
+    {
+        var connected = false;
+        var fake = new FakeEngineClient
+        {
+            CurrentModelStatus = new ModelStatus
+            {
+                State = ModelState.Ready,
+                Bytes = 864_676_480UL,
+                TotalBytes = 864_676_480UL,
+            },
+            CurrentConfig = new EngineConfig
+            {
+                SemanticEnabled = false,
+                PreferredBackend = "cuda",
+            },
+            GetModelStatusHandler = _ => connected
+                ? Task.FromResult(new ModelStatus
+                {
+                    State = ModelState.Ready,
+                    Bytes = 864_676_480UL,
+                    TotalBytes = 864_676_480UL,
+                })
+                : Task.FromException<ModelStatus>(new IOException("not connected")),
+            GetConfigHandler = _ => connected
+                ? Task.FromResult(new EngineConfig
+                {
+                    SemanticEnabled = false,
+                    PreferredBackend = "cuda",
+                })
+                : Task.FromException<EngineConfig>(new IOException("not connected")),
+        };
+
+        using var vm = new SettingsViewModel(new AppSettings(), fake);
+
+        // Settings opened before initial connection completes
+        await vm.InitializeAsync();
+        Assert.Equal("not connected", vm.ModelErrorText);
+        Assert.Equal(ModelState.NotDownloaded, vm.ModelState);
+
+        // Initial connection (or reconnection) finishes
+        connected = true;
+        fake.RaiseReconnected();
+
+        Assert.Equal("", vm.ModelErrorText);
+        Assert.Equal(ModelState.Ready, vm.ModelState);
+        Assert.False(vm.EnableSemanticSearch);
+        Assert.Equal("cuda", vm.SelectedBackend);
+    }
+
+    [Fact]
     public void AppSettings_ContainsOnlyUiPreferences()
     {
         // Verify engine-owned semantic/backend policy is not duplicated on AppSettings

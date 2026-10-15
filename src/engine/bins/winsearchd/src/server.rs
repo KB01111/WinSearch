@@ -104,13 +104,13 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
             ClientMessage::Search { id, query } => {
                 if let Some(prev) = active_search.replace(id) {
                     if prev != id {
-                        engine.cancel(prev);
+                        engine.cancel_for_client(client.id(), prev);
                     }
                 }
                 engine.search(&client, id, query);
             }
             ClientMessage::Cancel { id } => {
-                engine.cancel(id);
+                engine.cancel_for_client(client.id(), id);
             }
             ClientMessage::GetStatus { id } => {
                 let _ = client.send(&ServerMessage::Status {
@@ -143,7 +143,7 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
     }
 
     if let Some(prev) = active_search {
-        engine.cancel(prev);
+        engine.cancel_for_client(client.id(), prev);
     }
     engine.unregister_client(&client);
 }

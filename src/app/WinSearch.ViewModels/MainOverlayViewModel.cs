@@ -25,6 +25,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     private readonly SynchronizationContext? _ui;
     private CancellationTokenSource? _searchCts;
     private Timer? _debounceTimer;
+    private bool _debouncePending;
     private long _searchSequence;
     private string _pendingQuery = "";
     private bool _semanticEnabled = true;
@@ -120,6 +121,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     partial void OnQueryTextChanged(string value)
     {
         _pendingQuery = value;
+        _debouncePending = true;
         UpdateSemanticHint();
         _debounceTimer?.Dispose();
         _debounceTimer = new Timer(
@@ -134,6 +136,9 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         _ = RunSearchAsync(_pendingQuery);
     }
 
+    /// <summary>True when a query change is waiting on the debounce timer.</summary>
+    public bool HasPendingSearch => Volatile.Read(ref _debouncePending);
+
     /// <summary>Runs immediately (Enter / mode switch), bypassing the debounce.</summary>
     [RelayCommand]
     public Task SearchNowAsync() => RunSearchAsync(QueryText);
@@ -145,6 +150,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
             return;
         }
 
+        Volatile.Write(ref _debouncePending, false);
+        _debounceTimer?.Dispose();
+        _debounceTimer = null;
+
         _searchCts?.Cancel();
         _searchCts?.Dispose();
         _searchCts = new CancellationTokenSource();
@@ -155,6 +164,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         {
             Dispatch(() =>
             {
+                if (sequence != Interlocked.Read(ref _searchSequence))
+                {
+                    return;
+                }
                 Results.Clear();
                 IsSearching = false;
                 IsSemanticPending = false;
@@ -172,6 +185,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
 
         Dispatch(() =>
         {
+            if (sequence != Interlocked.Read(ref _searchSequence))
+            {
+                return;
+            }
             Results.Clear();
             IsSearching = true;
             IsSemanticPending = false;
@@ -206,6 +223,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
                 var pendingSemantic = includeSemantic && !done;
                 Dispatch(() =>
                 {
+                    if (sequence != Interlocked.Read(ref _searchSequence))
+                    {
+                        return;
+                    }
                     // Append-only: never clear or reorder already-displayed exact results.
                     foreach (var item in items)
                     {
@@ -223,6 +244,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
             {
                 Dispatch(() =>
                 {
+                    if (sequence != Interlocked.Read(ref _searchSequence))
+                    {
+                        return;
+                    }
                     IsSearching = false;
                     IsSemanticPending = false;
                 });
@@ -235,6 +260,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
             {
                 Dispatch(() =>
                 {
+                    if (sequence != Interlocked.Read(ref _searchSequence))
+                    {
+                        return;
+                    }
                     IsSearching = false;
                     IsSemanticPending = false;
                 });
@@ -244,6 +273,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         {
             Dispatch(() =>
             {
+                if (sequence != Interlocked.Read(ref _searchSequence))
+                {
+                    return;
+                }
                 IsSearching = false;
                 IsSemanticPending = false;
                 StatusText = ex.Code == ErrorCode.NotReady ? "Search is not ready yet" : ex.Message;
@@ -253,6 +286,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         {
             Dispatch(() =>
             {
+                if (sequence != Interlocked.Read(ref _searchSequence))
+                {
+                    return;
+                }
                 IsSearching = false;
                 IsSemanticPending = false;
                 StatusText = "Lost connection to the search engine";
@@ -264,12 +301,6 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     {
         Dispatch(() =>
         {
-            if (status.ModelLoaded && _modelState == ModelState.NotDownloaded)
-            {
-                _modelState = ModelState.Ready;
-                UpdateSemanticHint();
-            }
-
             if (!IsSearching && !IsSemanticPending && string.IsNullOrWhiteSpace(QueryText))
             {
                 StatusText = status.State switch

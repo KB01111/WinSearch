@@ -39,10 +39,15 @@ pub struct ParsedCodeFile {
 
 /// Parses `source` for `language` starting at 1-based line `1`.
 pub fn parse_source(source: &str, language: &str) -> ParsedCodeFile {
-    if language.eq_ignore_ascii_case("notebook") {
-        if let Ok(nb) = parse_notebook(source) {
-            return nb.parsed;
-        }
+    if language.eq_ignore_ascii_case("notebook") || language.eq_ignore_ascii_case("jupyter") {
+        return match parse_notebook(source) {
+            Ok(nb) => nb.parsed,
+            Err(_) => ParsedCodeFile {
+                language: language.to_string(),
+                chunks: Vec::new(),
+                symbols: Vec::new(),
+            },
+        };
     }
     parse_source_with_offset(source, language, 1)
 }
@@ -131,6 +136,7 @@ pub fn persist_parsed_file(
         })?;
         chunk_ids.push(id);
     }
+    store.truncate_chunks_for_file(file_id, parsed.chunks.len() as i64)?;
     Ok(chunk_ids)
 }
 
@@ -571,5 +577,61 @@ mod tests {
 
         let leaked = store.search_symbols("leaked_output_function", 10).unwrap();
         assert!(leaked.is_empty());
+    }
+
+    #[test]
+    fn malformed_notebook_returns_empty_parsed_file_without_leaking_raw_json() {
+        let malformed = r#"{"cells": [{"cell_type": "code", "outputs": ["SECRET_LEAK_TOKEN""#;
+        let parsed = parse_source(malformed, "notebook");
+        assert_eq!(parsed.language, "notebook");
+        assert!(parsed.chunks.is_empty());
+        assert!(parsed.symbols.is_empty());
+    }
+
+    #[test]
+    fn persist_parsed_file_truncates_stale_tail_chunks() {
+        let mut store = CodeStore::open_in_memory().unwrap();
+        let repo_id = store
+            .ensure_repo(&DetectedRepo {
+                root_path: "C:\\truncate".into(),
+                name: "truncate".into(),
+                has_git: true,
+            })
+            .unwrap();
+        let outcomes = store
+            .apply_file_batch(
+                repo_id,
+                1,
+                &[CodeFileRecord {
+                    path: "C:\\truncate\\lib.rs".into(),
+                    rel_path: "lib.rs".into(),
+                    name: "lib.rs".into(),
+                    ext: "rs".into(),
+                    language: "rust".into(),
+                    size: 100,
+                    mtime: 1,
+                    volume_serial: 1,
+                    file_id: 1,
+                }],
+            )
+            .unwrap();
+        let file_id = outcomes[0].file_id();
+
+        let v1 = parse_source(
+            "pub fn alpha() {\n    call_one();\n}\npub fn beta() {\n    call_two();\n}\npub fn gamma() {\n    stale_tail_marker();\n}\n",
+            "rust",
+        );
+        assert_eq!(v1.chunks.len(), 3);
+        persist_parsed_file(&mut store, file_id, &v1).unwrap();
+        assert_eq!(store.list_chunks_for_file(file_id).unwrap().len(), 3);
+
+        let v2 = parse_source("pub fn alpha() {\n    call_one();\n}\n", "rust");
+        assert_eq!(v2.chunks.len(), 1);
+        persist_parsed_file(&mut store, file_id, &v2).unwrap();
+
+        let chunks = store.list_chunks_for_file(file_id).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].symbol_name, "alpha");
+        assert_eq!(store.stats().unwrap().chunks_total, 1);
     }
 }

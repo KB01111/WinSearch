@@ -107,6 +107,7 @@ struct RootInfo {
 
 pub struct Indexer {
     store: Mutex<IndexStore>,
+    vector_index: std::sync::RwLock<Option<ws_index::VectorIndex>>,
     counters: Mutex<Counters>,
     wake: (Mutex<bool>, Condvar),
     shutdown: AtomicBool,
@@ -136,6 +137,7 @@ impl Indexer {
         }
         Ok(Arc::new(Self {
             store: Mutex::new(store),
+            vector_index: std::sync::RwLock::new(None),
             counters: Mutex::new(Counters::default()),
             wake: (Mutex::new(false), Condvar::new()),
             shutdown: AtomicBool::new(false),
@@ -206,18 +208,74 @@ impl Indexer {
     }
 
     /// Cosine top-k over the `segments` table for the semantic query stage
-    /// (P3.6). Same contract as `IndexStore::search_vectors`: degenerate
-    /// queries yield no hits, mixed-width rows are skipped.
+    /// (P3.6). Uses the in-memory [`ws_index::VectorIndex`] under a `RwLock`
+    /// so the cosine scan does not hold the SQLite `Mutex<IndexStore>`.
     pub fn search_vectors(
         &self,
         query: &[f32],
         top_k: usize,
         filter: Option<&VectorFilter>,
     ) -> Result<Vec<ScoredSegment>, StoreError> {
-        self.store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .search_vectors(query, top_k, filter)
+        if top_k == 0 || query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, query_norm) = ws_index::vectors::normalize_vector(query);
+        if query_norm == 0.0 {
+            return Ok(Vec::new());
+        }
+        let dim = query.len();
+        let need_build = {
+            let guard = self.vector_index.read().unwrap_or_else(|p| p.into_inner());
+            !guard.as_ref().is_some_and(|idx| idx.dim() == dim)
+        };
+        if need_build {
+            let segs = self
+                .store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .all_segments()?;
+            let built = ws_index::VectorIndex::from_segments(dim, &segs);
+            let mut guard = self.vector_index.write().unwrap_or_else(|p| p.into_inner());
+            *guard = Some(built);
+        }
+        let hits = {
+            let guard = self.vector_index.read().unwrap_or_else(|p| p.into_inner());
+            match guard.as_ref() {
+                Some(idx) if idx.dim() == dim => {
+                    idx.search(query, top_k, filter).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
+        };
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::with_capacity(hits.len());
+        for hit in hits {
+            if let Some(segment) = store.get_segment(hit.id)? {
+                out.push(ScoredSegment {
+                    segment,
+                    cosine: hit.cosine,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn invalidate_vector_cache(&self) {
+        *self.vector_index.write().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    pub(crate) fn update_vector_cache(&self, seg_id: i64, entry_id: i64, kind: &str, vec: &[f32]) {
+        let mut guard = self.vector_index.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(ref mut idx) = *guard {
+            if idx.dim() == vec.len() {
+                let _ = idx.add_or_update(seg_id, entry_id, kind, vec);
+            } else {
+                *guard = None;
+            }
+        }
     }
 
     /// One entry by id (the semantic stage resolves names/paths/mtimes for
@@ -332,6 +390,8 @@ impl Indexer {
             )?;
             enqueued += 1;
         }
+        drop(store);
+        self.invalidate_vector_cache();
         if purged > 0 || enqueued > 0 {
             info!(purged, enqueued, "purged stale name vectors; requeued for re-embed");
         }
@@ -407,13 +467,48 @@ impl Indexer {
         }
     }
 
+    fn relative_depth(&self, root_id: i64, dir_path: &str) -> usize {
+        self.roots
+            .iter()
+            .find(|r| r.id == root_id)
+            .and_then(|root| Path::new(dir_path).strip_prefix(&root.path).ok())
+            .map(|rel| rel.components().count())
+            .unwrap_or(0)
+    }
+
+    fn is_excluded_under_root(&self, root_id: i64, path: &Path, is_dir: bool) -> bool {
+        let rel = self
+            .roots
+            .iter()
+            .find(|r| r.id == root_id)
+            .and_then(|r| path.strip_prefix(&r.path).ok());
+        let Some(rel) = rel else {
+            return path
+                .file_name()
+                .map(|n| crawl::is_excluded(&n.to_string_lossy(), is_dir))
+                .unwrap_or(false);
+        };
+        let comps: Vec<_> = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+                _ => None,
+            })
+            .collect();
+        let Some((leaf, ancestors)) = comps.split_last() else {
+            return false;
+        };
+        ancestors.iter().any(|a| crawl::is_excluded(a, true))
+            || crawl::is_excluded(leaf, is_dir)
+    }
+
     fn process_dir(
         &self,
         queue_id: i64,
         root_id: i64,
         dir_path: &str,
     ) -> Result<(), StoreError> {
-        let depth = dir_path.matches('\\').count() + dir_path.matches('/').count();
+        let depth = self.relative_depth(root_id, dir_path);
         let parent_id = self
             .store
             .lock()
@@ -421,20 +516,26 @@ impl Indexer {
             .find_by_path(dir_path)?
             .map(|e| e.id);
 
+        let mut scan_failed = false;
         let scan = match crawl::scan_directory(root_id, dir_path, parent_id, depth) {
             Ok(s) => s,
             Err(e) => {
                 warn!(dir = %dir_path, error = %e, "scan error");
+                scan_failed = e.kind() != std::io::ErrorKind::NotFound;
                 crawl::DirScan::default()
             }
         };
 
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.current_generation(&store, root_id)?;
-        let outcomes = store.apply_batch(root_id, generation, &scan.entries)?;
-        Self::enqueue_name_jobs_for_outcomes(&mut store, &scan.entries, &outcomes)?;
-        for sub in &scan.subdirs {
-            store.enqueue_dir(root_id, sub)?;
+        if scan_failed {
+            store.touch_subtree_generation(root_id, dir_path, generation)?;
+        } else {
+            let outcomes = store.apply_batch(root_id, generation, &scan.entries)?;
+            Self::enqueue_name_jobs_for_outcomes(&mut store, &scan.entries, &outcomes)?;
+            for sub in &scan.subdirs {
+                store.enqueue_dir(root_id, sub)?;
+            }
         }
         store.complete_dir(queue_id)?;
 
@@ -458,7 +559,9 @@ impl Indexer {
             let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
             let generation = self.current_generation(&store, root_id)?;
             let swept = store.sweep_generation(root_id, generation)?;
+            drop(store);
             if swept > 0 {
+                self.invalidate_vector_cache();
                 info!(root_id, swept, "swept stale entries");
             }
         }
@@ -485,60 +588,78 @@ impl Indexer {
     fn apply_event(&self, root_id: i64, event: &WatchEvent) -> Result<(), StoreError> {
         match event {
             WatchEvent::Created(path) => {
-                let path_str = path.to_string_lossy().into_owned();
-                if path.is_dir() {
-                    let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
-                    store.enqueue_dir(root_id, &path_str)?;
-                    drop(store);
-                    self.notify_work();
-                } else {
-                    self.point_upsert(root_id, path)?;
+                let is_dir = path.is_dir();
+                if !self.is_excluded_under_root(root_id, path, is_dir) {
+                    let path_str = path.to_string_lossy().into_owned();
+                    if is_dir {
+                        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                        store.enqueue_dir(root_id, &path_str)?;
+                        drop(store);
+                        self.notify_work();
+                    } else {
+                        self.point_upsert(root_id, path)?;
+                    }
                 }
             }
             WatchEvent::Deleted(path) => {
                 let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
-                store.remove_tree(&path.to_string_lossy())?;
+                let removed = store.remove_tree(&path.to_string_lossy())?;
+                drop(store);
+                if removed > 0 {
+                    self.invalidate_vector_cache();
+                }
             }
             WatchEvent::Modified(path) => {
-                self.point_upsert(root_id, path)?;
+                if !self.is_excluded_under_root(root_id, path, path.is_dir()) {
+                    self.point_upsert(root_id, path)?;
+                }
             }
             WatchEvent::Renamed { from, to } => {
+                let to_excluded = self.is_excluded_under_root(root_id, to, to.is_dir());
                 let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
                 let from_str = from.to_string_lossy().into_owned();
-                let to_str = to.to_string_lossy().into_owned();
-                let existing = store.find_by_path(&from_str)?;
-                match existing {
-                    Some(row) => {
-                        let name = to
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let ext = ws_index::model::extension_of(&name);
-                        let parent_id = store
-                            .find_by_path(&parent_of(&to_str))?
-                            .map(|e| e.id);
-                        store.move_entry(row.id, parent_id, &to_str, &name, &ext)?;
-                        // The name changed: the stored name vector is stale.
-                        // Re-enqueue so the scheduler embeds the new name;
-                        // entry id (and its segment rows) is preserved.
-                        store.enqueue_extract_job_with_priority(
-                            row.id,
-                            SEGMENT_KIND_NAME,
-                            EXTRACT_PRIORITY_UPDATED,
-                        )?;
-                        if row.is_dir {
-                            store.rename_tree_paths(&from_str, &to_str)?;
-                            drop(store);
-                            let mut s = self.store.lock().unwrap_or_else(|p| p.into_inner());
-                            s.enqueue_dir(root_id, &to_str)?;
-                            drop(s);
-                            self.notify_work();
-                        }
+                if to_excluded {
+                    let removed = store.remove_tree(&from_str)?;
+                    drop(store);
+                    if removed > 0 {
+                        self.invalidate_vector_cache();
                     }
-                    None => {
-                        // Missed the create (e.g. move into the tree).
-                        drop(store);
-                        self.point_upsert(root_id, to)?;
+                } else {
+                    let to_str = to.to_string_lossy().into_owned();
+                    let existing = store.find_by_path(&from_str)?;
+                    match existing {
+                        Some(row) => {
+                            let name = to
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let ext = ws_index::model::extension_of(&name);
+                            let parent_id = store
+                                .find_by_path(&parent_of(&to_str))?
+                                .map(|e| e.id);
+                            store.move_entry(row.id, parent_id, &to_str, &name, &ext)?;
+                            // The name changed: the stored name vector is stale.
+                            // Re-enqueue so the scheduler embeds the new name;
+                            // entry id (and its segment rows) is preserved.
+                            store.enqueue_extract_job_with_priority(
+                                row.id,
+                                SEGMENT_KIND_NAME,
+                                EXTRACT_PRIORITY_UPDATED,
+                            )?;
+                            if row.is_dir {
+                                store.rename_tree_paths(&from_str, &to_str)?;
+                                drop(store);
+                                let mut s = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                                s.enqueue_dir(root_id, &to_str)?;
+                                drop(s);
+                                self.notify_work();
+                            }
+                        }
+                        None => {
+                            // Missed the create (e.g. move into the tree).
+                            drop(store);
+                            self.point_upsert(root_id, to)?;
+                        }
                     }
                 }
             }
@@ -564,6 +685,9 @@ impl Indexer {
     }
 
     fn point_upsert(&self, root_id: i64, path: &Path) -> Result<(), StoreError> {
+        if self.is_excluded_under_root(root_id, path, path.is_dir()) {
+            return Ok(());
+        }
         let parent_id = path
             .parent()
             .and_then(|p| {
@@ -623,12 +747,13 @@ impl Indexer {
     }
 
     fn refresh_catalog(&self) -> Result<(), StoreError> {
-        let apps = catalog::scan_catalog(&catalog::app_roots());
+        let scan = catalog::scan_catalog_full(&catalog::app_roots());
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let root_id = store.ensure_root(CATALOG_ROOT)?;
         let generation = store.begin_generation(root_id)?;
 
-        let records: Vec<EntryRecord> = apps
+        let records: Vec<EntryRecord> = scan
+            .apps
             .iter()
             .map(|app| EntryRecord {
                 root_id,
@@ -649,7 +774,16 @@ impl Indexer {
 
         let outcomes = store.apply_batch(root_id, generation, &records)?;
         Self::enqueue_name_jobs_for_outcomes(&mut store, &records, &outcomes)?;
-        let swept = store.sweep_generation(root_id, generation)?;
+        let swept = if scan.complete {
+            store.sweep_generation(root_id, generation)?
+        } else {
+            warn!("catalog scan incomplete due to I/O error; skipping stale sweep");
+            0
+        };
+        drop(store);
+        if swept > 0 {
+            self.invalidate_vector_cache();
+        }
         info!(apps = records.len(), swept, "application catalog refreshed");
         Ok(())
     }
@@ -846,8 +980,9 @@ impl Indexer {
                     line: None,
                     vector: vec,
                 }) {
-                    Ok(_) => {
+                    Ok(seg_id) => {
                         store.complete_extract_job(c.job_id)?;
+                        self.update_vector_cache(seg_id, c.entry_id, SEGMENT_KIND_NAME, vec);
                         embedded += 1;
                     }
                     Err(e) => {
@@ -1659,5 +1794,83 @@ mod tests {
         let (embedded, _) = drain_embed_queue(&indexer);
         assert_eq!(embedded as u64, enqueued);
         assert_eq!(indexer.segments_indexed().unwrap(), segs_before);
+    }
+
+    #[test]
+    fn watcher_events_under_excluded_ancestors_are_ignored() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("visible.txt"), b"ok").unwrap();
+        let indexer = seeded(&tree);
+        let root_id = indexer.roots[0].id;
+
+        let git_dir = tree.0.join(".git");
+        let nm_dir = tree.0.join("node_modules").join("pkg");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::create_dir_all(&nm_dir).unwrap();
+
+        let git_cfg = git_dir.join("config");
+        let nm_js = nm_dir.join("index.js");
+        fs::write(&git_cfg, b"secret").unwrap();
+        fs::write(&nm_js, b"module.exports = {}").unwrap();
+
+        indexer.handle_event(root_id, WatchEvent::Created(git_cfg.clone()));
+        indexer.handle_event(root_id, WatchEvent::Modified(git_cfg));
+        indexer.handle_event(root_id, WatchEvent::Created(nm_js.clone()));
+        indexer.handle_event(root_id, WatchEvent::Modified(nm_js));
+
+        assert!(
+            indexer
+                .search(&SearchRequest {
+                    text: "config".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            ".git/config must not be indexed via watcher event"
+        );
+        assert!(
+            indexer
+                .search(&SearchRequest {
+                    text: "index.js".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "node_modules/pkg/index.js must not be indexed via watcher event"
+        );
+    }
+
+    #[test]
+    fn touch_subtree_generation_protects_descendants_from_stale_sweep() {
+        let tree = TempTree::new();
+        let sub = tree.0.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("protected.txt"), b"keep").unwrap();
+        let indexer = seeded(&tree);
+        let root_id = indexer.roots[0].id;
+
+        // Simulate a new generation where `sub` failed to scan with a non-NotFound
+        // error: touching the subtree generation must keep `protected.txt` across sweep.
+        {
+            let mut store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let gen = store.begin_generation(root_id).unwrap();
+            let touched = store
+                .touch_subtree_generation(root_id, &sub.to_string_lossy(), gen)
+                .unwrap();
+            assert!(touched >= 2, "expected dir + child touched, got {touched}");
+            let swept = store.sweep_generation(root_id, gen).unwrap();
+            assert_eq!(swept, 0);
+        }
+
+        let hits = indexer
+            .search(&SearchRequest {
+                text: "protected".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

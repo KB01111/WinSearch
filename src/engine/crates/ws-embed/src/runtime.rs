@@ -326,8 +326,9 @@ impl EmbedRuntime {
 
     /// Embed a batch of texts. Returns one L2-normalized vector per input, in order.
     ///
-    /// Inputs are processed in chunks of at most the context's sequence capacity
-    /// (one llama sequence per text), so a large batch is split across decodes.
+    /// Inputs are processed in sub-batches bounded by both the context's sequence
+    /// capacity (`max_seqs`, one llama sequence per text) and token batch capacity
+    /// ([`DEFAULT_N_BATCH`]), so large or long-text batches are split across decodes.
     pub fn embed_texts<S: AsRef<str>>(&mut self, texts: &[S]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Err(EmbedError::EmptyBatch);
@@ -335,23 +336,34 @@ impl EmbedRuntime {
         let ctx = self.ctx.ok_or(EmbedError::ContextFailed("context released".into()))?;
         // SAFETY: plain C call with no pointer arguments.
         let max_seqs = unsafe { ffi::wse_context_max_seqs() }.max(1) as usize;
+        let budget = (DEFAULT_N_BATCH as usize).max(1);
+
+        // Tokenize each text separately (one llama sequence per input) and cap
+        // any single sequence to `budget` tokens so it fits in one decode batch.
+        let mut tokenized: Vec<Vec<i32>> = Vec::with_capacity(texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let mut t = self
+                .tokenize(text.as_ref())
+                .filter(|t| !t.is_empty())
+                .ok_or(EmbedError::Tokenize(i))?;
+            if t.len() > budget {
+                t.truncate(budget);
+            }
+            tokenized.push(t);
+        }
 
         let mut all: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-        for (chunk_idx, chunk) in texts.chunks(max_seqs).enumerate() {
-            let base = chunk_idx * max_seqs;
-            // Tokenize each text separately: one llama sequence per input.
-            let mut tokens: Vec<i32> = Vec::new();
-            let mut seq_lens: Vec<i32> = Vec::with_capacity(chunk.len());
-            for (i, text) in chunk.iter().enumerate() {
-                let t = self
-                    .tokenize(text.as_ref())
-                    .filter(|t| !t.is_empty())
-                    .ok_or(EmbedError::Tokenize(base + i))?;
+        for range in plan_sub_batches(&tokenized, max_seqs, budget) {
+            let slice = &tokenized[range];
+            let total_tokens: usize = slice.iter().map(|t| t.len()).sum();
+            let mut tokens: Vec<i32> = Vec::with_capacity(total_tokens);
+            let mut seq_lens: Vec<i32> = Vec::with_capacity(slice.len());
+            for t in slice {
                 seq_lens.push(t.len() as i32);
-                tokens.extend_from_slice(&t);
+                tokens.extend_from_slice(t);
             }
 
-            let n = chunk.len();
+            let n = slice.len();
             let mut out = vec![0f32; n * self.n_embd];
             // SAFETY: tokens/seq_lens hold exactly the sums the shim reads; out holds
             // n * n_embd floats. ctx is live until free_handles, which also consumes self.
@@ -481,5 +493,58 @@ fn open_mtmd(
 impl Drop for EmbedRuntime {
     fn drop(&mut self) {
         self.free_handles();
+    }
+}
+
+/// Packs tokenized sequences into contiguous index ranges where each range has
+/// at most `max_seqs` sequences and at most `budget` total tokens.
+fn plan_sub_batches(
+    tokenized: &[Vec<i32>],
+    max_seqs: usize,
+    budget: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let max_seqs = max_seqs.max(1);
+    let budget = budget.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < tokenized.len() {
+        let mut end = start;
+        let mut used = 0;
+        while end < tokenized.len()
+            && (end - start) < max_seqs
+            && used + tokenized[end].len() <= budget
+        {
+            used += tokenized[end].len();
+            end += 1;
+        }
+        if end == start {
+            end = start + 1;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_batches_respect_token_budget_and_max_seqs() {
+        // Three 200-token sequences with a 512-token budget must split into [0..2, 2..3].
+        let seqs = vec![vec![1i32; 200], vec![1i32; 200], vec![1i32; 200]];
+        let batches = plan_sub_batches(&seqs, 32, 512);
+        assert_eq!(batches, vec![0..2, 2..3]);
+
+        // Five 10-token sequences with max_seqs = 2 must split by sequence count.
+        let short = vec![vec![1i32; 10]; 5];
+        let batches = plan_sub_batches(&short, 2, 512);
+        assert_eq!(batches, vec![0..2, 2..4, 4..5]);
+
+        // Full-budget sequence stands alone in its own sub-batch.
+        let mixed = vec![vec![1i32; 100], vec![1i32; 512], vec![1i32; 100]];
+        let batches = plan_sub_batches(&mixed, 32, 512);
+        assert_eq!(batches, vec![0..1, 1..2, 2..3]);
     }
 }

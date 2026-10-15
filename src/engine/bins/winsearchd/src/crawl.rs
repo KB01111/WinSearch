@@ -147,17 +147,17 @@ pub fn scan_directory(
 
 /// True for names the exclusion policy never indexes.
 pub fn is_excluded(name: &str, is_dir: bool) -> bool {
+    let lower = name.to_lowercase();
     if is_dir {
         if EXCLUDED_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d)) {
             return true;
         }
         // ".env.local", "id_rsa" style sidecars inside any folder.
-        if name.starts_with(".env") {
+        if lower == ".env" || lower.starts_with(".env.") {
             return true;
         }
         return false;
     }
-    let lower = name.to_lowercase();
     if EXCLUDED_FILES.iter().any(|f| lower == *f) {
         return true;
     }
@@ -169,7 +169,7 @@ pub fn is_excluded(name: &str, is_dir: bool) -> bool {
     {
         return true;
     }
-    if lower.starts_with(".env") {
+    if lower.starts_with(".env.") {
         return true;
     }
     let ext = extension_of(&lower);

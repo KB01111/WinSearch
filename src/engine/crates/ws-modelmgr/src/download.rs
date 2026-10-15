@@ -105,11 +105,33 @@ pub fn download_file(
         None => expected.url(),
     };
 
-    let resume_from = part
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0)
-        .min(expected.size);
+    let mut resume_from = part.metadata().map(|m| m.len()).unwrap_or(0);
+    if resume_from > expected.size {
+        warn!(
+            file = expected.name,
+            got = resume_from,
+            expected = expected.size,
+            "oversized .part file; removing and restarting download"
+        );
+        fs::remove_file(&part)?;
+        resume_from = 0;
+    } else if part.is_file() && resume_from == expected.size {
+        if verify_file(&part, expected).is_ok() {
+            info!(
+                file = expected.name,
+                "complete .part file verified; committing without download"
+            );
+            fs::rename(&part, &dest)?;
+            progress(expected.size, expected.size);
+            return Ok(dest);
+        }
+        warn!(
+            file = expected.name,
+            "complete-sized .part file failed verification; removing and restarting"
+        );
+        fs::remove_file(&part)?;
+        resume_from = 0;
+    }
     if resume_from > 0 {
         info!(file = expected.name, bytes = resume_from, "resuming partial download");
     }
@@ -573,6 +595,65 @@ mod tests {
             matches!(err, DownloadError::SizeMismatch { .. }),
             "expected size rejection, got {err:?}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn complete_valid_part_file_commits_without_http() {
+        let bytes = fixture_bytes(41, 16 * 1024);
+        let fx = Fixture::serve(HashMap::new(), Duration::ZERO);
+        let expected = expected_for("complete-part.gguf", &bytes);
+        let dir = temp_dir("complete-part-valid");
+        fs::write(dir.join("complete-part.gguf.part"), &bytes).unwrap();
+
+        let (calls, progress) = last_progress();
+        let cancel = AtomicBool::new(false);
+        let dest = download_file(&expected, &dir, &fx.options(), progress, &cancel).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        assert!(!dir.join("complete-part.gguf.part").exists());
+        assert!(
+            fx.seen_ranges.lock().unwrap().is_empty(),
+            "complete valid .part file must not trigger HTTP requests"
+        );
+        assert_eq!(
+            *calls.lock().unwrap().last().unwrap(),
+            (bytes.len() as u64, bytes.len() as u64)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_or_corrupt_complete_part_file_is_discarded_and_redownloaded() {
+        let bytes = fixture_bytes(53, 16 * 1024);
+        let mut files = HashMap::new();
+        files.insert("recover.gguf".to_string(), bytes.clone());
+        let fx = Fixture::serve(files, Duration::ZERO);
+        let expected = expected_for("recover.gguf", &bytes);
+        let dir = temp_dir("part-recover");
+        let (_, progress) = last_progress();
+        let cancel = AtomicBool::new(false);
+
+        // 1. Corrupt .part of exact expected.size: discarded and downloaded fresh without Range.
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 0xff;
+        fs::write(dir.join("recover.gguf.part"), &corrupt).unwrap();
+        let dest = download_file(&expected, &dir, &fx.options(), progress, &cancel).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        assert!(!dir.join("recover.gguf.part").exists());
+        assert_eq!(fx.seen_ranges.lock().unwrap().as_slice(), &[None]);
+
+        // 2. Oversized .part (> expected.size): discarded and downloaded fresh without Range.
+        fs::remove_file(&dest).unwrap();
+        let mut oversized = bytes.clone();
+        oversized.extend_from_slice(&[0xabu8; 512]);
+        fs::write(dir.join("recover.gguf.part"), &oversized).unwrap();
+        let dest2 = download_file(&expected, &dir, &fx.options(), progress, &cancel).unwrap();
+        assert_eq!(fs::read(&dest2).unwrap(), bytes);
+        assert!(!dir.join("recover.gguf.part").exists());
+        assert_eq!(fx.seen_ranges.lock().unwrap().as_slice(), &[None, None]);
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -37,29 +37,60 @@ pub fn app_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Recursively scans catalog roots for application items.
-pub fn scan_catalog(roots: &[PathBuf]) -> Vec<AppEntry> {
+/// Outcome of scanning application catalog roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogScan {
+    pub apps: Vec<AppEntry>,
+    /// True when every existing catalog root (and its subdirectories) was read
+    /// without non-`NotFound` I/O errors.
+    pub complete: bool,
+}
+
+/// Recursively scans catalog roots for application items, tracking whether all
+/// existing catalog directories were read cleanly.
+pub fn scan_catalog_full(roots: &[PathBuf]) -> CatalogScan {
     let mut apps = Vec::new();
+    let mut complete = true;
     for root in roots {
-        scan_dir(root, 0, &mut apps);
+        if !scan_dir(root, 0, &mut apps) {
+            complete = false;
+        }
     }
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps.dedup_by(|a, b| a.path.eq_ignore_ascii_case(&b.path));
-    apps
+    CatalogScan { apps, complete }
 }
 
-fn scan_dir(dir: &Path, depth: usize, apps: &mut Vec<AppEntry>) {
+/// Recursively scans catalog roots for application items.
+pub fn scan_catalog(roots: &[PathBuf]) -> Vec<AppEntry> {
+    scan_catalog_full(roots).apps
+}
+
+fn scan_dir(dir: &Path, depth: usize, apps: &mut Vec<AppEntry>) -> bool {
     if depth > 8 {
-        return;
+        return true;
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    complete = false;
+                }
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() {
-            scan_dir(&path, depth + 1, apps);
+            if !scan_dir(&path, depth + 1, apps) {
+                complete = false;
+            }
             continue;
         }
         let ext = path
@@ -86,6 +117,7 @@ fn scan_dir(dir: &Path, depth: usize, apps: &mut Vec<AppEntry>) {
             _ => {}
         }
     }
+    complete
 }
 
 fn shortcut_entry(lnk: &Path) -> Option<AppEntry> {

@@ -16,7 +16,7 @@
 mod server;
 
 use tracing::info;
-use ws_platform::SingleInstanceGuard;
+use ws_platform::{identity, SingleInstanceGuard};
 
 use server::WorkerConfig;
 
@@ -29,19 +29,28 @@ fn main() -> anyhow::Result<()> {
 
     init_logging();
 
-    // Exactly one worker per session serves the pipe. A loser here means the
-    // winner is already serving: exit quietly so the supervisor's pipe-wait
-    // connects to it.
-    let _guard = match SingleInstanceGuard::acquire_embed() {
-        Some(g) => g,
-        None => {
-            eprintln!("winsearch-embed: another instance is already serving; exiting");
-            return Ok(());
-        }
-    };
-
     let mut config = WorkerConfig::from_env()?;
     config.apply_args(&args[1..])?;
+
+    // Exactly one worker per session serves the default daemon pipe. A loser
+    // here means the winner is already serving: exit quietly so the
+    // supervisor's pipe-wait connects to it. Dedicated workers on custom pipes
+    // (such as `winsearch-cli eval` or integration tests) skip the session-wide
+    // mutex so they can coexist with a running daemon worker.
+    let is_default_pipe = identity::embed_pipe_name()
+        .map(|default_pipe| config.pipe_name == default_pipe)
+        .unwrap_or(true);
+    let _guard = if is_default_pipe {
+        match SingleInstanceGuard::acquire_embed() {
+            Some(g) => Some(g),
+            None => {
+                eprintln!("winsearch-embed: another instance is already serving; exiting");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     info!(
         pipe = %config.pipe_name,

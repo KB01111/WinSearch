@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 use ws_index::model::{
-    EngineConfig as StoredEngineConfig, HitKind, PreferredBackend, SearchRequest, VectorFilter,
+    EngineConfig as StoredEngineConfig, HitKind, PreferredBackend, SearchRequest,
     kind_for_path_and_ext, SEGMENT_KIND_NAME,
 };
 use ws_index::{EntryRow, evaluate, search_settings};
@@ -59,6 +59,10 @@ impl ClientHandle {
         Self { id, stream }
     }
 
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn send(&self, msg: &ServerMessage) -> Result<(), FrameError> {
         let mut guard = self
             .stream
@@ -71,8 +75,8 @@ impl ClientHandle {
 pub struct EngineService {
     status: Mutex<EngineStatus>,
     clients: Mutex<Vec<ClientHandle>>,
-    /// Cancellation flags for in-flight search requests.
-    cancels: Mutex<HashMap<RequestId, Arc<AtomicBool>>>,
+    /// Cancellation flags for in-flight search requests, keyed by `(client_id, request_id)`.
+    cancels: Mutex<HashMap<(u64, RequestId), Arc<AtomicBool>>>,
     next_client_id: std::sync::atomic::AtomicU64,
     indexer: Arc<Indexer>,
     models: Arc<ModelService>,
@@ -124,6 +128,9 @@ impl EngineService {
         models: Arc<ModelService>,
         embed: EmbedSupervisor,
     ) -> SharedEngine {
+        if let Ok(cfg) = indexer.get_engine_config() {
+            embed.set_preferred_backend(cfg.preferred_backend.as_str());
+        }
         Arc::new(Self {
             status: Mutex::new(EngineStatus {
                 state: EngineRunState::Idle,
@@ -234,28 +241,37 @@ impl EngineService {
         }
     }
 
-    pub fn begin_request(&self, id: RequestId) -> Arc<AtomicBool> {
+    pub fn begin_request_for_client(&self, client_id: u64, id: RequestId) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(id, flag.clone());
+            .insert((client_id, id), flag.clone());
         flag
     }
 
-    pub fn end_request(&self, id: RequestId) {
+    pub fn end_request_for_client(&self, client_id: u64, id: RequestId) {
         self.cancels
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&id);
+            .remove(&(client_id, id));
     }
 
     pub fn cancel(&self, id: RequestId) {
+        let guard = self.cancels.lock().unwrap_or_else(|p| p.into_inner());
+        for ((_, req_id), flag) in guard.iter() {
+            if *req_id == id {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn cancel_for_client(&self, client_id: u64, id: RequestId) {
         if let Some(flag) = self
             .cancels
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&id)
+            .get(&(client_id, id))
         {
             flag.store(true, Ordering::Relaxed);
         }
@@ -360,6 +376,8 @@ impl EngineService {
         };
         match self.indexer.set_engine_config(&stored) {
             Ok(()) => {
+                self.embed
+                    .set_preferred_backend(stored.preferred_backend.as_str());
                 let _ = client.send(&ServerMessage::Config {
                     id: Some(id),
                     config,
@@ -458,6 +476,10 @@ impl EngineService {
         if !self.semantic_allowed(query) {
             return Vec::new();
         }
+        let kinds = hit_kinds(&query.categories);
+        if !query.categories.is_empty() && kinds.is_empty() {
+            return Vec::new();
+        }
         let text = query.text.trim();
         let query_vec = match self.embed_query(text) {
             Ok(v) => v,
@@ -466,7 +488,10 @@ impl EngineService {
                 return Vec::new();
             }
         };
-        let scored = match self.indexer.search_vectors(&query_vec, SEMANTIC_TOP_K, None) {
+        let scored = match self
+            .indexer
+            .search_vectors(&query_vec, SEMANTIC_TOP_K.saturating_mul(8), None)
+        {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "semantic stage: vector search failed; exact results stand");
@@ -488,7 +513,6 @@ impl EngineService {
                 })
                 .or_insert_with(|| (hit.cosine, hit.segment.kind.clone()));
         }
-        let kinds = hit_kinds(&query.categories);
         let now = now_unix();
         let mut out = Vec::new();
         for (entry_id, (cosine, seg_kind)) in best {
@@ -545,10 +569,10 @@ impl EngineService {
     /// cancelled between the stages closes with an empty terminal batch so the
     /// client can retire it.
     pub fn search(self: &Arc<Self>, client: &ClientHandle, id: RequestId, query: SearchQuery) {
-        let cancel = self.begin_request(id);
+        let cancel = self.begin_request_for_client(client.id(), id);
         let outcome = self.run_search(client, id, query, cancel);
         if let Err(e) = outcome {
-            self.end_request(id);
+            self.end_request_for_client(client.id(), id);
             let _ = client.send(&ServerMessage::Error {
                 id: Some(id),
                 code: ws_protocol::ErrorCode::Internal,
@@ -572,7 +596,7 @@ impl EngineService {
         let results = self.plan_results(&query);
 
         if cancel.load(Ordering::Relaxed) {
-            self.end_request(id);
+            self.end_request_for_client(client.id(), id);
             return client.send(&ServerMessage::Results {
                 id,
                 batch: Vec::new(),
@@ -595,7 +619,7 @@ impl EngineService {
         })?;
         if !rest.is_empty() {
             if cancel.load(Ordering::Relaxed) {
-                self.end_request(id);
+                self.end_request_for_client(client.id(), id);
                 return client.send(&ServerMessage::Results {
                     id,
                     batch: Vec::new(),
@@ -609,7 +633,7 @@ impl EngineService {
             })?;
         }
         if !semantic {
-            self.end_request(id);
+            self.end_request_for_client(client.id(), id);
             return Ok(());
         }
 
@@ -624,7 +648,7 @@ impl EngineService {
             .spawn(move || {
                 let outcome =
                     this.run_semantic_stage(&thread_client, id, &query, &exact_ids, &cancel);
-                this.end_request(id);
+                this.end_request_for_client(thread_client.id(), id);
                 if let Err(err) = outcome {
                     let _ = thread_client.send(&ServerMessage::Error {
                         id: Some(id),
@@ -640,7 +664,7 @@ impl EngineService {
             })
         {
             warn!(error = %e, "semantic stage: thread spawn failed; closing stream");
-            self.end_request(id);
+            self.end_request_for_client(client.id(), id);
             return client.send(&ServerMessage::Results {
                 id,
                 batch: Vec::new(),
@@ -690,9 +714,9 @@ impl EngineService {
 
         let mut results = Vec::new();
         let wants_index = query.mode != SearchMode::Code;
-        let wants_calc = wants_index
+        let wants_calc = query.mode == SearchMode::Auto
             && (query.categories.is_empty() || query.categories.contains(&ResultKind::Calculator));
-        let wants_settings = query.mode != SearchMode::Files
+        let wants_settings = query.mode == SearchMode::Auto
             && (query.categories.is_empty()
                 || query.categories.contains(&ResultKind::Settings)
                 || query.categories.contains(&ResultKind::Action));
@@ -740,12 +764,13 @@ impl EngineService {
             }
         }
 
-        if wants_index {
+        let kinds = hit_kinds(&query.categories);
+        if wants_index && (query.categories.is_empty() || !kinds.is_empty()) {
             let request = SearchRequest {
                 text: text.to_string(),
                 apps_only: query.mode == SearchMode::Apps,
                 files_only: query.mode == SearchMode::Files,
-                kinds: hit_kinds(&query.categories),
+                kinds,
                 limit: (query.limit.max(1) as usize).saturating_mul(3).clamp(20, 120),
             };
             if let Ok(hits) = self.indexer.search(&request) {
@@ -1051,6 +1076,72 @@ mod tests {
         q.categories = vec![ResultKind::Image];
         let results = engine.plan_results(&q);
         assert!(results.iter().all(|r| r.kind != ResultKind::Document));
+    }
+
+    #[test]
+    fn explicit_apps_and_files_modes_exclude_calculator_and_settings() {
+        let tree = TempTree::new();
+        let engine = service_with(&tree, &["windows update.txt"]);
+
+        let mut apps_calc = query("2 + 2");
+        apps_calc.mode = SearchMode::Apps;
+        assert!(
+            engine
+                .plan_results(&apps_calc)
+                .iter()
+                .all(|r| r.kind != ResultKind::Calculator)
+        );
+
+        let mut files_calc = query("2 + 2");
+        files_calc.mode = SearchMode::Files;
+        assert!(
+            engine
+                .plan_results(&files_calc)
+                .iter()
+                .all(|r| r.kind != ResultKind::Calculator)
+        );
+
+        let mut apps_settings = query("windows update");
+        apps_settings.mode = SearchMode::Apps;
+        assert!(
+            engine
+                .plan_results(&apps_settings)
+                .iter()
+                .all(|r| r.kind != ResultKind::Settings)
+        );
+    }
+
+    #[test]
+    fn non_index_category_filter_excludes_file_and_app_hits() {
+        let tree = TempTree::new();
+        let engine = service_with(&tree, &["windows update.txt"]);
+        let mut q = query("windows update");
+        q.categories = vec![ResultKind::Settings];
+        let results = engine.plan_results(&q);
+        assert!(
+            results.iter().all(|r| r.kind == ResultKind::Settings),
+            "expected only Settings results, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn client_scoped_cancellation_does_not_cancel_other_client_same_request_id() {
+        let tree = TempTree::new();
+        let engine = service_with(&tree, &[]);
+        let flag_a = engine.begin_request_for_client(1, 1);
+        let flag_b = engine.begin_request_for_client(2, 1);
+
+        engine.cancel_for_client(2, 1);
+        assert!(
+            !flag_a.load(Ordering::Relaxed),
+            "client 1's request id 1 must not be cancelled by client 2"
+        );
+        assert!(
+            flag_b.load(Ordering::Relaxed),
+            "client 2's request id 1 must be cancelled"
+        );
+        engine.end_request_for_client(1, 1);
+        engine.end_request_for_client(2, 1);
     }
 
     #[test]

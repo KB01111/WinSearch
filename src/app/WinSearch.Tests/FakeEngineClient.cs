@@ -25,6 +25,9 @@ internal sealed class FakeEngineClient : IEngineClient
     public int DeleteModelCalls { get; private set; }
 
     public Func<SearchQuery, CancellationToken, IAsyncEnumerable<SearchBatch>>? SearchHandler { get; set; }
+    public Func<CancellationToken, Task<ModelStatus>>? GetModelStatusHandler { get; set; }
+    public Func<CancellationToken, Task<EngineConfig>>? GetConfigHandler { get; set; }
+    public Func<EngineConfig, CancellationToken, Task<EngineConfig>>? SetConfigHandler { get; set; }
 
     public void PushStatus(EngineStatus status)
     {
@@ -104,10 +107,14 @@ internal sealed class FakeEngineClient : IEngineClient
     }
 
     public Task<ModelStatus> GetModelStatusAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult(CurrentModelStatus);
+        => GetModelStatusHandler is not null
+            ? GetModelStatusHandler(cancellationToken)
+            : Task.FromResult(CurrentModelStatus);
 
     public Task<EngineConfig> GetConfigAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult(CurrentConfig);
+        => GetConfigHandler is not null
+            ? GetConfigHandler(cancellationToken)
+            : Task.FromResult(CurrentConfig);
 
     public Task<EngineConfig> SetConfigAsync(EngineConfig config, CancellationToken cancellationToken = default)
     {
@@ -116,6 +123,10 @@ internal sealed class FakeEngineClient : IEngineClient
             SemanticEnabled = config.SemanticEnabled,
             PreferredBackend = config.PreferredBackend,
         });
+        if (SetConfigHandler is not null)
+        {
+            return SetConfigHandler(config, cancellationToken);
+        }
         CurrentConfig = new EngineConfig
         {
             SemanticEnabled = config.SemanticEnabled,

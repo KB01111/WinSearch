@@ -43,13 +43,13 @@ pub fn index_code_file(
     scan_generation: i64,
     record: &CodeFileRecord,
 ) -> anyhow::Result<(i64, Vec<i64>, ParsedCodeFile)> {
+    let raw = std::fs::read_to_string(Path::new(&record.path))?;
+    let parsed = parse_source(&raw, &record.language);
     let outcomes = store.apply_file_batch(repo_id, scan_generation, std::slice::from_ref(record))?;
     let file_id = outcomes
         .first()
         .map(|o| o.file_id())
         .ok_or_else(|| anyhow::anyhow!("apply_file_batch returned no outcome"))?;
-    let raw = std::fs::read_to_string(Path::new(&record.path))?;
-    let parsed = parse_source(&raw, &record.language);
     let chunk_ids = persist_parsed_file(store, file_id, &parsed)?;
     Ok((file_id, chunk_ids, parsed))
 }
