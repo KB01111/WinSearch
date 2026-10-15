@@ -1105,7 +1105,10 @@ impl IndexStore {
 
     /// Enqueues `(entry_id, kind)` idempotently at `priority`. A repeat enqueue
     /// for an already-queued job keeps the higher of the two priorities so a
-    /// later `Inserted` upgrades a pending `Updated` instead of being dropped.
+    /// later `Inserted` upgrades a pending `Updated` instead of being dropped;
+    /// if the existing row is unclaimed (e.g. previously marked `'failed'`),
+    /// it is reset to `state = 'pending', attempts = 0` so a modified file is
+    /// re-extracted.
     pub fn enqueue_extract_job_with_priority(
         &mut self,
         entry_id: i64,
@@ -1116,8 +1119,13 @@ impl IndexStore {
             "INSERT INTO extract_jobs(entry_id, kind, state, claimed, attempts, priority)
              VALUES(?1, ?2, 'pending', 0, 0, ?3)
              ON CONFLICT(entry_id, kind) DO UPDATE SET
-                 priority = CASE WHEN excluded.priority > extract_jobs.priority
-                                 THEN excluded.priority ELSE extract_jobs.priority END",
+                 state = CASE WHEN extract_jobs.claimed = 0 THEN 'pending' ELSE extract_jobs.state END,
+                 attempts = CASE WHEN extract_jobs.claimed = 0 THEN 0 ELSE extract_jobs.attempts END,
+                 priority = CASE WHEN extract_jobs.state = 'failed'
+                                 THEN excluded.priority
+                                 WHEN excluded.priority > extract_jobs.priority
+                                 THEN excluded.priority
+                                 ELSE extract_jobs.priority END",
             params![entry_id, kind, priority],
         )?;
         Ok(())
@@ -2270,5 +2278,42 @@ mod tests {
             .unwrap();
         assert_eq!(ocr_hits.len(), 1);
         assert_eq!(ocr_hits[0].entry_id, img_id);
+    }
+
+    #[test]
+    fn re_enqueue_after_mark_extract_failed_revives_job_to_pending() {
+        use crate::model::{
+            EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED, EXTRACT_STATE_FAILED,
+            EXTRACT_STATE_PENDING, SEGMENT_KIND_DOC,
+        };
+        let (mut store, root) = setup();
+        let eid = entry_id_for(&mut store, root, "C:\\data\\revive.txt", "revive.txt", 901);
+
+        store
+            .enqueue_extract_job_with_priority(eid, SEGMENT_KIND_DOC, EXTRACT_PRIORITY_NEW)
+            .unwrap();
+        let claimed = store.claim_content_extract_job().unwrap().unwrap();
+        assert_eq!(claimed.entry_id, eid);
+        store.mark_extract_failed(claimed.id).unwrap();
+
+        let failed = store.get_extract_job(claimed.id).unwrap().unwrap();
+        assert_eq!(failed.state, EXTRACT_STATE_FAILED);
+        assert!(!failed.claimed);
+        assert_eq!(failed.attempts, 1);
+        assert!(store.claim_content_extract_job().unwrap().is_none());
+
+        // File is later edited on disk and re-enqueued: must revive to pending with attempts = 0.
+        store
+            .enqueue_extract_job_with_priority(eid, SEGMENT_KIND_DOC, EXTRACT_PRIORITY_UPDATED)
+            .unwrap();
+        let revived = store.get_extract_job(claimed.id).unwrap().unwrap();
+        assert_eq!(revived.state, EXTRACT_STATE_PENDING);
+        assert!(!revived.claimed);
+        assert_eq!(revived.attempts, 0);
+        assert_eq!(revived.priority, EXTRACT_PRIORITY_UPDATED);
+
+        let reclaimed = store.claim_content_extract_job().unwrap().unwrap();
+        assert_eq!(reclaimed.id, claimed.id);
+        assert_eq!(reclaimed.entry_id, eid);
     }
 }
