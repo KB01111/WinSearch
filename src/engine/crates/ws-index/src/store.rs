@@ -10,12 +10,19 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{EntryRecord, UpsertOutcome};
+use crate::model::{
+    EntryRecord, ExtractJob, NewSegment, ScoredSegment, Segment, UpsertOutcome, VectorFilter,
+};
+use crate::vectors::{dot_fp16_row_vs_normalized, encode_normalized_vector, normalize_vector};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("unsupported schema version: {0}")]
+    UnsupportedSchemaVersion(String),
+    #[error("invalid vector: {0}")]
+    InvalidVector(String),
 }
 
 /// A configured indexing root.
@@ -120,6 +127,39 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 "#;
 
+/// Schema v2 (additive): vector segments + extract-job queue (reusable for
+/// Phase 4). Applied with `IF NOT EXISTS` so opening a v1 file migrates it in
+/// place; `meta.schema_version` is then bumped 1 → 2.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS segments (
+    id          INTEGER PRIMARY KEY,
+    entry_id    INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    text        TEXT NOT NULL DEFAULT '',
+    page        INTEGER NULL,
+    start_ms    INTEGER NULL,
+    end_ms      INTEGER NULL,
+    line        INTEGER NULL,
+    vector      BLOB NOT NULL,
+    norm        REAL NOT NULL DEFAULT 0,
+    UNIQUE(entry_id, kind, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_segments_entry ON segments(entry_id);
+
+CREATE TABLE IF NOT EXISTS extract_jobs (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    state    TEXT NOT NULL DEFAULT 'pending',
+    claimed  INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(entry_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_extract_jobs_entry ON extract_jobs(entry_id);
+CREATE INDEX IF NOT EXISTS idx_extract_jobs_state ON extract_jobs(state, claimed);
+"#;
+
 impl IndexStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
@@ -140,12 +180,43 @@ impl IndexStore {
         // lets the prefix query use the name index instead of scanning.
         conn.pragma_update(None, "case_sensitive_like", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', '1')
-             ON CONFLICT(key) DO NOTHING",
-            [],
-        )?;
+        conn.execute_batch(SCHEMA_V2)?;
+        // Additive migration 1 → 2: fresh DBs land directly on 2, v1 files
+        // keep every existing row and just gain the new tables.
+        let version: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        match version.as_deref() {
+            None => {
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', '2')",
+                    [],
+                )?;
+            }
+            Some("1") => {
+                conn.execute(
+                    "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
+                    [],
+                )?;
+            }
+            Some("2") => {}
+            Some(other) => {
+                return Err(StoreError::UnsupportedSchemaVersion(other.to_string()));
+            }
+        }
         Ok(Self { conn })
+    }
+
+    /// Current `meta.schema_version` (`"2"` on fresh and migrated DBs).
+    pub fn schema_version(&self) -> Result<String, StoreError> {
+        let v: String = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(v)
     }
 
     // ---- roots ----
@@ -587,6 +658,362 @@ impl IndexStore {
             .map_err(Into::into)
     }
 
+    // ---- vector segments (schema v2) ----
+
+    /// Inserts or replaces the segment for `(entry_id, kind, chunk_index)`.
+    /// The id is stable across replacements so the in-memory [`crate::vectors::VectorIndex`]
+    /// can update its slot instead of churning. Returns the segment id.
+    pub fn upsert_segment(&mut self, seg: NewSegment<'_>) -> Result<i64, StoreError> {
+        if seg.vector.is_empty() {
+            return Err(StoreError::InvalidVector("empty vector".into()));
+        }
+        if seg.kind.is_empty() {
+            return Err(StoreError::InvalidVector("empty kind".into()));
+        }
+        let (bytes, norm) = encode_normalized_vector(seg.vector);
+        if norm == 0.0 {
+            return Err(StoreError::InvalidVector(
+                "zero-length or non-finite vector".into(),
+            ));
+        }
+        let id: i64 = self.conn.query_row(
+            "INSERT INTO segments(entry_id, kind, chunk_index, text, page, start_ms, end_ms,
+                                  line, vector, norm)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(entry_id, kind, chunk_index) DO UPDATE SET
+                 text = excluded.text, page = excluded.page,
+                 start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+                 line = excluded.line, vector = excluded.vector, norm = excluded.norm
+             RETURNING id",
+            params![
+                seg.entry_id,
+                seg.kind,
+                seg.chunk_index,
+                seg.text,
+                seg.page,
+                seg.start_ms,
+                seg.end_ms,
+                seg.line,
+                bytes,
+                norm as f64,
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_segment(&self, id: i64) -> Result<Option<Segment>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, entry_id, kind, chunk_index, text, page, start_ms, end_ms,
+                        line, vector, norm
+                 FROM segments WHERE id = ?1",
+                params![id],
+                map_segment_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_segments_for_entry(&self, entry_id: i64) -> Result<Vec<Segment>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, entry_id, kind, chunk_index, text, page, start_ms, end_ms,
+                    line, vector, norm
+             FROM segments WHERE entry_id = ?1 ORDER BY kind, chunk_index",
+        )?;
+        let rows = stmt.query_map(params![entry_id], map_segment_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Every segment ordered by id (startup path for rebuilding the in-memory
+    /// scan index). Decodes FP16 to normalized `f32`.
+    pub fn all_segments(&self) -> Result<Vec<Segment>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, entry_id, kind, chunk_index, text, page, start_ms, end_ms,
+                    line, vector, norm
+             FROM segments ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], map_segment_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Raw `(id, entry_id, kind, fp16_bytes, norm)` rows for bulk loading a
+    /// [`crate::vectors::VectorIndex`] without an intermediate `f32` decode.
+    pub fn all_segment_vectors_raw(
+        &self,
+    ) -> Result<Vec<(i64, i64, String, Vec<u8>, f32)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, entry_id, kind, vector, norm FROM segments ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(3)?;
+            let norm_f64: f64 = row.get(4)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                bytes,
+                norm_f64 as f32,
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn remove_segment(&mut self, id: i64) -> Result<bool, StoreError> {
+        let n = self
+            .conn
+            .execute("DELETE FROM segments WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Deletes every segment of one entry (file-deleted path). Entry deletes
+    /// also cascade via FK; this helper covers explicit eviction and tests.
+    pub fn remove_segments_for_entry(&mut self, entry_id: i64) -> Result<u64, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM segments WHERE entry_id = ?1",
+            params![entry_id],
+        )?;
+        Ok(n as u64)
+    }
+
+    pub fn segment_count(&self) -> Result<u64, StoreError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Counts segments of one kind (e.g. `name` → `segments_indexed` status).
+    pub fn count_segments_by_kind(&self, kind: &str) -> Result<u64, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM segments WHERE kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Brute-force cosine top-k over the `segments` table. The query is
+    /// normalized once; each stored FP16 row is scored directly from its raw
+    /// `vector` BLOB bytes with [`crate::vectors::dot_fp16_row_vs_normalized`]
+    /// (`f32` accumulation — the same kernel as
+    /// [`crate::vectors::VectorIndex::search`]).
+    /// Rows whose width differs from the query are skipped. Results are
+    /// `(segment, cosine)` pairs sorted by descending cosine (ties by id).
+    ///
+    /// Contract (shared with [`crate::vectors::VectorIndex::search`]):
+    /// `top_k == 0`, an empty query, and a zero/non-finite query all yield
+    /// `Ok(vec![])` — an empty query is not an error, matching the crate's
+    /// other search APIs. Width mismatch is the one deliberate difference:
+    /// the fixed-dim index reports `Err(DimensionMismatch)` while this
+    /// schemaless table skips non-matching rows (so a query matching no
+    /// row's width yields `Ok(vec![])`). Callers needing strictness should
+    /// validate the width up front (`VectorIndex::dim` gives the expected one).
+    pub fn search_vectors(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&VectorFilter>,
+    ) -> Result<Vec<ScoredSegment>, StoreError> {
+        if top_k == 0 || query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (normed_query, query_norm) = normalize_vector(query);
+        if query_norm == 0.0 {
+            return Ok(Vec::new());
+        }
+        // Push the filter into SQL so large indexes don't materialize every row.
+        let mut sql = String::from(
+            "SELECT id, entry_id, kind, chunk_index, text, page, start_ms, end_ms,
+                    line, vector, norm
+             FROM segments",
+        );
+        // Own the bound values so the prepared statement can borrow them.
+        let kinds_owned: Vec<String>;
+        let entries_owned: Vec<i64>;
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(f) = filter {
+            if !f.kinds.is_empty() {
+                kinds_owned = f.kinds.clone();
+                let ph = kinds_owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                clauses.push(format!("kind IN ({ph})"));
+            } else {
+                kinds_owned = Vec::new();
+            }
+            if !f.entry_ids.is_empty() {
+                let base = kinds_owned.len();
+                entries_owned = f.entry_ids.clone();
+                let ph = entries_owned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", base + i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                clauses.push(format!("entry_id IN ({ph})"));
+            } else {
+                entries_owned = Vec::new();
+            }
+            if !clauses.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&clauses.join(" AND "));
+            }
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
+            for k in &kinds_owned {
+                params_vec.push(k);
+            }
+            for e in &entries_owned {
+                params_vec.push(e);
+            }
+            let rows = stmt.query_map(params_vec.as_slice(), map_segment_row_raw)?;
+            let mut scored = Vec::new();
+            for row in rows {
+                let raw: RawSegmentRow = row?;
+                if raw.bytes.len() != query.len() * 2 {
+                    continue; // mixed-width DB (e.g. model swap): skip, don't fail
+                }
+                if raw.segment.norm == 0.0 {
+                    continue; // mirrors VectorIndex::search (unreachable via upsert)
+                }
+                let cos = dot_fp16_row_vs_normalized(&raw.bytes, &normed_query);
+                scored.push(ScoredSegment {
+                    segment: raw.segment,
+                    cosine: cos,
+                });
+            }
+            scored.sort_by(|a, b| {
+                b.cosine
+                    .total_cmp(&a.cosine)
+                    .then_with(|| a.segment.id.cmp(&b.segment.id))
+            });
+            scored.truncate(top_k);
+            return Ok(scored);
+        }
+        // No filter: full scan.
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], map_segment_row_raw)?;
+        let mut scored = Vec::new();
+        for row in rows {
+            let raw: RawSegmentRow = row?;
+            if raw.bytes.len() != query.len() * 2 {
+                continue;
+            }
+            if raw.segment.norm == 0.0 {
+                continue; // mirrors VectorIndex::search (unreachable via upsert)
+            }
+            let cos = dot_fp16_row_vs_normalized(&raw.bytes, &normed_query);
+            scored.push(ScoredSegment {
+                segment: raw.segment,
+                cosine: cos,
+            });
+        }
+        scored.sort_by(|a, b| {
+            b.cosine
+                .total_cmp(&a.cosine)
+                .then_with(|| a.segment.id.cmp(&b.segment.id))
+        });
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    // ---- extract jobs (schema v2, crash-safe queue for Phase 4) ----
+
+    /// Enqueues `(entry_id, kind)` idempotently.
+    pub fn enqueue_extract_job(&mut self, entry_id: i64, kind: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO extract_jobs(entry_id, kind, state, claimed, attempts)
+             VALUES(?1, ?2, 'pending', 0, 0)
+             ON CONFLICT(entry_id, kind) DO NOTHING",
+            params![entry_id, kind],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically claims the oldest pending job (sets `claimed = 1`,
+    /// `state = 'claimed'`). The row stays queued until
+    /// [`Self::complete_extract_job`], so a crash re-runs it after
+    /// [`Self::release_extract_claims`].
+    pub fn claim_extract_job(&mut self) -> Result<Option<ExtractJob>, StoreError> {
+        self.conn
+            .query_row(
+                "UPDATE extract_jobs SET claimed = 1, state = 'claimed'
+                 WHERE id = (SELECT id FROM extract_jobs
+                             WHERE claimed = 0 AND state = 'pending'
+                             ORDER BY id LIMIT 1)
+                 RETURNING id, entry_id, kind, state, claimed, attempts",
+                [],
+                map_extract_job_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Releases claims held by a previous (crashed) process back to pending.
+    /// Returns the number of rows released.
+    pub fn release_extract_claims(&mut self) -> Result<u64, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE extract_jobs SET claimed = 0, state = 'pending'
+             WHERE claimed = 1 AND state = 'claimed'",
+            [],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Marks one job done (dequeues it).
+    pub fn complete_extract_job(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM extract_jobs WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Records a retryable failure: `attempts + 1`, back to pending.
+    /// Permanent failures are the caller's call (delete or mark `failed` via
+    /// [`Self::mark_extract_failed`]).
+    pub fn fail_extract_job(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE extract_jobs SET claimed = 0, state = 'pending',
+                 attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Records a permanent failure (kept for inspection, never auto-claimed).
+    pub fn mark_extract_failed(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE extract_jobs SET claimed = 0, state = 'failed',
+                 attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn extract_queue_depth(&self) -> Result<u64, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM extract_jobs WHERE state = 'pending' OR claimed = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    pub fn get_extract_job(&self, id: i64) -> Result<Option<ExtractJob>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, entry_id, kind, state, claimed, attempts
+                 FROM extract_jobs WHERE id = ?1",
+                params![id],
+                map_extract_job_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     // ---- stats ----
 
     pub fn stats(&self) -> Result<IndexStats, StoreError> {
@@ -642,6 +1069,51 @@ fn map_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
         is_app: row.get::<_, i64>(8)? != 0,
         mtime: row.get(9)?,
         missing: row.get::<_, i64>(10)? != 0,
+    })
+}
+
+fn map_segment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Segment> {
+    map_segment_row_raw(row).map(|raw| raw.segment)
+}
+
+/// A segment row carrying both the decoded payload and the raw FP16 bytes.
+/// Scoring reads `bytes` directly (no decode→re-encode round trip); `segment`
+/// is the payload returned to callers.
+struct RawSegmentRow {
+    segment: Segment,
+    bytes: Vec<u8>,
+}
+
+fn map_segment_row_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSegmentRow> {
+    let bytes: Vec<u8> = row.get(9)?;
+    let norm_f64: f64 = row.get(10)?;
+    let vector = crate::vectors::decode_fp16_vector(&bytes);
+    Ok(RawSegmentRow {
+        segment: Segment {
+            id: row.get(0)?,
+            entry_id: row.get(1)?,
+            kind: row.get(2)?,
+            chunk_index: row.get(3)?,
+            text: row.get(4)?,
+            page: row.get(5)?,
+            start_ms: row.get(6)?,
+            end_ms: row.get(7)?,
+            line: row.get(8)?,
+            vector,
+            norm: norm_f64 as f32,
+        },
+        bytes,
+    })
+}
+
+fn map_extract_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractJob> {
+    Ok(ExtractJob {
+        id: row.get(0)?,
+        entry_id: row.get(1)?,
+        kind: row.get(2)?,
+        state: row.get(3)?,
+        claimed: row.get::<_, i64>(4)? != 0,
+        attempts: row.get(5)?,
     })
 }
 
@@ -824,7 +1296,7 @@ mod tests {
         assert_eq!(store.meta_get("embedding_model").unwrap().as_deref(), Some("{}"));
         assert_eq!(
             store.meta_get("schema_version").unwrap().as_deref(),
-            Some("1")
+            Some("2")
         );
     }
 
@@ -844,5 +1316,397 @@ mod tests {
         assert_eq!(stats.dirs_total, 1);
         assert_eq!(stats.apps_total, 1);
         assert!(stats.index_size_bytes > 0);
+    }
+
+    // ---- schema v2 ----
+
+    fn entry_id_for(store: &mut IndexStore, root: i64, path: &str, name: &str, file_id: u64) -> i64 {
+        let gen = store.begin_generation(root).unwrap();
+        let mut r = rec(path, name, 1, 1);
+        r.file_id = file_id;
+        store.apply_batch(root, gen, &[r]).unwrap();
+        store.find_by_path(path).unwrap().unwrap().id
+    }
+
+    #[test]
+    fn fresh_db_is_schema_version_2() {
+        let (store, _) = setup();
+        assert_eq!(store.schema_version().unwrap(), "2");
+        assert_eq!(store.segment_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn segments_upsert_keeps_stable_id_and_replaces_vector() {
+        let (mut store, root) = setup();
+        let eid = entry_id_for(&mut store, root, "C:\\data\\a.txt", "a.txt", 101);
+        let first = store
+            .upsert_segment(NewSegment {
+                entry_id: eid,
+                kind: "name",
+                chunk_index: 0,
+                text: "a.txt",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0, 0.0, 0.0],
+            })
+            .unwrap();
+        let second = store
+            .upsert_segment(NewSegment {
+                entry_id: eid,
+                kind: "name",
+                chunk_index: 0,
+                text: "a.txt renamed",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[0.0, 1.0, 0.0, 0.0],
+            })
+            .unwrap();
+        assert_eq!(first, second, "upsert must preserve the segment id");
+        assert_eq!(store.segment_count().unwrap(), 1);
+        let got = store.get_segment(first).unwrap().unwrap();
+        assert_eq!(got.text, "a.txt renamed");
+        assert_eq!(got.vector.len(), 4);
+        // Stored vector is normalized: cosine to the new input is ~1.
+        let cos = crate::vectors::cosine_similarity(&got.vector, &[0.0, 1.0, 0.0, 0.0]);
+        assert!(cos > 0.999, "stored vector not replaced: cosine {cos}");
+        assert!(got.norm > 0.0);
+    }
+
+    #[test]
+    fn segments_incremental_add_remove() {
+        let (mut store, root) = setup();
+        let a = entry_id_for(&mut store, root, "C:\\data\\a.txt", "a.txt", 201);
+        let b = entry_id_for(&mut store, root, "C:\\data\\b.txt", "b.txt", 202);
+        let c = entry_id_for(&mut store, root, "C:\\data\\c.txt", "c.txt", 203);
+        for (eid, v) in [
+            (a, vec![1.0, 0.0, 0.0]),
+            (b, vec![0.0, 1.0, 0.0]),
+            (c, vec![0.0, 0.0, 1.0]),
+        ] {
+            store
+                .upsert_segment(NewSegment {
+                    entry_id: eid,
+                    kind: "name",
+                    chunk_index: 0,
+                    text: "t",
+                    page: None,
+                    start_ms: None,
+                    end_ms: None,
+                    line: None,
+                    vector: &v,
+                })
+                .unwrap();
+        }
+        assert_eq!(store.segment_count().unwrap(), 3);
+        assert_eq!(store.count_segments_by_kind("name").unwrap(), 3);
+
+        // Remove one entry's segments explicitly.
+        assert_eq!(store.remove_segments_for_entry(b).unwrap(), 1);
+        assert_eq!(store.segment_count().unwrap(), 2);
+        assert!(store.list_segments_for_entry(b).unwrap().is_empty());
+
+        // Query no longer returns the removed entry.
+        let hits = store.search_vectors(&[0.0, 1.0, 0.0], 10, None).unwrap();
+        assert!(hits.iter().all(|h| h.segment.entry_id != b));
+
+        // Entry delete cascades to segments via FK.
+        assert!(store.remove_by_path("C:\\data\\a.txt").unwrap());
+        assert_eq!(store.segment_count().unwrap(), 1);
+        assert!(store.list_segments_for_entry(a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_vectors_top_k_and_filters_are_correct() {
+        let (mut store, root) = setup();
+        let ids: Vec<i64> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                entry_id_for(
+                    &mut store,
+                    root,
+                    &format!("C:\\data\\{n}.txt"),
+                    &format!("{n}.txt"),
+                    300 + i as u64,
+                )
+            })
+            .collect();
+        // Angles from +x: 0°, 10°, 45°, 90° (2-d).
+        let deg = std::f32::consts::PI / 180.0;
+        let vecs = [
+            vec![1.0, 0.0],
+            vec![(10.0 * deg).cos(), (10.0 * deg).sin()],
+            vec![(45.0 * deg).cos(), (45.0 * deg).sin()],
+            vec![0.0, 1.0],
+        ];
+        for (i, eid) in ids.iter().enumerate() {
+            let kind = if i == 2 { "text" } else { "name" };
+            store
+                .upsert_segment(NewSegment {
+                    entry_id: *eid,
+                    kind,
+                    chunk_index: 0,
+                    text: "t",
+                    page: None,
+                    start_ms: None,
+                    end_ms: None,
+                    line: None,
+                    vector: &vecs[i],
+                })
+                .unwrap();
+        }
+        // Top-2 by cosine from +x.
+        let hits = store.search_vectors(&[1.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].segment.entry_id, ids[0]);
+        assert_eq!(hits[1].segment.entry_id, ids[1]);
+        assert!(hits[0].cosine >= hits[1].cosine);
+        assert!(hits[0].cosine > 0.999);
+
+        // Kind filter isolates the text segment.
+        let hits = store
+            .search_vectors(
+                &[1.0, 0.0],
+                10,
+                Some(&VectorFilter::for_kind("text")),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment.entry_id, ids[2]);
+
+        // Entry filter restricts the candidate set.
+        let hits = store
+            .search_vectors(
+                &[1.0, 0.0],
+                10,
+                Some(&VectorFilter {
+                    kinds: Vec::new(),
+                    entry_ids: vec![ids[3], ids[1]],
+                }),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].segment.entry_id, ids[1]);
+        assert_eq!(hits[1].segment.entry_id, ids[3]);
+
+        // Degenerate queries return empty, never an error (aligned contract
+        // with `VectorIndex::search`; see its rustdoc).
+        assert!(store.search_vectors(&[], 10, None).unwrap().is_empty());
+        assert!(store.search_vectors(&[0.0, 0.0], 10, None).unwrap().is_empty());
+        assert!(
+            store
+                .search_vectors(&[f32::NAN, 0.0], 10, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search_vectors(&[1.0, 0.0], 0, None).unwrap().is_empty());
+        // Width mismatch: schemaless table skips non-matching rows instead of
+        // erroring (the fixed-dim index reports DimensionMismatch).
+        assert!(store.search_vectors(&[1.0, 0.0, 0.0], 10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_vectors_skips_mixed_width_rows() {
+        let (mut store, root) = setup();
+        let a = entry_id_for(&mut store, root, "C:\\data\\a.txt", "a.txt", 601);
+        let b = entry_id_for(&mut store, root, "C:\\data\\b.txt", "b.txt", 602);
+        store
+            .upsert_segment(NewSegment {
+                entry_id: a,
+                kind: "name",
+                chunk_index: 0,
+                text: "a",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0],
+            })
+            .unwrap();
+        store
+            .upsert_segment(NewSegment {
+                entry_id: b,
+                kind: "name",
+                chunk_index: 0,
+                text: "b",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0, 0.0],
+            })
+            .unwrap();
+        let hits = store.search_vectors(&[1.0, 0.0], 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment.entry_id, a);
+        let hits = store.search_vectors(&[1.0, 0.0, 0.0], 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment.entry_id, b);
+    }
+
+    #[test]
+    fn search_vectors_agrees_with_in_memory_index() {
+        use crate::vectors::VectorIndex;
+        let (mut store, root) = setup();
+        let mut eids = Vec::new();
+        for i in 0..8 {
+            let eid = entry_id_for(
+                &mut store,
+                root,
+                &format!("C:\\data\\f{i}.txt"),
+                &format!("f{i}.txt"),
+                400 + i as u64,
+            );
+            let v = vec![(i as f32 + 1.0), (7 - i) as f32, 1.0];
+            store
+                .upsert_segment(NewSegment {
+                    entry_id: eid,
+                    kind: "name",
+                    chunk_index: 0,
+                    text: "t",
+                    page: None,
+                    start_ms: None,
+                    end_ms: None,
+                    line: None,
+                    vector: &v,
+                })
+                .unwrap();
+            eids.push(eid);
+        }
+        let query = vec![1.0, 0.5, 0.25];
+        let db_hits = store.search_vectors(&query, 8, None).unwrap();
+        let segs = store.all_segments().unwrap();
+        assert_eq!(segs.len(), 8);
+        let mem = VectorIndex::from_segments(3, &segs);
+        let mem_hits = mem.search(&query, 8, None).unwrap();
+        assert_eq!(db_hits.len(), mem_hits.len());
+        for (db, mm) in db_hits.iter().zip(mem_hits.iter()) {
+            assert_eq!(db.segment.id, mm.id);
+            assert!((db.cosine - mm.cosine).abs() <= 1e-5);
+        }
+        let _ = eids;
+    }
+
+    #[test]
+    fn extract_jobs_queue_claim_resume_and_fail() {
+        let (mut store, root) = setup();
+        let a = entry_id_for(&mut store, root, "C:\\data\\a.txt", "a.txt", 501);
+        let b = entry_id_for(&mut store, root, "C:\\data\\b.txt", "b.txt", 502);
+        store.enqueue_extract_job(a, "name").unwrap();
+        store.enqueue_extract_job(a, "name").unwrap(); // idempotent
+        store.enqueue_extract_job(b, "name").unwrap();
+        assert_eq!(store.extract_queue_depth().unwrap(), 2);
+
+        let first = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(first.entry_id, a);
+        assert!(first.claimed);
+        let second = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(second.entry_id, b);
+        assert!(store.claim_extract_job().unwrap().is_none());
+
+        // Simulated crash: claims go back to pending, jobs are not lost.
+        assert_eq!(store.release_extract_claims().unwrap(), 2);
+        let retry = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(retry.entry_id, a);
+
+        // Retryable failure bumps attempts and re-queues.
+        store.fail_extract_job(retry.id).unwrap();
+        let again = store.get_extract_job(retry.id).unwrap().unwrap();
+        assert_eq!(again.attempts, 1);
+        assert!(!again.claimed);
+
+        // Completion dequeues.
+        store.complete_extract_job(retry.id).unwrap();
+        store.complete_extract_job(second.id).unwrap();
+        assert_eq!(store.extract_queue_depth().unwrap(), 0);
+
+        // Permanent failure is kept for inspection, never auto-claimed.
+        store.enqueue_extract_job(a, "text").unwrap();
+        let job = store.claim_extract_job().unwrap().unwrap();
+        store.mark_extract_failed(job.id).unwrap();
+        let failed = store.get_extract_job(job.id).unwrap().unwrap();
+        assert_eq!(failed.state, crate::model::EXTRACT_STATE_FAILED);
+        assert!(store.claim_extract_job().unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_from_v1_file_preserves_data_and_bumps_version() {
+        // Build a genuine v1 file with raw SQL (no segments/extract_jobs).
+        let dir = std::env::temp_dir().join(format!(
+            "winsearch-v1mig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(super::SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('schema_version', '1')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO roots(path) VALUES('C:\\data')", [],)
+                .unwrap();
+            let root: i64 = conn
+                .query_row("SELECT id FROM roots WHERE path = 'C:\\data'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "INSERT INTO entries(root_id, path, name, name_lower, ext, is_dir, size,
+                                     mtime, volume_serial, file_id, scan_generation)
+                 VALUES(?1, 'C:\\data\\keep.txt', 'keep.txt', 'keep.txt', 'txt',
+                        0, 5, 100, 1, 999, 1)",
+                rusqlite::params![root],
+            )
+            .unwrap();
+            // No segments/extract_jobs tables in a v1 file.
+            let tables: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!tables.contains(&"segments".to_string()));
+            assert!(!tables.contains(&"extract_jobs".to_string()));
+        }
+        // Open with v2 code: migrates in place, data intact, version == 2.
+        let mut store = IndexStore::open(&db_path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), "2");
+        let kept = store.find_by_path("C:\\data\\keep.txt").unwrap().unwrap();
+        assert_eq!(kept.name, "keep.txt");
+        // New tables are usable immediately.
+        store.enqueue_extract_job(kept.id, "name").unwrap();
+        assert_eq!(store.extract_queue_depth().unwrap(), 1);
+        let sid = store
+            .upsert_segment(NewSegment {
+                entry_id: kept.id,
+                kind: "name",
+                chunk_index: 0,
+                text: "keep.txt",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0, 0.0],
+            })
+            .unwrap();
+        assert!(store.get_segment(sid).unwrap().is_some());
+        // Reopening keeps version 2 and the new rows.
+        drop(store);
+        let store2 = IndexStore::open(&db_path).unwrap();
+        assert_eq!(store2.schema_version().unwrap(), "2");
+        assert_eq!(store2.segment_count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

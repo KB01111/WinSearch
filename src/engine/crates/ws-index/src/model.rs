@@ -131,6 +131,97 @@ pub enum UpsertOutcome {
     Unchanged,
 }
 
+/// Kind string for name-embedding segments (Phase 3: one per entry).
+/// Stored in `segments.kind` / `extract_jobs.kind`.
+pub const SEGMENT_KIND_NAME: &str = "name";
+
+/// States for `extract_jobs.state`.
+pub const EXTRACT_STATE_PENDING: &str = "pending";
+pub const EXTRACT_STATE_CLAIMED: &str = "claimed";
+pub const EXTRACT_STATE_FAILED: &str = "failed";
+
+/// One embedded segment: a chunk of an entry with its vector.
+///
+/// Vectors are stored in SQLite as FP16 little-endian bytes plus the L2 norm
+/// of the original full-precision vector. In Rust they are exposed decoded as
+/// normalized `f32` values; `norm` is `0.0` for zero vectors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    pub id: i64,
+    pub entry_id: i64,
+    pub kind: String,
+    pub chunk_index: i64,
+    pub text: String,
+    pub page: Option<i64>,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub line: Option<i64>,
+    /// Normalized embedding (unit length unless `norm == 0.0`).
+    pub vector: Vec<f32>,
+    /// L2 norm of the original vector before normalization.
+    pub norm: f32,
+}
+
+/// Input for inserting or replacing a segment. The vector is full-precision
+/// `f32`; the store normalizes it, encodes FP16, and persists the norm.
+#[derive(Debug, Clone)]
+pub struct NewSegment<'a> {
+    pub entry_id: i64,
+    pub kind: &'a str,
+    pub chunk_index: i64,
+    pub text: &'a str,
+    pub page: Option<i64>,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    pub line: Option<i64>,
+    pub vector: &'a [f32],
+}
+
+/// One row of the `extract_jobs` queue (reused by Phase 4 extractors).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractJob {
+    pub id: i64,
+    pub entry_id: i64,
+    pub kind: String,
+    pub state: String,
+    pub claimed: bool,
+    pub attempts: i64,
+}
+
+/// Filter for vector search. Empty lists mean "no restriction".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorFilter {
+    /// Restrict to these segment kinds; empty means all kinds.
+    pub kinds: Vec<String>,
+    /// Restrict to these entries; empty means all entries.
+    pub entry_ids: Vec<i64>,
+}
+
+impl VectorFilter {
+    /// Convenience for a single-kind filter (e.g. `name` segments).
+    pub fn for_kind(kind: &str) -> Self {
+        Self {
+            kinds: vec![kind.to_string()],
+            entry_ids: Vec::new(),
+        }
+    }
+
+    pub fn matches_kind(&self, kind: &str) -> bool {
+        self.kinds.is_empty() || self.kinds.iter().any(|k| k == kind)
+    }
+
+    pub fn matches_entry(&self, entry_id: i64) -> bool {
+        self.entry_ids.is_empty() || self.entry_ids.contains(&entry_id)
+    }
+}
+
+/// A segment paired with its cosine similarity to the query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredSegment {
+    pub segment: Segment,
+    pub cosine: f32,
+}
+
 /// Splits a path into its file name (lossy UTF-8).
 pub fn file_name(path: &Path) -> String {
     path.file_name()
