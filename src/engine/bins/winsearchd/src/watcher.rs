@@ -155,6 +155,8 @@ fn watch_loop(root: &Path, handle: Arc<OwnedHandle>, on_event: &(dyn Fn(WatchEve
         | FILE_NOTIFY_CHANGE_SIZE
         | FILE_NOTIFY_CHANGE_CREATION;
 
+    let mut pending_rename: Option<PathBuf> = None;
+
     loop {
         let mut returned = 0u32;
         let result = unsafe {
@@ -175,10 +177,11 @@ fn watch_loop(root: &Path, handle: Arc<OwnedHandle>, on_event: &(dyn Fn(WatchEve
         }
         if returned == 0 {
             // Buffer overflow: contents unreliable, subtree must be rescanned.
+            pending_rename = None;
             on_event(WatchEvent::Overflow);
             continue;
         }
-        for event in parse_notifications(&buffer[..returned as usize]) {
+        for event in parse_notifications_with_state(&buffer[..returned as usize], &mut pending_rename) {
             let full_event = match event {
                 WatchEvent::Created(p) => WatchEvent::Created(root.join(p)),
                 WatchEvent::Deleted(p) => WatchEvent::Deleted(root.join(p)),
@@ -201,9 +204,21 @@ const ACTION_RENAMED_OLD: u32 = FILE_ACTION_RENAMED_OLD_NAME.0;
 const ACTION_RENAMED_NEW: u32 = FILE_ACTION_RENAMED_NEW_NAME.0;
 
 /// Parses a `FILE_NOTIFY_INFORMATION` stream into paired events.
-fn parse_notifications(mut data: &[u8]) -> Vec<WatchEvent> {
+#[cfg(test)]
+fn parse_notifications(data: &[u8]) -> Vec<WatchEvent> {
+    let mut pending = None;
+    let mut out = parse_notifications_with_state(data, &mut pending);
+    if let Some(unmatched) = pending.take() {
+        out.push(WatchEvent::Deleted(unmatched));
+    }
+    out
+}
+
+fn parse_notifications_with_state(
+    mut data: &[u8],
+    pending_rename: &mut Option<PathBuf>,
+) -> Vec<WatchEvent> {
     let mut events = Vec::new();
-    let mut pending_rename: Option<PathBuf> = None;
 
     loop {
         if data.len() < 12 {
@@ -223,18 +238,18 @@ fn parse_notifications(mut data: &[u8]) -> Vec<WatchEvent> {
         let name = String::from_utf16_lossy(&wide);
         let path = PathBuf::from(name);
 
-        match action {
-            ACTION_ADDED => {
-                if let Some(from) = pending_rename.take() {
-                    events.push(WatchEvent::Renamed { from, to: path });
-                } else {
-                    events.push(WatchEvent::Created(path));
-                }
+        if action != ACTION_RENAMED_NEW {
+            if let Some(unmatched_old) = pending_rename.take() {
+                events.push(WatchEvent::Deleted(unmatched_old));
             }
+        }
+
+        match action {
+            ACTION_ADDED => events.push(WatchEvent::Created(path)),
             ACTION_REMOVED => events.push(WatchEvent::Deleted(path)),
             ACTION_MODIFIED => events.push(WatchEvent::Modified(path)),
             ACTION_RENAMED_OLD => {
-                pending_rename = Some(path);
+                *pending_rename = Some(path);
             }
             ACTION_RENAMED_NEW => match pending_rename.take() {
                 Some(from) => events.push(WatchEvent::Renamed { from, to: path }),

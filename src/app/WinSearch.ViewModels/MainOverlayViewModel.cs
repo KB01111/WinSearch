@@ -26,6 +26,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     private CancellationTokenSource? _searchCts;
     private Timer? _debounceTimer;
     private bool _debouncePending;
+    private Task? _activeSearchTask;
     private long _searchSequence;
     private string _pendingQuery = "";
     private bool _semanticEnabled = true;
@@ -139,11 +140,33 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     /// <summary>True when a query change is waiting on the debounce timer.</summary>
     public bool HasPendingSearch => Volatile.Read(ref _debouncePending);
 
+    /// <summary>Flushes any pending debounced query or awaits an in-flight search.</summary>
+    public async Task FlushOrWaitForSearchAsync()
+    {
+        if (HasPendingSearch)
+        {
+            await SearchNowAsync();
+            return;
+        }
+
+        if (_activeSearchTask is { IsCompleted: false } inflight)
+        {
+            await inflight;
+        }
+    }
+
     /// <summary>Runs immediately (Enter / mode switch), bypassing the debounce.</summary>
     [RelayCommand]
     public Task SearchNowAsync() => RunSearchAsync(QueryText);
 
-    public async Task RunSearchAsync(string query)
+    public Task RunSearchAsync(string query)
+    {
+        var task = RunSearchCoreAsync(query);
+        _activeSearchTask = task;
+        return task;
+    }
+
+    private async Task RunSearchCoreAsync(string query)
     {
         if (_disposed)
         {

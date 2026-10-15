@@ -44,7 +44,16 @@ pub fn index_code_file(
     record: &CodeFileRecord,
 ) -> anyhow::Result<(i64, Vec<i64>, ParsedCodeFile)> {
     let raw = std::fs::read_to_string(Path::new(&record.path))?;
-    let parsed = parse_source(&raw, &record.language);
+    let parsed = if record.language.eq_ignore_ascii_case("notebook")
+        || record.language.eq_ignore_ascii_case("jupyter")
+        || record.ext.eq_ignore_ascii_case("ipynb")
+    {
+        parse_notebook(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid notebook {}: {e}", record.path))?
+            .parsed
+    } else {
+        parse_source(&raw, &record.language)
+    };
     let outcomes = store.apply_file_batch(repo_id, scan_generation, std::slice::from_ref(record))?;
     let file_id = outcomes
         .first()

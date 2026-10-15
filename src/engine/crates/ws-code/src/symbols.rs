@@ -588,10 +588,15 @@ fn skip_leading_generics(mut s: &str) -> &str {
 fn match_rust_def(line: &str) -> Option<(String, String)> {
     let s = strip_modifiers(
         line,
-        &["pub", "async", "const", "unsafe", "extern", "default"],
+        &["pub", "async", "unsafe", "extern", "default"],
     );
+    let s_for_fn = strip_modifiers(s, &["const", "async", "unsafe", "extern"]);
+    if let Some(rest) = after_keyword(s_for_fn, "fn") {
+        if let Some(id) = take_ident(rest) {
+            return Some((id, "function".into()));
+        }
+    }
     for (kw, kind) in [
-        ("fn", "function"),
         ("struct", "struct"),
         ("enum", "enum"),
         ("trait", "trait"),
@@ -855,14 +860,19 @@ fn match_swift_def(line: &str) -> Option<(String, String)> {
             "internal",
             "open",
             "static",
-            "class",
             "override",
             "mutating",
             "final",
         ],
     );
+    // Swift allows `class func` for overridable type methods as well as `class Foo` declarations.
+    let s_for_func = strip_modifiers(s, &["class", "override", "final"]);
+    if let Some(rest) = after_keyword(s_for_func, "func") {
+        if let Some(id) = take_ident(rest) {
+            return Some((id, "function".into()));
+        }
+    }
     for (kw, kind) in [
-        ("func", "function"),
         ("struct", "struct"),
         ("class", "class"),
         ("enum", "enum"),
@@ -1393,6 +1403,39 @@ mod tests {
             syms.iter()
                 .any(|s| s.name == "some" && s.role == SymbolRole::Reference),
             "expected 'some' call reference, got {syms:?}"
+        );
+    }
+
+    #[test]
+    fn rust_const_and_const_fn_and_swift_class_and_class_func_are_indexed() {
+        let rust_src = "pub const LIMIT: usize = 4;\npub const fn calc() -> usize {\n    LIMIT\n}\n";
+        let rust_syms = extract_symbols(rust_src, "rust");
+        assert!(
+            rust_syms.iter().any(|s| s.name == "LIMIT"
+                && s.kind == "constant"
+                && s.role == SymbolRole::Definition),
+            "expected Rust const LIMIT, got {rust_syms:?}"
+        );
+        assert!(
+            rust_syms.iter().any(|s| s.name == "calc"
+                && s.kind == "function"
+                && s.role == SymbolRole::Definition),
+            "expected Rust const fn calc, got {rust_syms:?}"
+        );
+
+        let swift_src = "public class Widget {\n    public class func make() {}\n}\n";
+        let swift_syms = extract_symbols(swift_src, "swift");
+        assert!(
+            swift_syms.iter().any(|s| s.name == "Widget"
+                && s.kind == "class"
+                && s.role == SymbolRole::Definition),
+            "expected Swift class Widget, got {swift_syms:?}"
+        );
+        assert!(
+            swift_syms.iter().any(|s| s.name == "make"
+                && s.kind == "function"
+                && s.role == SymbolRole::Definition),
+            "expected Swift class func make, got {swift_syms:?}"
         );
     }
 }

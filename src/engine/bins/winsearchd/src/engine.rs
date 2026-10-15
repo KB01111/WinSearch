@@ -488,9 +488,15 @@ impl EngineService {
                 return Vec::new();
             }
         };
+        let candidate_limit =
+            if query.mode == SearchMode::Auto && query.categories.is_empty() {
+                SEMANTIC_TOP_K.saturating_mul(8)
+            } else {
+                usize::MAX
+            };
         let scored = match self
             .indexer
-            .search_vectors(&query_vec, SEMANTIC_TOP_K.saturating_mul(8), None)
+            .search_vectors(&query_vec, candidate_limit, None)
         {
             Ok(s) => s,
             Err(e) => {
@@ -773,19 +779,24 @@ impl EngineService {
                 kinds,
                 limit: (query.limit.max(1) as usize).saturating_mul(3).clamp(20, 120),
             };
-            if let Ok(hits) = self.indexer.search(&request) {
-                for hit in hits {
-                    results.push(SearchResult {
-                        id: format!("e{}", hit.entry_id),
-                        kind: to_result_kind(hit.kind),
-                        title: hit.name,
-                        subtitle: hit.path.clone(),
-                        match_explanation: hit.explanation,
-                        score: hit.score,
-                        path: Some(hit.path),
-                        location: None,
-                        thumbnail_path: hit.thumbnail_path,
-                    });
+            match self.indexer.search(&request) {
+                Ok(hits) => {
+                    for hit in hits {
+                        results.push(SearchResult {
+                            id: format!("e{}", hit.entry_id),
+                            kind: to_result_kind(hit.kind),
+                            title: hit.name,
+                            subtitle: hit.path.clone(),
+                            match_explanation: hit.explanation,
+                            score: hit.score,
+                            path: Some(hit.path),
+                            location: None,
+                            thumbnail_path: hit.thumbnail_path,
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "exact index search failed");
                 }
             }
         }

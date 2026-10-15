@@ -90,13 +90,18 @@ fn llama_source_dir() -> PathBuf {
     if dest.join("CMakeLists.txt").is_file() {
         return dest;
     }
-    let _ = fs::remove_dir_all(&dest);
-    fs::create_dir_all(&dest).expect("create llama.cpp cache dir");
-    // Fetch exactly the pinned commit (shallow, no full history).
+    let tmp = cache_root().join(format!(
+        "llama.cpp-{LLAMA_CPP_LABEL}.tmp-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).expect("create llama.cpp temp cache dir");
+    // Fetch exactly the pinned commit (shallow, no full history) into an
+    // isolated per-PID directory, then atomically rename into place.
     let git = |args: &[&str]| {
         let status = Command::new("git")
             .arg("-C")
-            .arg(&dest)
+            .arg(&tmp)
             .args(["-c", "core.longpaths=true"])
             .args(args)
             .status()
@@ -107,6 +112,19 @@ fn llama_source_dir() -> PathBuf {
     git(&["remote", "add", "origin", LLAMA_CPP_REPO]);
     git(&["fetch", "--depth", "1", "--quiet", "origin", LLAMA_CPP_REV]);
     git(&["checkout", "--quiet", "FETCH_HEAD"]);
+    if dest.join("CMakeLists.txt").is_file() {
+        let _ = fs::remove_dir_all(&tmp);
+        return dest;
+    }
+    let _ = fs::remove_dir_all(&dest);
+    if fs::rename(&tmp, &dest).is_err() {
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(
+            dest.join("CMakeLists.txt").is_file(),
+            "failed to move llama.cpp checkout into {}",
+            dest.display()
+        );
+    }
     dest
 }
 

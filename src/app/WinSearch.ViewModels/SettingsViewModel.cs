@@ -124,8 +124,13 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
     /// <summary>Loads initial model status and engine config over IPC.</summary>
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        Initialize();
-        if (_client is null)
+        Dispatch(Initialize);
+        await RefreshFromEngineAsync(cancellationToken);
+    }
+
+    private async Task RefreshFromEngineAsync(CancellationToken cancellationToken = default)
+    {
+        if (_client is null || _disposed)
         {
             return;
         }
@@ -133,21 +138,45 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
         try
         {
             var status = await _client.GetModelStatusAsync(cancellationToken);
-            Dispatch(() => ApplyModelStatus(status));
+            Dispatch(() =>
+            {
+                if (!_disposed)
+                {
+                    ApplyModelStatus(status);
+                }
+            });
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Dispatch(() => ModelErrorText = ex.Message);
+            Dispatch(() =>
+            {
+                if (!_disposed)
+                {
+                    ModelErrorText = ex.Message;
+                }
+            });
         }
 
         try
         {
             var config = await _client.GetConfigAsync(cancellationToken);
-            Dispatch(() => ApplyConfig(config));
+            Dispatch(() =>
+            {
+                if (!_disposed)
+                {
+                    ApplyConfig(config);
+                }
+            });
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Dispatch(() => ModelErrorText = ex.Message);
+            Dispatch(() =>
+            {
+                if (!_disposed)
+                {
+                    ModelErrorText = ex.Message;
+                }
+            });
         }
     }
 
@@ -474,7 +503,7 @@ public sealed partial class SettingsViewModel : ObservableObject, IDisposable
     {
         if (!_disposed)
         {
-            _ = InitializeAsync();
+            _ = RefreshFromEngineAsync();
         }
     }
 

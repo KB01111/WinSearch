@@ -127,11 +127,14 @@ impl ModelService {
                     "embedding model changed: purging name vectors and requeueing for re-embed"
                 );
                 match this.indexer.purge_name_vectors_and_requeue() {
-                    Ok((purged, enqueued)) => info!(
-                        purged,
-                        enqueued,
-                        "model swap: stale vectors purged, re-embed queued"
-                    ),
+                    Ok((purged, enqueued)) => {
+                        let _ = this.record_compat();
+                        info!(
+                            purged,
+                            enqueued,
+                            "model swap: stale vectors purged, re-embed queued"
+                        );
+                    }
                     Err(e) => warn!(error = %e, "model-swap purge/requeue failed"),
                 }
             }
@@ -268,6 +271,7 @@ impl ModelService {
             ..Default::default()
         };
         *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = started.clone();
+        self.push(&started);
 
         let this = Arc::clone(self);
         let thread_cancel = Arc::clone(&cancel);
@@ -276,21 +280,22 @@ impl ModelService {
             .spawn(move || this.run_op(id, kind, path.as_deref(), &thread_cancel))
         {
             let msg = format!("cannot spawn model thread: {e}");
-            *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = ModelStatus {
+            let failed_status = ModelStatus {
                 state: ModelState::Error,
                 total_bytes: total,
                 error: Some(msg.clone()),
                 ..Default::default()
             };
+            *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = failed_status.clone();
             *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
                 Some(Outcome::Failed(msg.clone()));
             *active = None;
+            self.push(&failed_status);
             return Err(msg);
         }
         *active = Some(ActiveOp { id, cancel });
         drop(active);
 
-        self.push(&started);
         info!(?kind, "model operation started");
         Ok(started)
     }

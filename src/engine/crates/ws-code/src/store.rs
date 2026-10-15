@@ -304,7 +304,7 @@ impl CodeStore {
                 "SELECT id, size, mtime, name_lower, rel_path FROM code_files WHERE path = ?1",
             )?;
             let mut by_identity = tx.prepare_cached(
-                "SELECT id FROM code_files
+                "SELECT id, path, scan_generation FROM code_files
                  WHERE repo_id = ?1 AND volume_serial = ?2 AND file_id = ?3
                  LIMIT 1",
             )?;
@@ -363,14 +363,24 @@ impl CodeStore {
                 }
 
                 // Not at `rec.path`: check filesystem identity `(volume_serial, file_id)`
-                // for a rename/move within the repository.
+                // for a rename/move within the repository (ignoring hard links where the
+                // original path still exists on disk or is also present in this batch).
                 let renamed_id: Option<i64> = if rec.volume_serial != 0 && rec.file_id != 0 {
-                    by_identity
+                    let cand: Option<(i64, String, i64)> = by_identity
                         .query_row(
                             params![repo_id, rec.volume_serial as i64, rec.file_id as i64],
-                            |r| r.get(0),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
-                        .optional()?
+                        .optional()?;
+                    cand.and_then(|(id, old_path, old_gen)| {
+                        let in_batch = records.iter().any(|r| r.path == old_path);
+                        let still_exists = std::path::Path::new(&old_path).exists();
+                        if old_gen != scan_generation && !in_batch && !still_exists {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     None
                 };

@@ -207,7 +207,7 @@ fn extract_text_via_ifilter_blocking(
             continue;
         }
 
-        if !out.is_empty() && !out.ends_with('\n') {
+        if !out.is_empty() && !out.ends_with('\n') && out.chars().count() < max_chars {
             out.push('\n');
         }
 
@@ -215,7 +215,8 @@ fn extract_text_via_ifilter_blocking(
             if Instant::now() >= deadline {
                 return IFilterOutcome::DeadlineExceeded;
             }
-            if out.len() >= max_chars {
+            let current_chars = out.chars().count();
+            if current_chars >= max_chars {
                 break;
             }
             let mut cwc = (buf.len() - 1) as u32;
@@ -224,15 +225,16 @@ fn extract_text_via_ifilter_blocking(
                 let count = (cwc as usize).min(buf.len());
                 if count > 0 {
                     let decoded = String::from_utf16_lossy(&buf[..count]);
-                    out.push_str(&decoded);
+                    let remaining = max_chars.saturating_sub(current_chars);
+                    out.extend(decoded.chars().take(remaining));
                 }
                 if text_hr == FILTER_S_LAST_TEXT || text_hr == S_FALSE || count == 0 {
                     break;
                 }
-            } else if text_hr == FILTER_E_NO_MORE_TEXT {
+            } else if text_hr == FILTER_E_NO_MORE_TEXT || text_hr == FILTER_E_NO_TEXT {
                 break;
             } else {
-                break;
+                return IFilterOutcome::Failed(format!("IFilter::GetText failed: {text_hr:?}"));
             }
         }
     }

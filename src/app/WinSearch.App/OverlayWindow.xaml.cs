@@ -244,15 +244,16 @@ public sealed partial class OverlayWindow : Window
         if (queryMismatch)
         {
             _viewModel.QueryText = SearchBox.Text;
+            await _viewModel.SearchNowAsync();
+        }
+        else
+        {
+            await _viewModel.FlushOrWaitForSearchAsync();
         }
 
-        if (queryMismatch || _viewModel.HasPendingSearch)
+        if (ResultsList.SelectedIndex < 0 && _viewModel.Results.Count > 0)
         {
-            await _viewModel.SearchNowAsync();
-            if (ResultsList.SelectedIndex < 0 && _viewModel.Results.Count > 0)
-            {
-                ResultsList.SelectedIndex = 0;
-            }
+            ResultsList.SelectedIndex = 0;
         }
     }
 

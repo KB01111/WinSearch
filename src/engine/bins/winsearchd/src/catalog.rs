@@ -67,9 +67,6 @@ pub fn scan_catalog(roots: &[PathBuf]) -> Vec<AppEntry> {
 }
 
 fn scan_dir(dir: &Path, depth: usize, apps: &mut Vec<AppEntry>) -> bool {
-    if depth > 8 {
-        return true;
-    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
@@ -86,9 +83,18 @@ fn scan_dir(dir: &Path, depth: usize, apps: &mut Vec<AppEntry>) -> bool {
                 continue;
             }
         };
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    complete = false;
+                }
+                continue;
+            }
+        };
         let path = entry.path();
-        if path.is_dir() {
-            if !scan_dir(&path, depth + 1, apps) {
+        if ft.is_dir() {
+            if depth < 8 && !scan_dir(&path, depth + 1, apps) {
                 complete = false;
             }
             continue;

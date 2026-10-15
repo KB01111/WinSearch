@@ -20,7 +20,9 @@ use ws_extract::{
     DocumentExtractor, ExtractBudget, ExtractError, ExtractOutput, ExtractionStatus, Extractor,
     ImageExtractor, SegmentDraft,
 };
-use ws_index::model::{NewSegment, SEGMENT_KIND_DOC, SEGMENT_KIND_IMAGE, SEGMENT_KIND_OCR};
+use ws_index::model::{
+    NewSegment, SEGMENT_KIND_DOC, SEGMENT_KIND_IMAGE, SEGMENT_KIND_OCR, SEGMENT_KIND_PDF,
+};
 use ws_index::{ExtractJob, StoreError};
 
 use crate::embed_client::{EmbedSupervisor, EMBED_JOB_TIMEOUT};
@@ -62,6 +64,7 @@ impl Default for ExtractorRegistry {
             budget_factory: Box::new(|_kind| ExtractBudget::default()),
         };
         reg.register(SEGMENT_KIND_DOC, Arc::new(DocumentExtractor));
+        reg.register(SEGMENT_KIND_PDF, Arc::new(DocumentExtractor));
         reg.register(SEGMENT_KIND_IMAGE, Arc::new(ImageExtractor::default()));
         reg
     }
@@ -278,6 +281,10 @@ impl Indexer {
                         let mut store = self.store_lock();
                         let poisoned =
                             Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                        drop(store);
+                        if poisoned {
+                            self.invalidate_vector_cache();
+                        }
                         return Ok(ExtractStepOutcome {
                             claimed: true,
                             status: Some(output.status),
@@ -295,6 +302,10 @@ impl Indexer {
                         let mut store = self.store_lock();
                         let poisoned =
                             Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                        drop(store);
+                        if poisoned {
+                            self.invalidate_vector_cache();
+                        }
                         return Ok(ExtractStepOutcome {
                             claimed: true,
                             status: Some(output.status),
@@ -322,6 +333,10 @@ impl Indexer {
                         let mut store = self.store_lock();
                         let poisoned =
                             Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                        drop(store);
+                        if poisoned {
+                            self.invalidate_vector_cache();
+                        }
                         return Ok(ExtractStepOutcome {
                             claimed: true,
                             status: Some(output.status),
@@ -504,6 +519,7 @@ impl Indexer {
                 attempts = job.attempts + 1,
                 "content extract job failing repeatedly; poison-pilled"
             );
+            let _ = clear_modality_artifacts(store, job.entry_id, &job.kind);
             let _ = store.mark_extract_failed(job.id);
             true
         } else {

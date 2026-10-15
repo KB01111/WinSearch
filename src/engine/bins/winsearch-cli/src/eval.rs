@@ -350,6 +350,15 @@ pub fn run_eval_suite_with(
     suite: &EvalSuite,
     embedder: &dyn EvalEmbedder,
 ) -> anyhow::Result<SuiteReport> {
+    if suite.queries.is_empty() {
+        anyhow::bail!("evaluation suite {:?} contains no queries", suite.name);
+    }
+    if !suite.queries.iter().any(|q| !q.expect_empty) {
+        anyhow::bail!(
+            "evaluation suite {:?} contains no positive queries",
+            suite.name
+        );
+    }
     let mut store = IndexStore::open_in_memory()?;
     let root_id = store.ensure_root("C:\\Users\\demo")?;
     let gen = store.begin_generation(root_id)?;
@@ -468,12 +477,12 @@ pub fn run_eval_suite_with(
     let recall_at_5 = if positive_queries > 0 {
         recall_hits as f64 / positive_queries as f64
     } else {
-        1.0
+        0.0
     };
     let mrr = if positive_queries > 0 {
         mrr_sum / positive_queries as f64
     } else {
-        1.0
+        0.0
     };
     let false_positive_rate = if negative_queries > 0 {
         false_positives as f64 / negative_queries as f64

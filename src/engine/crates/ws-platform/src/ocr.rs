@@ -13,23 +13,42 @@ use windows::Storage::Streams::DataWriter;
 use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
+#[link(name = "runtimeobject")]
+extern "system" {
+    fn RoInitialize(init_type: i32) -> windows::core::HRESULT;
+    fn RoUninitialize();
+}
+
+const RO_INIT_MULTITHREADED: i32 = 1;
+
 struct ComGuard {
-    should_uninit: bool,
+    should_uninit_com: bool,
+    should_uninit_ro: bool,
 }
 
 impl ComGuard {
     fn init() -> Self {
+        let ro_hr = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+        let should_uninit_ro = ro_hr == S_OK || ro_hr == S_FALSE;
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let should_uninit = hr == S_OK || hr == S_FALSE;
-        Self { should_uninit }
+        let should_uninit_com = hr == S_OK || hr == S_FALSE;
+        Self {
+            should_uninit_com,
+            should_uninit_ro,
+        }
     }
 }
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        if self.should_uninit {
+        if self.should_uninit_com {
             unsafe {
                 CoUninitialize();
+            }
+        }
+        if self.should_uninit_ro {
+            unsafe {
+                RoUninitialize();
             }
         }
     }

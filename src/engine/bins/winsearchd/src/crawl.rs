@@ -64,6 +64,9 @@ pub const MAX_DEPTH: usize = 64;
 pub struct DirScan {
     pub entries: Vec<EntryRecord>,
     pub subdirs: Vec<String>,
+    /// True when every entry in `read_dir` was enumerated and inspected without
+    /// non-`NotFound` I/O errors.
+    pub complete: bool,
 }
 
 /// Scans `dir_path`, producing records for its children (`parent_id` is the
@@ -74,9 +77,27 @@ pub fn scan_directory(
     parent_id: Option<i64>,
     depth: usize,
 ) -> io::Result<DirScan> {
-    let mut scan = DirScan::default();
+    let mut scan = DirScan {
+        entries: Vec::new(),
+        subdirs: Vec::new(),
+        complete: true,
+    };
     if depth >= MAX_DEPTH {
         return Ok(scan);
+    }
+    if depth > 0 {
+        match std::fs::symlink_metadata(dir_path) {
+            Ok(meta) => {
+                let attrs = meta.file_attributes();
+                // Reject reparse-point, hidden, or system directories queued via
+                // watcher events so scanning never escapes the configured root.
+                if (attrs & 0x400) != 0 || (attrs & (0x2 | 0x4)) != 0 {
+                    return Ok(scan);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(scan),
+            Err(e) => return Err(e),
+        }
     }
     let rd = match std::fs::read_dir(dir_path) {
         Ok(rd) => rd,
@@ -94,13 +115,23 @@ pub fn scan_directory(
     for entry in rd {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue, // transient per-entry failure: skip
+            Err(e) => {
+                if e.kind() != io::ErrorKind::NotFound {
+                    scan.complete = false;
+                }
+                continue; // transient per-entry failure: skip
+            }
         };
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path().to_string_lossy().into_owned();
         let metadata = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                if e.kind() != io::ErrorKind::NotFound {
+                    scan.complete = false;
+                }
+                continue;
+            }
         };
         let attrs = metadata.file_attributes();
 

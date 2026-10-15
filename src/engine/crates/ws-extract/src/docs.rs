@@ -29,7 +29,7 @@ use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use ws_index::model::SEGMENT_KIND_DOC;
+use ws_index::model::{SEGMENT_KIND_DOC, SEGMENT_KIND_PDF};
 use ws_platform::ifilter::{extract_text_ifilter, IFilterOutcome};
 
 use crate::budget::ExtractBudget;
@@ -97,6 +97,11 @@ pub fn build_document_output(
         return Ok(ExtractOutput::extracted(Vec::new()));
     }
 
+    let seg_kind = if ext.eq_ignore_ascii_case("pdf") {
+        SEGMENT_KIND_PDF
+    } else {
+        SEGMENT_KIND_DOC
+    };
     let mut segments = Vec::with_capacity(raw_chunks.len().min(budget.max_segments));
     for chunk in raw_chunks {
         budget.check_deadline()?;
@@ -104,7 +109,7 @@ pub fn build_document_output(
             break;
         }
         segments.push(SegmentDraft {
-            kind: SEGMENT_KIND_DOC.to_string(),
+            kind: seg_kind.to_string(),
             text: chunk.text,
             page: None,
             start_ms: None,
@@ -249,7 +254,49 @@ fn extract_html_text(path: &Path, budget: &ExtractBudget) -> Result<String, Extr
     let bytes = budget.read_bounded(path)?;
     let html = decode_text_bytes(&bytes)
         .ok_or_else(|| ExtractError::Unsupported("binary html".into()))?;
-    walk_xml_text(&html, budget, true)
+    let stripped = strip_raw_html_blocks(&html, &["script", "style"]);
+    walk_xml_text(&stripped, budget, true)
+}
+
+/// Removes raw `<script ...>...</script>` and `<style ...>...</style>` blocks
+/// case-insensitively before feeding HTML to `quick-xml`, so unescaped `<`
+/// characters inside inline JS/CSS (e.g. `if (x < 2)`) never abort XML parsing.
+fn strip_raw_html_blocks(input: &str, tags: &[&str]) -> String {
+    let mut current = input.to_string();
+    for &tag in tags {
+        let open_pat = format!("<{tag}");
+        let close_pat = format!("</{tag}");
+        let mut out = String::with_capacity(current.len());
+        let lower = current.to_ascii_lowercase();
+        let mut pos = 0usize;
+        while let Some(rel) = lower[pos..].find(&open_pat) {
+            let start = pos + rel;
+            let after_tag = start + open_pat.len();
+            let valid_boundary = lower
+                .as_bytes()
+                .get(after_tag)
+                .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/');
+            if !valid_boundary {
+                out.push_str(&current[pos..after_tag]);
+                pos = after_tag;
+                continue;
+            }
+            out.push_str(&current[pos..start]);
+            if let Some(close_rel) = lower[after_tag..].find(&close_pat) {
+                let close_start = after_tag + close_rel;
+                if let Some(gt_rel) = lower[close_start..].find('>') {
+                    pos = close_start + gt_rel + 1;
+                } else {
+                    pos = current.len();
+                }
+            } else {
+                pos = current.len();
+            }
+        }
+        out.push_str(&current[pos..]);
+        current = out;
+    }
+    current
 }
 
 /// Walks XML/HTML events with `quick-xml`, stripping `<script>`, `<style>`,
@@ -1102,5 +1149,36 @@ Purchase price is \'8042 million \u8212? subject to board approval.\par
         if out.status == ExtractionStatus::Unsupported {
             assert!(out.segments.is_empty());
         }
+    }
+
+    #[test]
+    fn html_with_unescaped_less_than_inside_script_still_extracts_body() {
+        let tmp = TempDir::new();
+        let html_path = tmp.0.join("page.html");
+        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <script>if (x < 2 && y > 1) { console.log("skip me"); }</script>
+  <style>.a < .b { color: red; }</style>
+</head>
+<body>
+  <h1>Quarterly Revenue Summary</h1>
+  <p>Visible body paragraph after script.</p>
+</body>
+</html>"#;
+        std::fs::write(&html_path, html).unwrap();
+
+        let out = DocumentExtractor
+            .extract(&html_path, &ExtractBudget::default())
+            .unwrap();
+        assert_eq!(out.status, ExtractionStatus::Extracted);
+        assert_eq!(out.segments.len(), 1);
+        let text = &out.segments[0].text;
+        assert!(text.contains("Quarterly Revenue Summary"), "got {text:?}");
+        assert!(
+            text.contains("Visible body paragraph after script."),
+            "got {text:?}"
+        );
+        assert!(!text.contains("skip me"));
     }
 }

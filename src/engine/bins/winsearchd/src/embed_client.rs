@@ -439,27 +439,34 @@ impl EmbedSupervisor {
             )));
         }
         let outcome = rx.recv_timeout(timeout);
-        let remaining = self.active_bounded.fetch_sub(1, Ordering::AcqRel) - 1;
         match outcome {
-            Ok(r) => r,
+            Ok(r) => {
+                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                r
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Stop the helper promptly: flag it and cancel only this
-                // caller's synchronous pipe IO. Only kill the owned child when
-                // no other bounded caller is in flight so a short interactive
-                // query timeout never kills a healthy background batch.
+                // caller's synchronous pipe IO. Check whether we are the sole
+                // bounded caller BEFORE decrementing `active_bounded` so a new
+                // bounded call starting right after cannot see a stale zero and
+                // have its worker killed.
                 cancel.store(true, Ordering::Relaxed);
                 self.cancel_inflight_read_for(call_id);
-                if remaining == 0 {
+                if self.active_bounded.load(Ordering::Acquire) == 1 {
                     self.terminate_worker();
                 }
+                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
                 warn!("embed job timed out after {timeout:?}; helper cancelled, batch fails for retry");
                 Err(EmbedError::Transport(format!(
                     "embed job timed out after {timeout:?}"
                 )))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EmbedError::Transport(
-                "embed helper died before answering".into(),
-            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                Err(EmbedError::Transport(
+                    "embed helper died before answering".into(),
+                ))
+            }
         }
     }
 
@@ -484,8 +491,8 @@ impl EmbedSupervisor {
                 id,
                 texts: chunk.to_vec(),
             };
-            let observed_gen = self.worker_gen.load(Ordering::Acquire);
-            match self.transact_bounded(call_id, req, cancel, deadline) {
+            let mut used_gen = self.worker_gen.load(Ordering::Acquire);
+            match self.transact_bounded(call_id, req, cancel, deadline, &mut used_gen) {
                 Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                     self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
                     all.extend(vecs);
@@ -509,7 +516,7 @@ impl EmbedSupervisor {
                         retry,
                         cancel,
                         deadline,
-                        observed_gen,
+                        used_gen,
                     ) {
                         Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                             self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
@@ -563,23 +570,29 @@ impl EmbedSupervisor {
             )));
         }
         let outcome = rx.recv_timeout(timeout);
-        let remaining = self.active_bounded.fetch_sub(1, Ordering::AcqRel) - 1;
         match outcome {
-            Ok(r) => r,
+            Ok(r) => {
+                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                r
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 cancel.store(true, Ordering::Relaxed);
                 self.cancel_inflight_read_for(call_id);
-                if remaining == 0 {
+                if self.active_bounded.load(Ordering::Acquire) == 1 {
                     self.terminate_worker();
                 }
+                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
                 warn!("image embed job timed out after {timeout:?}; helper cancelled");
                 Err(EmbedError::Transport(format!(
                     "image embed job timed out after {timeout:?}"
                 )))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EmbedError::Transport(
-                "image embed helper died before answering".into(),
-            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                Err(EmbedError::Transport(
+                    "image embed helper died before answering".into(),
+                ))
+            }
         }
     }
 
@@ -603,8 +616,8 @@ impl EmbedSupervisor {
                 EmbedError::Protocol("embed_image returned empty vector list".into())
             })
         };
-        let observed_gen = self.worker_gen.load(Ordering::Acquire);
-        match self.transact_bounded(call_id, req, cancel, deadline) {
+        let mut used_gen = self.worker_gen.load(Ordering::Acquire);
+        match self.transact_bounded(call_id, req, cancel, deadline, &mut used_gen) {
             Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                 self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
                 extract_first(vecs)
@@ -626,7 +639,7 @@ impl EmbedSupervisor {
                     retry,
                     cancel,
                     deadline,
-                    observed_gen,
+                    used_gen,
                 ) {
                     Ok(EmbedResponse::Embeddings { vecs, .. }) => {
                         self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
@@ -877,6 +890,7 @@ impl EmbedSupervisor {
         req: EmbedRequest,
         cancel: &AtomicBool,
         deadline: Instant,
+        used_gen: &mut u64,
     ) -> Result<EmbedResponse, EmbedError> {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
             return Err(EmbedError::Transport("embed job cancelled".into()));
@@ -891,6 +905,7 @@ impl EmbedSupervisor {
                     let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
                     self.ensure_worker_locked(&mut slot)
                 };
+                *used_gen = self.worker_gen.load(Ordering::Acquire);
                 ensure.and_then(|()| self.connect_and_send(&req))
             }
         };

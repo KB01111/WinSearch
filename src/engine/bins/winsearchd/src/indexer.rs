@@ -103,11 +103,13 @@ pub struct EmbedBatchOutcome {
 struct RootInfo {
     id: i64,
     path: PathBuf,
+    offline: AtomicBool,
 }
 
 pub struct Indexer {
     store: Mutex<IndexStore>,
     vector_index: std::sync::RwLock<Option<ws_index::VectorIndex>>,
+    cache_epoch: std::sync::atomic::AtomicU64,
     counters: Mutex<Counters>,
     wake: (Mutex<bool>, Condvar),
     shutdown: AtomicBool,
@@ -132,12 +134,14 @@ impl Indexer {
             let id = store.ensure_root(&path)?;
             infos.push(RootInfo {
                 id,
+                offline: AtomicBool::new(!root.is_dir()),
                 path: root.clone(),
             });
         }
         Ok(Arc::new(Self {
             store: Mutex::new(store),
             vector_index: std::sync::RwLock::new(None),
+            cache_epoch: std::sync::atomic::AtomicU64::new(1),
             counters: Mutex::new(Counters::default()),
             wake: (Mutex::new(false), Condvar::new()),
             shutdown: AtomicBool::new(false),
@@ -228,17 +232,21 @@ impl Indexer {
             let guard = self.vector_index.read().unwrap_or_else(|p| p.into_inner());
             !guard.as_ref().is_some_and(|idx| idx.dim() == dim)
         };
-        if need_build {
+        let hits = if need_build {
+            let epoch = self.cache_epoch.load(Ordering::Acquire);
             let segs = self
                 .store
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .all_segments()?;
             let built = ws_index::VectorIndex::from_segments(dim, &segs);
+            let hits = built.search(query, top_k, filter).unwrap_or_default();
             let mut guard = self.vector_index.write().unwrap_or_else(|p| p.into_inner());
-            *guard = Some(built);
-        }
-        let hits = {
+            if self.cache_epoch.load(Ordering::Acquire) == epoch {
+                *guard = Some(built);
+            }
+            hits
+        } else {
             let guard = self.vector_index.read().unwrap_or_else(|p| p.into_inner());
             match guard.as_ref() {
                 Some(idx) if idx.dim() == dim => {
@@ -264,10 +272,12 @@ impl Indexer {
     }
 
     pub(crate) fn invalidate_vector_cache(&self) {
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
         *self.vector_index.write().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     pub(crate) fn update_vector_cache(&self, seg_id: i64, entry_id: i64, kind: &str, vec: &[f32]) {
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
         let mut guard = self.vector_index.write().unwrap_or_else(|p| p.into_inner());
         if let Some(ref mut idx) = *guard {
             if idx.dim() == vec.len() {
@@ -536,6 +546,9 @@ impl Indexer {
             for sub in &scan.subdirs {
                 store.enqueue_dir(root_id, sub)?;
             }
+            if !scan.complete {
+                store.touch_subtree_generation(root_id, dir_path, generation)?;
+            }
         }
         store.complete_dir(queue_id)?;
 
@@ -646,13 +659,45 @@ impl Indexer {
                                 SEGMENT_KIND_NAME,
                                 EXTRACT_PRIORITY_UPDATED,
                             )?;
+                            let mut invalidate_cache = false;
+                            if !row.is_dir && !row.ext.eq_ignore_ascii_case(&ext) {
+                                let old_mod = ws_extract::modality_kind_for_ext(&row.ext);
+                                let new_mod = ws_extract::modality_kind_for_ext(&ext);
+                                if old_mod != new_mod {
+                                    store.delete_content_text(row.id)?;
+                                    if let Some(om) = old_mod {
+                                        store.remove_segments_for_entry_and_kind(row.id, om)?;
+                                        if om == ws_index::model::SEGMENT_KIND_IMAGE {
+                                            store.remove_segments_for_entry_and_kind(
+                                                row.id,
+                                                ws_index::model::SEGMENT_KIND_OCR,
+                                            )?;
+                                        }
+                                        invalidate_cache = true;
+                                    }
+                                    if let Some(nm) = new_mod {
+                                        let prio = compute_extract_priority(
+                                            row.size,
+                                            row.mtime,
+                                            UpsertOutcome::Updated,
+                                        );
+                                        store.enqueue_extract_job_with_priority(row.id, nm, prio)?;
+                                    }
+                                }
+                            }
                             if row.is_dir {
                                 store.rename_tree_paths(&from_str, &to_str)?;
                                 drop(store);
+                                if invalidate_cache {
+                                    self.invalidate_vector_cache();
+                                }
                                 let mut s = self.store.lock().unwrap_or_else(|p| p.into_inner());
                                 s.enqueue_dir(root_id, &to_str)?;
                                 drop(s);
                                 self.notify_work();
+                            } else if invalidate_cache {
+                                drop(store);
+                                self.invalidate_vector_cache();
                             }
                         }
                         None => {
@@ -671,7 +716,9 @@ impl Indexer {
                     .find(|r| r.id == root_id)
                     .map(|r| r.path.to_string_lossy().into_owned());
                 if let Some(root_path) = root {
-                    store.enqueue_dir(root_id, &root_path)?;
+                    let gen = store.begin_generation(root_id)?;
+                    store.requeue_dir(root_id, &root_path)?;
+                    store.set_checkpoint(&format!("root:{root_id}:generation"), &gen.to_string())?;
                 }
                 drop(store);
                 self.notify_work();
@@ -1091,16 +1138,19 @@ impl Indexer {
     fn reconcile_drives(self: &Arc<Self>) {
         for root in &self.roots {
             let present = root.path.is_dir();
-            let marked_missing = self.root_marked_missing(root.id);
+            let was_offline = root.offline.load(Ordering::Acquire);
+            let marked_missing = self.root_marked_missing(root.id).unwrap_or(false) || was_offline;
             match (present, marked_missing) {
-                (true, Ok(true)) => {
+                (true, true) => {
                     info!(root = %root.path.display(), "volume reconnected; reconciling");
+                    root.offline.store(false, Ordering::Release);
                     if let Err(e) = self.reconnect_root(root) {
                         warn!(error = %e, "reconnect failed");
                     }
                 }
-                (false, Ok(false)) => {
+                (false, false) => {
                     info!(root = %root.path.display(), "volume disconnected; preserving index");
+                    root.offline.store(true, Ordering::Release);
                     let mut store =
                         self.store.lock().unwrap_or_else(|p| p.into_inner());
                     if let Err(e) = store.set_missing_for_root(root.id, true) {

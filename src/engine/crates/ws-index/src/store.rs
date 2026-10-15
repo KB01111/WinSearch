@@ -698,6 +698,21 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Forces `(root_id, dir_path)` to be queued as an unclaimed crawl item
+    /// with a fresh queue id (used on watcher overflow so an already-claimed
+    /// scan cannot swallow the rescan request when it completes).
+    pub fn requeue_dir(&mut self, root_id: i64, dir_path: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM crawl_queue WHERE root_id = ?1 AND dir_path = ?2",
+            params![root_id, dir_path],
+        )?;
+        self.conn.execute(
+            "INSERT INTO crawl_queue(root_id, dir_path) VALUES(?1, ?2)",
+            params![root_id, dir_path],
+        )?;
+        Ok(())
+    }
+
     /// Atomically claims the oldest unclaimed directory for a worker. The row
     /// stays in the queue until [`Self::complete_dir`] runs, so a crash at any
     /// point re-runs the (idempotent) scan of that directory on restart.

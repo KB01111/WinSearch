@@ -33,13 +33,15 @@ pub enum VectorError {
     EmptyVector,
 }
 
-/// L2 norm with `f32` accumulation. Returns `0.0` for empty input.
+/// L2 norm with `f64` accumulation so finite `f32` values near `1e20` do not
+/// overflow `x * x`. Returns `0.0` for empty input.
 pub fn l2_norm(v: &[f32]) -> f32 {
-    let mut sum = 0f32;
+    let mut sum = 0.0f64;
     for &x in v {
-        sum += x * x;
+        let xf = f64::from(x);
+        sum += xf * xf;
     }
-    sum.sqrt()
+    sum.sqrt() as f32
 }
 
 /// Normalizes `v` to unit length. Returns `(normalized, norm)` where `norm`
@@ -49,14 +51,23 @@ pub fn normalize_vector(v: &[f32]) -> (Vec<f32>, f32) {
     if v.is_empty() {
         return (Vec::new(), 0.0);
     }
-    let norm = l2_norm(v);
-    if norm == 0.0 || !norm.is_finite() {
-        return (vec![0.0; v.len()], 0.0);
-    }
     if !v.iter().all(|x| x.is_finite()) {
         return (vec![0.0; v.len()], 0.0);
     }
-    (v.iter().map(|x| x / norm).collect(), norm)
+    let mut sum = 0.0f64;
+    for &x in v {
+        let xf = f64::from(x);
+        sum += xf * xf;
+    }
+    let norm_f64 = sum.sqrt();
+    if norm_f64 == 0.0 || !norm_f64.is_finite() {
+        return (vec![0.0; v.len()], 0.0);
+    }
+    let norm = (norm_f64 as f32).min(f32::MAX);
+    (
+        v.iter().map(|&x| (f64::from(x) / norm_f64) as f32).collect(),
+        norm,
+    )
 }
 
 /// Encodes (already normalized) `f32` values as FP16 little-endian bytes.
@@ -646,5 +657,13 @@ mod tests {
         assert_eq!(idx.remove_by_kind(SEGMENT_KIND_PDF), 1);
         assert_eq!(idx.count_by_kind(SEGMENT_KIND_PDF), 0);
         assert_eq!(idx.len(), 6);
+    }
+
+    #[test]
+    fn large_finite_components_do_not_overflow_to_zero_norm() {
+        let (normed, norm) = normalize_vector(&[1e20, 0.0]);
+        assert!(norm > 0.0, "expected positive norm for 1e20, got {norm}");
+        assert!((normed[0] - 1.0).abs() < 1e-5, "got {normed:?}");
+        assert_eq!(normed[1], 0.0);
     }
 }
