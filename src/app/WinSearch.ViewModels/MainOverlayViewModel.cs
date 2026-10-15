@@ -15,23 +15,31 @@ namespace WinSearch.ViewModels;
 /// </summary>
 public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDisposable
 {
+    public const string MissingModelHintText =
+        "Semantic search needs the AI model — Settings → AI model";
+
     private const int DebounceMs = 120;
 
-    private readonly EngineClient _client;
+    private readonly IEngineClient _client;
     private readonly AppSettings _settings;
     private readonly SynchronizationContext? _ui;
     private CancellationTokenSource? _searchCts;
     private Timer? _debounceTimer;
     private long _searchSequence;
     private string _pendingQuery = "";
+    private bool _semanticEnabled = true;
+    private ModelState _modelState = ModelState.NotDownloaded;
     private bool _disposed;
 
-    public MainOverlayViewModel(EngineClient client, AppSettings settings)
+    public MainOverlayViewModel(IEngineClient client, AppSettings settings)
     {
         _client = client;
         _settings = settings;
         _ui = SynchronizationContext.Current;
         _client.StatusChanged += OnStatusChanged;
+        _client.ModelStatusChanged += OnModelStatusChanged;
+        _client.ConfigChanged += OnConfigChanged;
+        _client.Reconnected += OnReconnected;
     }
 
     public ObservableCollection<ResultItemViewModel> Results { get; } = new();
@@ -52,9 +60,67 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     [ObservableProperty]
     private bool _isSemanticPending;
 
+    /// <summary>
+    /// Hint shown when semantic search is enabled in engine policy, the user is
+    /// running a non-code search, and the AI model is not ready.
+    /// </summary>
+    [ObservableProperty]
+    private string _semanticHintText = "";
+
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var config = await _client.GetConfigAsync(cancellationToken);
+            Dispatch(() => ApplyConfig(config));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Connection may still be establishing; Reconnected refreshes state.
+        }
+
+        try
+        {
+            var modelStatus = await _client.GetModelStatusAsync(cancellationToken);
+            Dispatch(() => ApplyModelStatus(modelStatus));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+        }
+    }
+
+    public void ApplyConfig(EngineConfig config)
+    {
+        _semanticEnabled = config.SemanticEnabled;
+        UpdateSemanticHint();
+    }
+
+    public void ApplyModelStatus(ModelStatus status)
+    {
+        _modelState = status.State;
+        UpdateSemanticHint();
+    }
+
+    private void UpdateSemanticHint()
+    {
+        var query = QueryText;
+        var isCode = query.StartsWith("code:", StringComparison.OrdinalIgnoreCase);
+        var hasQuery = !string.IsNullOrWhiteSpace(query);
+
+        if (hasQuery && !isCode && _semanticEnabled && _modelState != ModelState.Ready)
+        {
+            SemanticHintText = MissingModelHintText;
+        }
+        else
+        {
+            SemanticHintText = "";
+        }
+    }
+
     partial void OnQueryTextChanged(string value)
     {
         _pendingQuery = value;
+        UpdateSemanticHint();
         _debounceTimer?.Dispose();
         _debounceTimer = new Timer(
             static state => ((MainOverlayViewModel)state!).OnDebounceElapsed(),
@@ -70,9 +136,9 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
 
     /// <summary>Runs immediately (Enter / mode switch), bypassing the debounce.</summary>
     [RelayCommand]
-    private Task SearchNowAsync() => RunSearchAsync(QueryText);
+    public Task SearchNowAsync() => RunSearchAsync(QueryText);
 
-    private async Task RunSearchAsync(string query)
+    public async Task RunSearchAsync(string query)
     {
         if (_disposed)
         {
@@ -93,30 +159,35 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
                 IsSearching = false;
                 IsSemanticPending = false;
                 StatusText = "";
+                UpdateSemanticHint();
             });
             return;
         }
-
-        Dispatch(() =>
-        {
-            IsSearching = true;
-            StatusText = "Searching…";
-        });
 
         var mode = query.StartsWith("code:", StringComparison.OrdinalIgnoreCase)
             ? SearchMode.Code
             : SearchMode.Auto;
         var effectiveText = mode == SearchMode.Code ? query["code:".Length..].Trim() : query;
-        Dispatch(() => ModeLabel = mode == SearchMode.Code ? "Code" : "All");
+        var includeSemantic = mode != SearchMode.Code && _semanticEnabled;
+
+        Dispatch(() =>
+        {
+            Results.Clear();
+            IsSearching = true;
+            IsSemanticPending = false;
+            ModeLabel = mode == SearchMode.Code ? "Code" : "All";
+            StatusText = "Searching…";
+            UpdateSemanticHint();
+        });
 
         var searchQuery = new SearchQuery
         {
             Text = effectiveText,
             Mode = mode,
             Limit = 20,
-            // Semantic batches append after the exact results; the toggle in
-            // Settings opts out client-side, the engine gates on model/policy.
-            IncludeSemantic = mode != SearchMode.Code && _settings.EnableSemanticSearch,
+            // Semantic batches append after the exact results; engine policy
+            // and model readiness gate the second stage server-side.
+            IncludeSemantic = includeSemantic,
         };
 
         try
@@ -131,26 +202,50 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
 
                 var items = batch.Results.Select(r => new ResultItemViewModel(r)).ToList();
                 seen += items.Count;
+                var done = batch.Done;
+                var pendingSemantic = includeSemantic && !done;
                 Dispatch(() =>
                 {
+                    // Append-only: never clear or reorder already-displayed exact results.
                     foreach (var item in items)
                     {
                         Results.Add(item);
                     }
-                    StatusText = seen == 0 ? "No matches" : $"{seen} result{(seen == 1 ? "" : "s")}";
                     IsSearching = false;
+                    IsSemanticPending = pendingSemantic;
+                    StatusText = seen == 0
+                        ? (pendingSemantic ? "Searching semantic matches…" : "No matches")
+                        : $"{seen} result{(seen == 1 ? "" : "s")}";
+                });
+            }
+
+            if (sequence == Interlocked.Read(ref _searchSequence))
+            {
+                Dispatch(() =>
+                {
+                    IsSearching = false;
+                    IsSemanticPending = false;
                 });
             }
         }
         catch (OperationCanceledException)
         {
-            // Superseded query: nothing to report.
+            // Superseded query: if no newer query took over, clear pending flags.
+            if (sequence == Interlocked.Read(ref _searchSequence))
+            {
+                Dispatch(() =>
+                {
+                    IsSearching = false;
+                    IsSemanticPending = false;
+                });
+            }
         }
         catch (EngineException ex)
         {
             Dispatch(() =>
             {
                 IsSearching = false;
+                IsSemanticPending = false;
                 StatusText = ex.Code == ErrorCode.NotReady ? "Search is not ready yet" : ex.Message;
             });
         }
@@ -159,6 +254,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
             Dispatch(() =>
             {
                 IsSearching = false;
+                IsSemanticPending = false;
                 StatusText = "Lost connection to the search engine";
             });
         }
@@ -168,7 +264,13 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     {
         Dispatch(() =>
         {
-            if (!IsSearching)
+            if (status.ModelLoaded && _modelState == ModelState.NotDownloaded)
+            {
+                _modelState = ModelState.Ready;
+                UpdateSemanticHint();
+            }
+
+            if (!IsSearching && !IsSemanticPending && string.IsNullOrWhiteSpace(QueryText))
             {
                 StatusText = status.State switch
                 {
@@ -183,12 +285,27 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         });
     }
 
+    private void OnModelStatusChanged(object? sender, ModelStatus status)
+    {
+        Dispatch(() => ApplyModelStatus(status));
+    }
+
+    private void OnConfigChanged(object? sender, EngineConfig config)
+    {
+        Dispatch(() => ApplyConfig(config));
+    }
+
+    private void OnReconnected(object? sender, EventArgs e)
+    {
+        _ = InitializeAsync();
+    }
+
     public Task RefreshStatusAsync(CancellationToken cancellationToken = default)
         => _client.GetStatusAsync(cancellationToken);
 
     private void Dispatch(Action action)
     {
-        if (_ui is null)
+        if (_ui is null || SynchronizationContext.Current == _ui)
         {
             action();
         }
@@ -206,6 +323,9 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         }
         _disposed = true;
         _client.StatusChanged -= OnStatusChanged;
+        _client.ModelStatusChanged -= OnModelStatusChanged;
+        _client.ConfigChanged -= OnConfigChanged;
+        _client.Reconnected -= OnReconnected;
         _debounceTimer?.Dispose();
         _searchCts?.Cancel();
         _searchCts?.Dispose();
