@@ -13,7 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::model::{
     EntryRecord, ExtractJob, NewSegment, ScoredSegment, Segment, UpsertOutcome, VectorFilter,
 };
-use crate::vectors::{cosine_fp16_vs_f32, encode_normalized_vector, l2_norm};
+use crate::vectors::{dot_fp16_row_vs_normalized, encode_normalized_vector, normalize_vector};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -771,10 +771,21 @@ impl IndexStore {
     }
 
     /// Brute-force cosine top-k over the `segments` table. The query is
-    /// normalized once; each stored FP16 row is scored with `f32`
-    /// accumulation (same kernel as [`crate::vectors::VectorIndex::search`]).
+    /// normalized once; each stored FP16 row is scored directly from its raw
+    /// `vector` BLOB bytes with [`crate::vectors::dot_fp16_row_vs_normalized`]
+    /// (`f32` accumulation — the same kernel as
+    /// [`crate::vectors::VectorIndex::search`]).
     /// Rows whose width differs from the query are skipped. Results are
     /// `(segment, cosine)` pairs sorted by descending cosine (ties by id).
+    ///
+    /// Contract (shared with [`crate::vectors::VectorIndex::search`]):
+    /// `top_k == 0`, an empty query, and a zero/non-finite query all yield
+    /// `Ok(vec![])` — an empty query is not an error, matching the crate's
+    /// other search APIs. Width mismatch is the one deliberate difference:
+    /// the fixed-dim index reports `Err(DimensionMismatch)` while this
+    /// schemaless table skips non-matching rows (so a query matching no
+    /// row's width yields `Ok(vec![])`). Callers needing strictness should
+    /// validate the width up front (`VectorIndex::dim` gives the expected one).
     pub fn search_vectors(
         &self,
         query: &[f32],
@@ -784,11 +795,8 @@ impl IndexStore {
         if top_k == 0 || query.is_empty() {
             return Ok(Vec::new());
         }
-        let query_norm = l2_norm(query);
-        if query_norm == 0.0 || !query_norm.is_finite() {
-            return Ok(Vec::new());
-        }
-        if !query.iter().all(|x| x.is_finite()) {
+        let (normed_query, query_norm) = normalize_vector(query);
+        if query_norm == 0.0 {
             return Ok(Vec::new());
         }
         // Push the filter into SQL so large indexes don't materialize every row.
@@ -839,17 +847,19 @@ impl IndexStore {
             for e in &entries_owned {
                 params_vec.push(e);
             }
-            let rows = stmt.query_map(params_vec.as_slice(), map_segment_row)?;
+            let rows = stmt.query_map(params_vec.as_slice(), map_segment_row_raw)?;
             let mut scored = Vec::new();
             for row in rows {
-                let seg: Segment = row?;
-                if seg.vector.len() != query.len() {
+                let raw: RawSegmentRow = row?;
+                if raw.bytes.len() != query.len() * 2 {
                     continue; // mixed-width DB (e.g. model swap): skip, don't fail
                 }
-                let bytes = crate::vectors::encode_fp16_vector(&seg.vector);
-                let cos = cosine_fp16_vs_f32(&bytes, seg.norm, query);
+                if raw.segment.norm == 0.0 {
+                    continue; // mirrors VectorIndex::search (unreachable via upsert)
+                }
+                let cos = dot_fp16_row_vs_normalized(&raw.bytes, &normed_query);
                 scored.push(ScoredSegment {
-                    segment: seg,
+                    segment: raw.segment,
                     cosine: cos,
                 });
             }
@@ -863,17 +873,19 @@ impl IndexStore {
         }
         // No filter: full scan.
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_segment_row)?;
+        let rows = stmt.query_map([], map_segment_row_raw)?;
         let mut scored = Vec::new();
         for row in rows {
-            let seg: Segment = row?;
-            if seg.vector.len() != query.len() {
+            let raw: RawSegmentRow = row?;
+            if raw.bytes.len() != query.len() * 2 {
                 continue;
             }
-            let bytes = crate::vectors::encode_fp16_vector(&seg.vector);
-            let cos = cosine_fp16_vs_f32(&bytes, seg.norm, query);
+            if raw.segment.norm == 0.0 {
+                continue; // mirrors VectorIndex::search (unreachable via upsert)
+            }
+            let cos = dot_fp16_row_vs_normalized(&raw.bytes, &normed_query);
             scored.push(ScoredSegment {
-                segment: seg,
+                segment: raw.segment,
                 cosine: cos,
             });
         }
@@ -1038,20 +1050,36 @@ fn map_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
 }
 
 fn map_segment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Segment> {
+    map_segment_row_raw(row).map(|raw| raw.segment)
+}
+
+/// A segment row carrying both the decoded payload and the raw FP16 bytes.
+/// Scoring reads `bytes` directly (no decode→re-encode round trip); `segment`
+/// is the payload returned to callers.
+struct RawSegmentRow {
+    segment: Segment,
+    bytes: Vec<u8>,
+}
+
+fn map_segment_row_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSegmentRow> {
     let bytes: Vec<u8> = row.get(9)?;
     let norm_f64: f64 = row.get(10)?;
-    Ok(Segment {
-        id: row.get(0)?,
-        entry_id: row.get(1)?,
-        kind: row.get(2)?,
-        chunk_index: row.get(3)?,
-        text: row.get(4)?,
-        page: row.get(5)?,
-        start_ms: row.get(6)?,
-        end_ms: row.get(7)?,
-        line: row.get(8)?,
-        vector: crate::vectors::decode_fp16_vector(&bytes),
-        norm: norm_f64 as f32,
+    let vector = crate::vectors::decode_fp16_vector(&bytes);
+    Ok(RawSegmentRow {
+        segment: Segment {
+            id: row.get(0)?,
+            entry_id: row.get(1)?,
+            kind: row.get(2)?,
+            chunk_index: row.get(3)?,
+            text: row.get(4)?,
+            page: row.get(5)?,
+            start_ms: row.get(6)?,
+            end_ms: row.get(7)?,
+            line: row.get(8)?,
+            vector,
+            norm: norm_f64 as f32,
+        },
+        bytes,
     })
 }
 
@@ -1423,9 +1451,59 @@ mod tests {
         assert_eq!(hits[0].segment.entry_id, ids[1]);
         assert_eq!(hits[1].segment.entry_id, ids[3]);
 
-        // Zero query and top_k == 0 return empty, never an error.
+        // Degenerate queries return empty, never an error (aligned contract
+        // with `VectorIndex::search`; see its rustdoc).
+        assert!(store.search_vectors(&[], 10, None).unwrap().is_empty());
         assert!(store.search_vectors(&[0.0, 0.0], 10, None).unwrap().is_empty());
+        assert!(
+            store
+                .search_vectors(&[f32::NAN, 0.0], 10, None)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.search_vectors(&[1.0, 0.0], 0, None).unwrap().is_empty());
+        // Width mismatch: schemaless table skips non-matching rows instead of
+        // erroring (the fixed-dim index reports DimensionMismatch).
+        assert!(store.search_vectors(&[1.0, 0.0, 0.0], 10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_vectors_skips_mixed_width_rows() {
+        let (mut store, root) = setup();
+        let a = entry_id_for(&mut store, root, "C:\\data\\a.txt", "a.txt", 601);
+        let b = entry_id_for(&mut store, root, "C:\\data\\b.txt", "b.txt", 602);
+        store
+            .upsert_segment(NewSegment {
+                entry_id: a,
+                kind: "name",
+                chunk_index: 0,
+                text: "a",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0],
+            })
+            .unwrap();
+        store
+            .upsert_segment(NewSegment {
+                entry_id: b,
+                kind: "name",
+                chunk_index: 0,
+                text: "b",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0, 0.0],
+            })
+            .unwrap();
+        let hits = store.search_vectors(&[1.0, 0.0], 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment.entry_id, a);
+        let hits = store.search_vectors(&[1.0, 0.0, 0.0], 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment.entry_id, b);
     }
 
     #[test]

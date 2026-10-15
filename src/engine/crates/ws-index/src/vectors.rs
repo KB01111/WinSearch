@@ -113,27 +113,39 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Cosine between one stored FP16-normalized vector and a raw `f32` query.
 /// The query is normalized internally; a zero/non-finite query yields `0.0`.
 /// Length mismatch (`stored.len() / 2 != query.len()`) yields `0.0`.
+///
+/// Single-shot convenience wrapper: batch callers (e.g. [`VectorIndex::search`],
+/// `IndexStore::search_vectors`) normalize the query once and call
+/// [`dot_fp16_row_vs_normalized`] per row instead.
 pub fn cosine_fp16_vs_f32(stored_fp16: &[u8], stored_norm: f32, query: &[f32]) -> f32 {
     if stored_norm == 0.0 || !stored_norm.is_finite() {
         return 0.0;
     }
-    if stored_fp16.len() % 2 != 0 || stored_fp16.len() / 2 != query.len() || query.is_empty() {
+    if query.is_empty() {
         return 0.0;
     }
-    let (_, query_norm) = normalize_vector(query);
+    let (normed_query, query_norm) = normalize_vector(query);
     if query_norm == 0.0 {
         return 0.0;
     }
-    let inv = 1.0 / query_norm;
+    dot_fp16_row_vs_normalized(stored_fp16, &normed_query)
+}
+
+/// Dot product of one FP16-normalized row against an already-normalized query,
+/// with `f32` accumulation and output clamped to `[-1, 1]`.
+///
+/// This is the shared scoring kernel used by both [`VectorIndex::search`] and
+/// `IndexStore::search_vectors`, so the two paths always agree. Callers must
+/// pass a unit-length query; byte-width mismatch
+/// (`stored.len() != query.len() * 2`) yields `0.0`.
+pub fn dot_fp16_row_vs_normalized(stored_fp16: &[u8], normed_query: &[f32]) -> f32 {
+    if stored_fp16.len() != normed_query.len() * 2 {
+        return 0.0;
+    }
     let mut dot = 0f32;
     for (i, chunk) in stored_fp16.chunks_exact(2).enumerate() {
-        let q = query[i];
-        if !q.is_finite() {
-            return 0.0;
-        }
         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-        let s = half::f16::from_bits(bits).to_f32();
-        dot += s * (q * inv);
+        dot += half::f16::from_bits(bits).to_f32() * normed_query[i];
     }
     dot.clamp(-1.0, 1.0)
 }
@@ -306,10 +318,17 @@ impl VectorIndex {
     }
 
     /// Brute-force cosine top-k. The query is normalized once; each stored
-    /// FP16 row is decoded on the fly with `f32` accumulation. Zero queries,
-    /// empty indexes, and `top_k == 0` yield an empty result (never an error).
-    /// Dimension mismatch on the query is an error; per-row width is invariant
-    /// so it cannot mismatch.
+    /// FP16 row is scored with [`dot_fp16_row_vs_normalized`] (`f32`
+    /// accumulation) — the same kernel `IndexStore::search_vectors` uses.
+    ///
+    /// Contract (shared with `IndexStore::search_vectors`):
+    /// `top_k == 0`, an empty index, an empty query, and a zero/non-finite
+    /// query all yield `Ok(vec![])` — an empty query is not an error, matching
+    /// the crate's other search APIs. A non-empty query whose width differs
+    /// from the index dimension is a programming error and yields
+    /// `Err(DimensionMismatch)`; the store instead skips non-matching rows
+    /// (it is schemaless and has no single expected width — see
+    /// `IndexStore::search_vectors`).
     pub fn search(
         &self,
         query: &[f32],
@@ -320,7 +339,8 @@ impl VectorIndex {
             return Ok(Vec::new());
         }
         if query.is_empty() {
-            return Err(VectorError::EmptyVector);
+            // Aligned with `IndexStore::search_vectors`: empty query → no hits.
+            return Ok(Vec::new());
         }
         if query.len() != self.dim {
             return Err(VectorError::DimensionMismatch {
@@ -354,15 +374,11 @@ impl VectorIndex {
             }
             let off = slot * stride;
             let row = &self.data[off..off + stride];
-            let mut dot = 0f32;
-            for (i, chunk) in row.chunks_exact(2).enumerate() {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                dot += half::f16::from_bits(bits).to_f32() * normed_query[i];
-            }
+            let dot = dot_fp16_row_vs_normalized(row, &normed_query);
             hits.push(VectorHit {
                 id: self.ids[slot],
                 entry_id: self.entry_ids[slot],
-                cosine: dot.clamp(-1.0, 1.0),
+                cosine: dot,
             });
         }
         hits.sort_by(|a, b| {
@@ -525,5 +541,44 @@ mod tests {
         };
         let hits = idx.search(&[1.0, 0.0], 10, Some(&filter)).unwrap();
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 4]);
+    }
+
+    #[test]
+    fn search_error_contract_matches_store() {
+        // Aligned contract (see `VectorIndex::search` rustdoc): degenerate
+        // queries yield Ok(empty); only a width mismatch on this fixed-dim
+        // index is an error (the schemaless store skips such rows instead).
+        let mut idx = VectorIndex::new(2);
+        idx.add_or_update(1, 1, "name", &[1.0, 0.0]).unwrap();
+
+        assert!(idx.search(&[], 10, None).unwrap().is_empty());
+        assert!(idx.search(&[0.0, 0.0], 10, None).unwrap().is_empty());
+        assert!(
+            idx.search(&[f32::NAN, 1.0], 10, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(idx.search(&[1.0, 0.0], 0, None).unwrap().is_empty());
+        assert!(VectorIndex::new(2).search(&[1.0, 0.0], 10, None).unwrap().is_empty());
+        assert_eq!(
+            idx.search(&[1.0, 0.0, 0.0], 10, None).unwrap_err(),
+            VectorError::DimensionMismatch {
+                expected: 2,
+                actual: 3
+            }
+        );
+        // `EmptyVector` is still the error for empty inserts (fixed-dim slot
+        // cannot hold a widthless vector).
+        assert_eq!(
+            idx.add_or_update(9, 9, "name", &[]).unwrap_err(),
+            VectorError::EmptyVector
+        );
+        assert_eq!(
+            idx.add_or_update(9, 9, "name", &[1.0]).unwrap_err(),
+            VectorError::DimensionMismatch {
+                expected: 2,
+                actual: 1
+            }
+        );
     }
 }
