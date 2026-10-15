@@ -15,7 +15,7 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn features() -> Vec<String> {
     // Capability tags advertised at handshake. Grows with the phases:
     // "search.semantic" appears in Phase 3, "code" in Phase 5.
-    vec!["search.exact".to_string()]
+    vec!["search.exact".to_string(), "search.semantic".to_string()]
 }
 
 pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
@@ -125,6 +125,12 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
             }
             ClientMessage::GetModelStatus { id } => {
                 engine.model_status(&client, id);
+            }
+            ClientMessage::GetConfig { id } => {
+                engine.get_config(&client, id);
+            }
+            ClientMessage::SetConfig { id, config } => {
+                engine.set_config(&client, id, config);
             }
         }
     }

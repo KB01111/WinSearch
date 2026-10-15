@@ -14,6 +14,7 @@ public sealed partial class SettingsViewModel : ObservableObject
         _settings = settings;
         _selectedTheme = settings.Theme;
         _rememberLastQuery = settings.RememberLastQuery;
+        _enableSemanticSearch = settings.EnableSemanticSearch;
     }
 
     public static IReadOnlyList<AppTheme> ThemeOptions { get; } =
@@ -24,6 +25,9 @@ public sealed partial class SettingsViewModel : ObservableObject
 
     [ObservableProperty]
     private bool _rememberLastQuery;
+
+    [ObservableProperty]
+    private bool _enableSemanticSearch;
 
     [ObservableProperty]
     private string _hotkeyDisplay = "";
@@ -45,6 +49,12 @@ public sealed partial class SettingsViewModel : ObservableObject
     partial void OnRememberLastQueryChanged(bool value)
     {
         _settings.RememberLastQuery = value;
+        _settings.Save();
+    }
+
+    partial void OnEnableSemanticSearchChanged(bool value)
+    {
+        _settings.EnableSemanticSearch = value;
         _settings.Save();
     }
 

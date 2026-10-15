@@ -11,7 +11,8 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{
-    EntryRecord, ExtractJob, NewSegment, ScoredSegment, Segment, UpsertOutcome, VectorFilter,
+    EngineConfig, EntryRecord, ExtractJob, NewSegment, PreferredBackend, ScoredSegment, Segment,
+    UpsertOutcome, VectorFilter,
 };
 use crate::vectors::{dot_fp16_row_vs_normalized, encode_normalized_vector, normalize_vector};
 
@@ -23,6 +24,8 @@ pub enum StoreError {
     UnsupportedSchemaVersion(String),
     #[error("invalid vector: {0}")]
     InvalidVector(String),
+    #[error("invalid engine config: {0}")]
+    InvalidConfig(String),
 }
 
 /// A configured indexing root.
@@ -162,6 +165,22 @@ CREATE INDEX IF NOT EXISTS idx_extract_jobs_state ON extract_jobs(state, claimed
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_priority ON extract_jobs(state, claimed, priority, id);
 "#;
 
+/// Engine config store (P3.6, additive): a plain key/value table holding the
+/// `EngineConfig` fields (`semantic_enabled`, `preferred_backend`). Wired into
+/// `init` with `IF NOT EXISTS`, so fresh and v1/v2 files all gain it without
+/// a migration and `meta.schema_version` stays "2" (same pattern as the
+/// `priority`-column exception: a policy hint, not a format break).
+const SCHEMA_CONFIG: &str = r#"
+CREATE TABLE IF NOT EXISTS config (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
+/// `config` keys backing [`EngineConfig`].
+pub const CONFIG_KEY_SEMANTIC_ENABLED: &str = "semantic_enabled";
+pub const CONFIG_KEY_PREFERRED_BACKEND: &str = "preferred_backend";
+
 impl IndexStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
@@ -183,6 +202,7 @@ impl IndexStore {
         conn.pragma_update(None, "case_sensitive_like", "ON")?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(SCHEMA_V2)?;
+        conn.execute_batch(SCHEMA_CONFIG)?;
         // Additive migration for pre-priority v2 files: v2 DBs created before
         // the `priority` column gain it here (fresh DBs already have it from
         // SCHEMA_V2 above). `schema_version` stays "2": the column is a
@@ -652,6 +672,75 @@ impl IndexStore {
             "INSERT INTO meta(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // ---- engine config (P3.6: semantic policy + backend preference) ----
+
+    /// Reads one raw `config` value (`None` when the key was never set).
+    pub fn config_get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row("SELECT value FROM config WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Upserts one raw `config` value. Additive: new keys never disturb
+    /// existing rows.
+    pub fn config_set(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO config(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Reads the engine search policy. Missing keys read back as defaults
+    /// (`semantic_enabled = true`, `preferred_backend = auto`); a stored
+    /// `preferred_backend` outside `auto|cuda|vulkan|cpu` fails closed with
+    /// `InvalidConfig` so typos surface instead of silently sticking.
+    pub fn get_engine_config(&self) -> Result<EngineConfig, StoreError> {
+        let defaults = EngineConfig::default();
+        let semantic_enabled = match self.config_get(CONFIG_KEY_SEMANTIC_ENABLED)? {
+            None => defaults.semantic_enabled,
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                other => {
+                    return Err(StoreError::InvalidConfig(format!(
+                        "config {CONFIG_KEY_SEMANTIC_ENABLED} has no boolean meaning: {other:?}"
+                    )));
+                }
+            },
+        };
+        let preferred_backend = match self.config_get(CONFIG_KEY_PREFERRED_BACKEND)? {
+            None => defaults.preferred_backend,
+            Some(v) => PreferredBackend::parse(&v).ok_or_else(|| {
+                StoreError::InvalidConfig(format!(
+                    "config {CONFIG_KEY_PREFERRED_BACKEND} must be auto|cuda|vulkan|cpu, got {v:?}"
+                ))
+            })?,
+        };
+        Ok(EngineConfig {
+            semantic_enabled,
+            preferred_backend,
+        })
+    }
+
+    /// Persists the engine search policy in canonical spellings
+    /// (`"1"`/`"0"`, `auto|cuda|vulkan|cpu`).
+    pub fn set_engine_config(&mut self, config: &EngineConfig) -> Result<(), StoreError> {
+        self.config_set(
+            CONFIG_KEY_SEMANTIC_ENABLED,
+            if config.semantic_enabled { "1" } else { "0" },
+        )?;
+        self.config_set(
+            CONFIG_KEY_PREFERRED_BACKEND,
+            config.preferred_backend.as_str(),
         )?;
         Ok(())
     }
@@ -1939,5 +2028,69 @@ mod tests {
         assert_eq!(store2.schema_version().unwrap(), "2");
         assert_eq!(store2.segment_count().unwrap(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engine_config_defaults_semantic_on_auto_backend() {
+        let store = IndexStore::open_in_memory().unwrap();
+        assert_eq!(store.schema_version().unwrap(), "2");
+        let cfg = store.get_engine_config().unwrap();
+        assert!(cfg.semantic_enabled);
+        assert_eq!(cfg.preferred_backend, crate::model::PreferredBackend::Auto);
+    }
+
+    #[test]
+    fn engine_config_round_trip_persists_both_fields() {
+        let mut store = IndexStore::open_in_memory().unwrap();
+        let cfg = crate::model::EngineConfig {
+            semantic_enabled: false,
+            preferred_backend: crate::model::PreferredBackend::Cuda,
+        };
+        store.set_engine_config(&cfg).unwrap();
+        assert_eq!(store.get_engine_config().unwrap(), cfg);
+        // Raw spellings are canonical ("0", "cuda").
+        assert_eq!(
+            store.config_get(super::CONFIG_KEY_SEMANTIC_ENABLED).unwrap().as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            store
+                .config_get(super::CONFIG_KEY_PREFERRED_BACKEND)
+                .unwrap()
+                .as_deref(),
+            Some("cuda")
+        );
+        // Re-enabling flips just the one key.
+        store
+            .set_engine_config(&crate::model::EngineConfig {
+                semantic_enabled: true,
+                preferred_backend: crate::model::PreferredBackend::Vulkan,
+            })
+            .unwrap();
+        let back = store.get_engine_config().unwrap();
+        assert!(back.semantic_enabled);
+        assert_eq!(back.preferred_backend, crate::model::PreferredBackend::Vulkan);
+    }
+
+    #[test]
+    fn engine_config_rejects_unknown_backend_and_non_boolean() {
+        let mut store = IndexStore::open_in_memory().unwrap();
+        store.config_set(super::CONFIG_KEY_PREFERRED_BACKEND, "opencl").unwrap();
+        assert!(
+            matches!(
+                store.get_engine_config().unwrap_err(),
+                super::StoreError::InvalidConfig(_)
+            ),
+            "unknown backend must fail closed"
+        );
+        store.config_set(super::CONFIG_KEY_PREFERRED_BACKEND, "cpu").unwrap();
+        store.config_set(super::CONFIG_KEY_SEMANTIC_ENABLED, "maybe").unwrap();
+        assert!(
+            matches!(
+                store.get_engine_config().unwrap_err(),
+                super::StoreError::InvalidConfig(_)
+            ),
+            "non-boolean semantic flag must fail closed"
+        );
     }
 }

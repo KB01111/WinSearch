@@ -17,10 +17,10 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use tracing::{info, warn};
 use ws_index::model::{
-    EntryRecord, NewSegment, SearchRequest, UpsertOutcome, EMBED_BATCH_SIZE,
+    EngineConfig, EntryRecord, NewSegment, SearchRequest, UpsertOutcome, EMBED_BATCH_SIZE,
     EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED, SEGMENT_KIND_NAME,
 };
-use ws_index::{HitKind, IndexStats, IndexStore, SearchHit, StoreError};
+use ws_index::{EntryRow, HitKind, IndexStats, IndexStore, ScoredSegment, SearchHit, StoreError, VectorFilter};
 
 use crate::catalog;
 use crate::crawl;
@@ -202,6 +202,47 @@ impl Indexer {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .search(req)
+    }
+
+    /// Cosine top-k over the `segments` table for the semantic query stage
+    /// (P3.6). Same contract as `IndexStore::search_vectors`: degenerate
+    /// queries yield no hits, mixed-width rows are skipped.
+    pub fn search_vectors(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&VectorFilter>,
+    ) -> Result<Vec<ScoredSegment>, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .search_vectors(query, top_k, filter)
+    }
+
+    /// One entry by id (the semantic stage resolves names/paths/mtimes for
+    /// scored segments through this).
+    pub fn get_entry_by_id(&self, id: i64) -> Result<Option<EntryRow>, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_entry(id)
+    }
+
+    /// Engine search policy for the semantic stage (`semantic_enabled`
+    /// gates the stage; unknown/missing keys read back as defaults).
+    pub fn get_engine_config(&self) -> Result<EngineConfig, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_engine_config()
+    }
+
+    /// Persists the engine search policy (IPC `set_config` path).
+    pub fn set_engine_config(&self, config: &EngineConfig) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_engine_config(config)
     }
 
     /// Reads a `meta` record (e.g. the `embedding_model` compat record the

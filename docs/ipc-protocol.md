@@ -46,16 +46,19 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
 | `model_import` | `id`, `path` | Import model files from a local file or directory (copied + verified). |
 | `model_delete` | `id` | Delete the downloaded model files. |
 | `get_model_status` | `id` | Snapshot request; answered by `model_status` with `id` set. |
+| `get_config` | `id` | Snapshot of engine search policy; answered by `config` with `id` set. |
+| `set_config` | `id`, `config` | Persist engine search policy; answered by `config` with `id` set (`invalid_request` on unknown `preferred_backend`). |
 
 ### Engine → client (`ServerMessage`)
 
 | type | fields | description |
 |---|---|---|
-| `hello_ack` | `protocol_version`, `engine_version`, `features[]` | Handshake reply; `features` lists capability tags (e.g. `search.exact`, `search.semantic`, `code`). |
+| `hello_ack` | `protocol_version`, `engine_version`, `features[]` | Handshake reply; `features` lists capability tags (currently `["search.exact", "search.semantic"]`; `"code"` added in Phase 5). |
 | `pong` | `id` | Heartbeat reply. |
 | `results` | `id`, `batch[]`, `done` | Streamed result batches; terminal frame has `done: true` (also sent when cancelled). |
 | `status` | `id?`, `status` | `id: null` is a pushed update (indexing progress); `id` set answers `get_status`. |
 | `model_status` | `id?`, `status` | `id: null` is a pushed update (download progress / completion); `id` set answers a model request. |
+| `config` | `id?`, `config` | `id` set answers `get_config` or `set_config`. |
 | `error` | `id?`, `code`, `message` | `id: null` is connection-scoped (e.g. handshake failure). |
 
 ### Payload models
@@ -71,13 +74,20 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
   `model_loaded`, `index_size_bytes`.
 - `ModelStatus`: `state` (`not_downloaded|downloading|paused|ready|error`),
   `bytes`, `total_bytes`, `error?`.
+- `EngineConfig`: `semantic_enabled` (default `true`), `preferred_backend`
+  (`auto|cuda|vulkan|cpu`, default `"auto"`).
 - `ErrorCode`: `protocol_version_mismatch`, `invalid_request`, `internal`,
   `not_ready`, `cancelled`, `unsupported`.
 
 ## Semantics
 
 - **Progressive search**: exact matches stream first; semantic results append
-  in later batches under the same `id` when `include_semantic` is set. The
+  in later batches under the same `id` when `include_semantic` is set,
+  `semantic_enabled` is true, and the embedding model is ready (excluding
+  `mode: code`). Semantic hits are deduplicated against already-streamed
+  exact entry IDs, scored in the hybrid band (`0.45 + 0.45·cosine` with
+  cosine ≥ `0.35`, `+0.10` exact-token-in-name boost, `+0.02` recency), and
+  carry `match_explanation` (`"semantic name match · similarity 0.XX"`). The
   client discards batches from superseded requests (sequence guard) so older
   searches never overwrite newer ones.
 - **Cancellation**: cancelling the client-side token sends `cancel`; the engine

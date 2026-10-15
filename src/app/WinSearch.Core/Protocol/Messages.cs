@@ -17,6 +17,8 @@ namespace WinSearch.Core.Protocol;
 [JsonDerivedType(typeof(ModelImportMessage), "model_import")]
 [JsonDerivedType(typeof(ModelDeleteMessage), "model_delete")]
 [JsonDerivedType(typeof(GetModelStatusMessage), "get_model_status")]
+[JsonDerivedType(typeof(GetConfigMessage), "get_config")]
+[JsonDerivedType(typeof(SetConfigMessage), "set_config")]
 public abstract class ClientMessage;
 
 public sealed class HelloMessage : ClientMessage
@@ -73,6 +75,17 @@ public sealed class GetModelStatusMessage : ClientMessage
     public ulong Id { get; set; }
 }
 
+public sealed class GetConfigMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+}
+
+public sealed class SetConfigMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+    public EngineConfig Config { get; set; } = new();
+}
+
 // ---------------------------------------------------------------------------
 // Engine -> client
 // ---------------------------------------------------------------------------
@@ -83,6 +96,7 @@ public sealed class GetModelStatusMessage : ClientMessage
 [JsonDerivedType(typeof(ResultsMessage), "results")]
 [JsonDerivedType(typeof(StatusMessage), "status")]
 [JsonDerivedType(typeof(ModelStatusMessage), "model_status")]
+[JsonDerivedType(typeof(ConfigMessage), "config")]
 [JsonDerivedType(typeof(ErrorMessage), "error")]
 public abstract class ServerMessage;
 
@@ -117,6 +131,13 @@ public sealed class ModelStatusMessage : ServerMessage
     /// <summary>Set when answering a model request; null for pushed progress updates.</summary>
     public ulong? Id { get; set; }
     public ModelStatus Status { get; set; } = new();
+}
+
+public sealed class ConfigMessage : ServerMessage
+{
+    /// <summary>Set when answering GetConfig/SetConfig.</summary>
+    public ulong? Id { get; set; }
+    public EngineConfig Config { get; set; } = new();
 }
 
 public sealed class ErrorMessage : ServerMessage
@@ -246,6 +267,18 @@ public sealed class ModelStatus
 
     /// <summary>Fraction downloaded in [0, 1]; 1 when the total is unknown-but-complete.</summary>
     public double Fraction => TotalBytes == 0 ? 0 : (double)Bytes / TotalBytes;
+}
+
+/// <summary>
+/// Engine search policy (mirrors the Rust EngineConfig verbatim).
+/// PreferredBackend is a plain string on the wire (canonical
+/// "auto|cuda|vulkan|cpu"); the engine refuses unknown spellings with
+/// invalid_request at set_config time.
+/// </summary>
+public sealed class EngineConfig
+{
+    public bool SemanticEnabled { get; set; } = true;
+    public string PreferredBackend { get; set; } = "auto";
 }
 
 /// <summary>One streamed chunk of search results (client-side only).</summary>

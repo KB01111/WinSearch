@@ -58,6 +58,11 @@
                 OffContent="Start with an empty search field"
                 OnContent="Remember the last query between launches"
                 Toggled="OnRememberQueryToggled" />
+            <ToggleSwitch
+                x:Name="SemanticSearchToggle"
+                OffContent="Exact matches only"
+                OnContent="Show semantic matches after exact results"
+                Toggled="OnSemanticSearchToggled" />
         </StackPanel>
     </Grid>
 </Window>

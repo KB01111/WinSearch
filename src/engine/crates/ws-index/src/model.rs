@@ -240,6 +240,64 @@ pub struct ScoredSegment {
     pub cosine: f32,
 }
 
+/// Which inference backend the embed worker should prefer. Recorded in the
+/// `config` table (`preferred_backend`); the worker itself still reads
+/// `WS_EMBED_BACKEND`/its CLI flag, so today this is a stored preference the
+/// UI can display and a future worker-selection path can honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreferredBackend {
+    #[default]
+    Auto,
+    Cuda,
+    Vulkan,
+    Cpu,
+}
+
+impl PreferredBackend {
+    /// Canonical wire/store spelling (`auto|cuda|vulkan|cpu`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreferredBackend::Auto => "auto",
+            PreferredBackend::Cuda => "cuda",
+            PreferredBackend::Vulkan => "vulkan",
+            PreferredBackend::Cpu => "cpu",
+        }
+    }
+
+    /// Parses a canonical spelling (ASCII case-insensitive); anything else is
+    /// rejected so `set_config` fails closed on typos instead of storing them.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(PreferredBackend::Auto),
+            "cuda" => Some(PreferredBackend::Cuda),
+            "vulkan" => Some(PreferredBackend::Vulkan),
+            "cpu" => Some(PreferredBackend::Cpu),
+            _ => None,
+        }
+    }
+}
+
+/// Engine-wide search policy persisted in the SQLite `config` table
+/// (P3.6, Task 6). Additive by design: unknown keys are ignored, missing keys
+/// read back as defaults, and `meta.schema_version` is untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineConfig {
+    /// Whether the semantic query stage may run. Defaults to true; the query
+    /// path additionally requires the embedding model to be ready, so the
+    /// effective default is "true once model ready".
+    pub semantic_enabled: bool,
+    pub preferred_backend: PreferredBackend,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            semantic_enabled: true,
+            preferred_backend: PreferredBackend::Auto,
+        }
+    }
+}
+
 /// Splits a path into its file name (lossy UTF-8).
 pub fn file_name(path: &Path) -> String {
     path.file_name()
@@ -287,5 +345,29 @@ mod tests {
             keywords: String::new(),
         };
         assert_eq!(rec.kind(), EntryKind::Application);
+    }
+
+    #[test]
+    fn backend_spellings_round_trip_and_reject_unknown() {
+        for (text, want) in [
+            ("auto", PreferredBackend::Auto),
+            ("cuda", PreferredBackend::Cuda),
+            ("vulkan", PreferredBackend::Vulkan),
+            ("cpu", PreferredBackend::Cpu),
+            ("CUDA", PreferredBackend::Cuda),
+        ] {
+            let parsed = PreferredBackend::parse(text).expect("canonical spelling must parse");
+            assert_eq!(parsed, want);
+            assert_eq!(parsed.as_str(), want.as_str());
+        }
+        assert_eq!(PreferredBackend::parse("opencl"), None);
+        assert_eq!(PreferredBackend::parse(""), None);
+    }
+
+    #[test]
+    fn engine_config_defaults_to_semantic_on_auto_backend() {
+        let cfg = EngineConfig::default();
+        assert!(cfg.semantic_enabled);
+        assert_eq!(cfg.preferred_backend, PreferredBackend::Auto);
     }
 }

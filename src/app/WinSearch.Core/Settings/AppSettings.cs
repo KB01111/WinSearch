@@ -27,6 +27,14 @@ public sealed class AppSettings
     public bool RememberLastQuery { get; set; }
     public string LastQuery { get; set; } = "";
 
+    /// <summary>
+    /// Whether searches ask the engine for semantic (embedding) retrieval on
+    /// top of exact matches. The engine additionally requires the model to be
+    /// ready and the policy to allow it, so disabling here is a pure
+    /// client-side opt-out of the later semantic batches.
+    /// </summary>
+    public bool EnableSemanticSearch { get; set; } = true;
+
     public static string SettingsDirectory =>
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

@@ -74,7 +74,7 @@ public partial class App : Application
         _engineClient = new EngineClient(EnginePipe.NameForCurrentUser());
         _engineClient.StatusChanged += OnEngineStatus;
 
-        var viewModel = new MainOverlayViewModel(_engineClient);
+        var viewModel = new MainOverlayViewModel(_engineClient, _settings);
         _overlay = new OverlayWindow(viewModel, _settings);
 
         RegisterHotkeyWithFallback();

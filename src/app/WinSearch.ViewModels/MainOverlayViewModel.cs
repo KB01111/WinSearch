@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using WinSearch.Core.Ipc;
 using WinSearch.Core.Protocol;
+using WinSearch.Core.Settings;
 
 namespace WinSearch.ViewModels;
 
@@ -17,6 +18,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     private const int DebounceMs = 120;
 
     private readonly EngineClient _client;
+    private readonly AppSettings _settings;
     private readonly SynchronizationContext? _ui;
     private CancellationTokenSource? _searchCts;
     private Timer? _debounceTimer;
@@ -24,9 +26,10 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     private string _pendingQuery = "";
     private bool _disposed;
 
-    public MainOverlayViewModel(EngineClient client)
+    public MainOverlayViewModel(EngineClient client, AppSettings settings)
     {
         _client = client;
+        _settings = settings;
         _ui = SynchronizationContext.Current;
         _client.StatusChanged += OnStatusChanged;
     }
@@ -111,8 +114,9 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
             Text = effectiveText,
             Mode = mode,
             Limit = 20,
-            // Semantic runs after exact results; enabled from Phase 3 onward.
-            IncludeSemantic = false,
+            // Semantic batches append after the exact results; the toggle in
+            // Settings opts out client-side, the engine gates on model/policy.
+            IncludeSemantic = mode != SearchMode.Code && _settings.EnableSemanticSearch,
         };
 
         try

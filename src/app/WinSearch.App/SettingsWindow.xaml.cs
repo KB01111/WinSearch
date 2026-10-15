@@ -40,6 +40,7 @@ internal sealed partial class SettingsWindow : Window
         ThemeCombo.ItemsSource = SettingsViewModel.ThemeOptions;
         ThemeCombo.SelectedItem = _viewModel.SelectedTheme;
         RememberQueryToggle.IsOn = _viewModel.RememberLastQuery;
+        SemanticSearchToggle.IsOn = _viewModel.EnableSemanticSearch;
 
         RootGrid.KeyDown += OnRootKeyDown;
     }
@@ -140,6 +141,11 @@ internal sealed partial class SettingsWindow : Window
     private void OnRememberQueryToggled(object sender, RoutedEventArgs e)
     {
         _viewModel.RememberLastQuery = RememberQueryToggle.IsOn;
+    }
+
+    private void OnSemanticSearchToggled(object sender, RoutedEventArgs e)
+    {
+        _viewModel.EnableSemanticSearch = SemanticSearchToggle.IsOn;
     }
 
     private const uint NativeMethods_MOD_ALT = 0x1;

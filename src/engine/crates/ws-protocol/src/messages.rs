@@ -43,6 +43,14 @@ pub enum ClientMessage {
     ModelDelete { id: RequestId },
     /// Snapshot of the model lifecycle state.
     GetModelStatus { id: RequestId },
+    /// Snapshot of the engine search policy (`semantic_enabled`,
+    /// `preferred_backend`). Answered by `Config` with `id` set.
+    GetConfig { id: RequestId },
+    /// Persist the engine search policy. Answered by `Config` with `id` set;
+    /// an unknown `preferred_backend` spelling is refused with
+    /// `Error{invalid_request}` (the typed store only holds
+    /// `auto|cuda|vulkan|cpu`).
+    SetConfig { id: RequestId, config: EngineConfig },
 }
 
 /// Messages sent by the engine to a client.
@@ -74,12 +82,55 @@ pub enum ServerMessage {
         id: Option<RequestId>,
         status: ModelStatus,
     },
+    /// `id: Some(_)` answers `GetConfig`/`SetConfig`. Additive like every
+    /// other frame: `PROTOCOL_VERSION` stays 1.
+    Config {
+        id: Option<RequestId>,
+        config: EngineConfig,
+    },
     Error {
         /// `None` means the error is connection-scoped (e.g. handshake).
         id: Option<RequestId>,
         code: ErrorCode,
         message: String,
     },
+}
+
+/// Engine search policy (P3.6): the semantic-stage kill switch plus the
+/// recorded inference-backend preference.
+///
+/// `preferred_backend` is deliberately a plain string on the wire (canonical
+/// `auto|cuda|vulkan|cpu`) rather than an enum: an unknown spelling from a
+/// newer peer still parses, and validation happens at application time
+/// (`set_config` refuses it with `invalid_request`). The typed
+/// `ws_index::PreferredBackend` is the store-side counterpart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EngineConfig {
+    /// Whether the semantic query stage may run (default true; the stage
+    /// additionally requires the embedding model to be ready).
+    #[serde(default = "default_semantic_enabled")]
+    pub semantic_enabled: bool,
+    /// Canonical `auto|cuda|vulkan|cpu`.
+    #[serde(default = "default_preferred_backend")]
+    pub preferred_backend: String,
+}
+
+fn default_semantic_enabled() -> bool {
+    true
+}
+
+fn default_preferred_backend() -> String {
+    "auto".to_string()
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            semantic_enabled: true,
+            preferred_backend: "auto".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -320,5 +371,51 @@ mod tests {
                 path: "x".into()
             }
         );
+    }
+
+    #[test]
+    fn config_messages_round_trip() {
+        for msg in [
+            ClientMessage::GetConfig { id: 11 },
+            ClientMessage::SetConfig {
+                id: 12,
+                config: EngineConfig {
+                    semantic_enabled: false,
+                    preferred_backend: "cuda".into(),
+                },
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: ClientMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(msg, back);
+        }
+        let answer = ServerMessage::Config {
+            id: Some(11),
+            config: EngineConfig::default(),
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+        assert!(json.contains("\"type\":\"config\""));
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(answer, back);
+    }
+
+    #[test]
+    fn config_defaults_are_additive() {
+        // A bare `{}` (or a frame from an older peer that never sent the new
+        // fields) reads back as "semantic on, auto backend" — never a parse
+        // error, and `PROTOCOL_VERSION` stays 1.
+        let cfg: EngineConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.semantic_enabled);
+        assert_eq!(cfg.preferred_backend, "auto");
+        // Unknown backend spellings still parse on the wire; the engine
+        // refuses them at `set_config` application time.
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"semantic_enabled":true,"preferred_backend":"opencl"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.preferred_backend, "opencl");
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"get_config","id":3}"#).unwrap();
+        assert_eq!(msg, ClientMessage::GetConfig { id: 3 });
     }
 }

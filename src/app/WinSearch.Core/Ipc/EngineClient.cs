@@ -41,6 +41,9 @@ public sealed class EngineClient : IAsyncDisposable
     /// <summary>Raised for every pushed or request-scoped model status (download progress, completion).</summary>
     public event EventHandler<ModelStatus>? ModelStatusChanged;
 
+    /// <summary>Raised when the engine search policy arrives (Get/SetConfig answers).</summary>
+    public event EventHandler<EngineConfig>? ConfigChanged;
+
     /// <summary>Raised when the pipe drops and reconnect attempts begin.</summary>
     public event EventHandler? Disconnected;
 
@@ -159,6 +162,14 @@ public sealed class EngineClient : IAsyncDisposable
     /// <summary>Requests a model status snapshot; pushed updates also arrive via <see cref="ModelStatusChanged"/>.</summary>
     public Task<ModelStatus> GetModelStatusAsync(CancellationToken cancellationToken = default)
         => UnaryAsync(static id => new GetModelStatusMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Requests the engine search policy; answers also arrive via <see cref="ConfigChanged"/>.</summary>
+    public Task<EngineConfig> GetConfigAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new GetConfigMessage { Id = id }, static m => ((ConfigMessage)m).Config, cancellationToken);
+
+    /// <summary>Persists the engine search policy; the stored copy arrives via <see cref="ConfigChanged"/>.</summary>
+    public Task<EngineConfig> SetConfigAsync(EngineConfig config, CancellationToken cancellationToken = default)
+        => UnaryAsync(id => new SetConfigMessage { Id = id, Config = config }, static m => ((ConfigMessage)m).Config, cancellationToken);
 
     /// <summary>
     /// Runs a search and streams result batches. Cancelling <paramref name="cancellationToken"/>
@@ -372,6 +383,14 @@ public sealed class EngineClient : IAsyncDisposable
                     modelStatusTcs.TrySetResult(modelStatus);
                 }
                 ModelStatusChanged?.Invoke(this, modelStatus.Status);
+                break;
+
+            case ConfigMessage config:
+                if (config.Id is { } configId && _unary.TryRemove(configId, out var configTcs))
+                {
+                    configTcs.TrySetResult(config);
+                }
+                ConfigChanged?.Invoke(this, config.Config);
                 break;
 
             case ErrorMessage error:

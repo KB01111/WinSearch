@@ -16,11 +16,11 @@ pub mod vectors;
 
 pub use calc::{evaluate, CalcError, CalcResult};
 pub use model::{
-    EntryKind, EntryRecord, ExtractJob, HitKind, NewSegment, ScoredSegment, SearchHit, SearchRequest,
-    UpsertOutcome, VectorFilter, Segment, EMBED_BATCH_SIZE, EXTRACT_PRIORITY_NEW,
-    EXTRACT_PRIORITY_UPDATED, EXTRACT_STATE_CLAIMED, EXTRACT_STATE_FAILED,
+    EngineConfig, EntryKind, EntryRecord, ExtractJob, HitKind, NewSegment, PreferredBackend,
+    ScoredSegment, SearchHit, SearchRequest, UpsertOutcome, VectorFilter, Segment, EMBED_BATCH_SIZE,
+    EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED, EXTRACT_STATE_CLAIMED, EXTRACT_STATE_FAILED,
     EXTRACT_STATE_PENDING, SEGMENT_KIND_NAME,
 };
 pub use settings::{search_settings, SettingsHit};
-pub use store::{IndexStats, IndexStore, Root, StoreError};
+pub use store::{EntryRow, IndexStats, IndexStore, Root, StoreError};
 pub use vectors::{VectorError, VectorHit, VectorIndex};
