@@ -134,6 +134,39 @@ pub enum UpsertOutcome {
 /// Kind string for name-embedding segments (Phase 3: one per entry).
 /// Stored in `segments.kind` / `extract_jobs.kind`.
 pub const SEGMENT_KIND_NAME: &str = "name";
+/// Kind string for document text segments (`txt`, `md`, `docx`, `odt`, `rtf`, `html`, IFilter).
+pub const SEGMENT_KIND_DOC: &str = "doc";
+/// Kind string for image visual / metadata segments.
+pub const SEGMENT_KIND_IMAGE: &str = "image";
+/// Kind string for OCR text segments extracted from images or scanned pages.
+pub const SEGMENT_KIND_OCR: &str = "ocr";
+/// Kind string for PDF page text segments.
+pub const SEGMENT_KIND_PDF: &str = "pdf";
+/// Kind string for audio window segments.
+pub const SEGMENT_KIND_AUDIO: &str = "audio";
+/// Kind string for video frame / audio segments.
+pub const SEGMENT_KIND_VIDEO: &str = "video";
+
+/// All non-name content segment kinds produced by Phase 4 extractors.
+pub const CONTENT_SEGMENT_KINDS: &[&str] = &[
+    SEGMENT_KIND_DOC,
+    SEGMENT_KIND_IMAGE,
+    SEGMENT_KIND_OCR,
+    SEGMENT_KIND_PDF,
+    SEGMENT_KIND_AUDIO,
+    SEGMENT_KIND_VIDEO,
+];
+
+/// All valid segment kinds (`name` + [`CONTENT_SEGMENT_KINDS`]).
+pub const ALL_SEGMENT_KINDS: &[&str] = &[
+    SEGMENT_KIND_NAME,
+    SEGMENT_KIND_DOC,
+    SEGMENT_KIND_IMAGE,
+    SEGMENT_KIND_OCR,
+    SEGMENT_KIND_PDF,
+    SEGMENT_KIND_AUDIO,
+    SEGMENT_KIND_VIDEO,
+];
 
 /// Priority for `extract_jobs.priority`: new files first, LIFO within priority.
 ///
@@ -144,6 +177,33 @@ pub const SEGMENT_KIND_NAME: &str = "name";
 /// `EXTRACT_PRIORITY_UPDATED` so fresh discoveries jump the queue.
 pub const EXTRACT_PRIORITY_NEW: i64 = 10;
 pub const EXTRACT_PRIORITY_UPDATED: i64 = 0;
+
+/// Computes the priority score for a content extraction job so that small
+/// files and recently modified files are extracted before large or old files
+/// (`priority DESC, id DESC`).
+///
+/// Components:
+/// - New vs Updated bonus (`+100_000` for newly discovered files).
+/// - Size bucket (`0..=60_000`, smaller files score higher: ≤64 KiB → +60_000,
+///   ≤1 MiB → +45_000, ≤10 MiB → +30_000, ≤100 MiB → +15_000, >100 MiB → 0;
+///   plus fine-grained sub-bucket ordering so a 1 KiB file beats a 32 KiB file).
+/// - Recency tie-breaker (`mtime` clamped to non-negative seconds, scaled so
+///   more recent files always rank above older files in the same size tier).
+pub fn compute_extract_priority(size: u64, mtime: i64, outcome: UpsertOutcome) -> i64 {
+    let outcome_bonus: i64 = match outcome {
+        UpsertOutcome::Inserted => 1_000_000_000_000,
+        UpsertOutcome::Updated | UpsertOutcome::Unchanged => 0,
+    };
+    let size_tier: i64 = match size {
+        0..=65_536 => 400_000_000_000 - (size as i64),
+        65_537..=1_048_576 => 300_000_000_000 - (size as i64 / 16),
+        1_048_577..=10_485_760 => 200_000_000_000 - (size as i64 / 256),
+        10_485_761..=104_857_600 => 100_000_000_000 - (size as i64 / 4096),
+        _ => -(size.min(50_000_000_000) as i64 / 65_536),
+    };
+    let recency: i64 = mtime.clamp(0, 9_999_999_999);
+    outcome_bonus + size_tier + recency
+}
 
 /// How many name texts the winsearchd embed scheduler batches into one
 /// worker round-trip (P3.5). Well under `MAX_TEXTS_PER_JOB` (256) so one
@@ -222,6 +282,21 @@ impl VectorFilter {
             kinds: vec![kind.to_string()],
             entry_ids: Vec::new(),
         }
+    }
+
+    /// Convenience for a multi-kind filter (e.g. all content segments or
+    /// `ALL_SEGMENT_KINDS`).
+    pub fn for_kinds(kinds: &[&str]) -> Self {
+        Self {
+            kinds: kinds.iter().map(|k| (*k).to_string()).collect(),
+            entry_ids: Vec::new(),
+        }
+    }
+
+    /// Filter matching all non-name content segment kinds (`doc`, `image`,
+    /// `ocr`, `pdf`, `audio`, `video`).
+    pub fn content_kinds() -> Self {
+        Self::for_kinds(CONTENT_SEGMENT_KINDS)
     }
 
     pub fn matches_kind(&self, kind: &str) -> bool {

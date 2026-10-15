@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use tracing::{info, warn};
+use ws_extract::modality_kind_for_ext;
 use ws_index::model::{
-    EngineConfig, EntryRecord, NewSegment, SearchRequest, UpsertOutcome, EMBED_BATCH_SIZE,
-    EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED, SEGMENT_KIND_NAME,
+    compute_extract_priority, EngineConfig, EntryRecord, NewSegment, SearchRequest, UpsertOutcome,
+    EMBED_BATCH_SIZE, EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED, SEGMENT_KIND_NAME,
 };
 use ws_index::{EntryRow, HitKind, IndexStats, IndexStore, ScoredSegment, SearchHit, StoreError, VectorFilter};
 
@@ -280,6 +281,21 @@ impl Indexer {
             segments_indexed,
             embedding: embed_queue_depth > 0,
         })
+    }
+
+    /// Internal store lock helper shared with `extract.rs`.
+    pub(crate) fn store_lock(&self) -> std::sync::MutexGuard<'_, IndexStore> {
+        self.store.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// True if shutdown has been requested.
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Pending-or-claimed non-name content extraction jobs.
+    pub fn content_extract_queue_depth(&self) -> Result<u64, StoreError> {
+        self.store_lock().content_extract_queue_depth()
     }
 
     /// Name-segments stored (→ `EngineStatus.segments_indexed`).
@@ -643,10 +659,11 @@ impl Indexer {
     // ---- semantic feed helper ----
 
     /// Enqueues one `extract_jobs(kind='name')` per changed record
-    /// (`UpsertOutcome != Unchanged`). `Inserted` (new files) enqueues at
-    /// `EXTRACT_PRIORITY_NEW` so fresh discoveries jump the queue; `Updated`
-    /// uses `EXTRACT_PRIORITY_UPDATED`. LIFO within priority is the claim
-    /// order (`priority DESC, id DESC`). Must hold the store lock.
+    /// (`UpsertOutcome != Unchanged`), plus a modality content extraction job
+    /// (`doc`, `pdf`, `image`, `audio`, `video`) for non-dir, non-app files
+    /// whose extension maps to a supported modality. Content jobs use
+    /// `compute_extract_priority(size, mtime, outcome)` so small and recent
+    /// files drain first. Must hold the store lock.
     fn enqueue_name_jobs_for_outcomes(
         store: &mut IndexStore,
         records: &[EntryRecord],
@@ -665,6 +682,17 @@ impl Indexer {
                     SEGMENT_KIND_NAME,
                     priority,
                 )?;
+                if !rec.is_dir && !rec.is_app {
+                    if let Some(modality_kind) = modality_kind_for_ext(&rec.ext) {
+                        let content_priority =
+                            compute_extract_priority(rec.size, rec.mtime, *outcome);
+                        store.enqueue_extract_job_with_priority(
+                            row.id,
+                            modality_kind,
+                            content_priority,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())

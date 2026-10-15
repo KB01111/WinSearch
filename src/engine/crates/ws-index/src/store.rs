@@ -59,6 +59,7 @@ pub struct EntryRow {
     pub ext: String,
     pub is_dir: bool,
     pub is_app: bool,
+    pub size: u64,
     pub mtime: i64,
     pub missing: bool,
 }
@@ -163,6 +164,13 @@ CREATE TABLE IF NOT EXISTS extract_jobs (
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_entry ON extract_jobs(entry_id);
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_state ON extract_jobs(state, claimed);
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_priority ON extract_jobs(state, claimed, priority, id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
+    entry_id UNINDEXED,
+    kind UNINDEXED,
+    text,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
 "#;
 
 /// Engine config store (P3.6, additive): a plain key/value table holding the
@@ -311,6 +319,10 @@ impl IndexStore {
         )?;
         tx.execute(
             &format!("DELETE FROM entries_tri WHERE rowid IN ({stale})"),
+            params![root_id, gen],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM content_fts WHERE entry_id IN ({stale})"),
             params![root_id, gen],
         )?;
         let deleted_rows = tx.execute(
@@ -492,7 +504,7 @@ impl IndexStore {
         self.conn
             .query_row(
                 "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                        mtime, missing
+                        size, mtime, missing
                  FROM entries WHERE path = ?1",
                 params![path],
                 map_entry_row,
@@ -511,7 +523,7 @@ impl IndexStore {
         self.conn
             .query_row(
                 "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                        mtime, missing
+                        size, mtime, missing
                  FROM entries WHERE volume_serial = ?1 AND file_id = ?2 LIMIT 1",
                 params![volume_serial as i64, file_id as i64],
                 map_entry_row,
@@ -531,6 +543,7 @@ impl IndexStore {
             Some(id) => {
                 tx.execute("DELETE FROM entries_fts WHERE rowid = ?1", params![id])?;
                 tx.execute("DELETE FROM entries_tri WHERE rowid = ?1", params![id])?;
+                tx.execute("DELETE FROM content_fts WHERE entry_id = ?1", params![id])?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", params![id])? > 0
             }
             None => false,
@@ -558,6 +571,7 @@ impl IndexStore {
         for id in ids {
             tx.execute("DELETE FROM entries_fts WHERE rowid = ?1", params![id])?;
             tx.execute("DELETE FROM entries_tri WHERE rowid = ?1", params![id])?;
+            tx.execute("DELETE FROM content_fts WHERE entry_id = ?1", params![id])?;
             deleted += tx.execute("DELETE FROM entries WHERE id = ?1", params![id])? as u64;
         }
         tx.commit()?;
@@ -883,6 +897,55 @@ impl IndexStore {
         Ok(n as u64)
     }
 
+    /// Deletes every segment of `(entry_id, kind)` (re-extraction path before
+    /// writing the fresh chunk set).
+    pub fn remove_segments_for_entry_and_kind(
+        &mut self,
+        entry_id: i64,
+        kind: &str,
+    ) -> Result<u64, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM segments WHERE entry_id = ?1 AND kind = ?2",
+            params![entry_id, kind],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Replaces the FTS-indexed content text for `(entry_id, kind)` with
+    /// `texts` (non-empty strings are concatenated and indexed in
+    /// `content_fts`, making extracted document text and OCR searchable via
+    /// FTS as well as vectors).
+    pub fn replace_content_fts<S: AsRef<str>>(
+        &mut self,
+        entry_id: i64,
+        kind: &str,
+        texts: &[S],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM content_fts WHERE entry_id = ?1 AND kind = ?2",
+            params![entry_id, kind],
+        )?;
+        let mut combined = String::new();
+        for t in texts {
+            let s = t.as_ref().trim();
+            if !s.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(s);
+            }
+        }
+        if !combined.is_empty() {
+            tx.execute(
+                "INSERT INTO content_fts(entry_id, kind, text) VALUES(?1, ?2, ?3)",
+                params![entry_id, kind, combined],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn segment_count(&self) -> Result<u64, StoreError> {
         let n: i64 = self
             .conn
@@ -1203,8 +1266,33 @@ impl IndexStore {
         Ok(n as u64)
     }
 
-    /// Pending-or-claimed depth for one job kind (e.g. `name` → the embed
-    /// scheduler's backlog behind `EngineStatus` activity strings).
+    /// Claims the highest-priority pending content extraction job (`kind != 'name'`),
+    /// ordered by `priority DESC, id DESC` (small + recent files first, LIFO on ties).
+    pub fn claim_content_extract_job(&mut self) -> Result<Option<ExtractJob>, StoreError> {
+        self.conn
+            .query_row(
+                "UPDATE extract_jobs SET claimed = 1, state = 'claimed'
+                 WHERE id = (SELECT id FROM extract_jobs
+                             WHERE claimed = 0 AND state = 'pending' AND kind != ?1
+                             ORDER BY priority DESC, id DESC LIMIT 1)
+                 RETURNING id, entry_id, kind, state, claimed, attempts, priority",
+                params![crate::model::SEGMENT_KIND_NAME],
+                map_extract_job_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Pending-or-claimed depth for all non-name content extraction jobs.
+    pub fn content_extract_queue_depth(&self) -> Result<u64, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM extract_jobs
+             WHERE kind != ?1 AND (state = 'pending' OR claimed = 1)",
+            params![crate::model::SEGMENT_KIND_NAME],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
     pub fn extract_queue_depth_for_kind(&self, kind: &str) -> Result<u64, StoreError> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM extract_jobs
@@ -1232,7 +1320,7 @@ impl IndexStore {
         self.conn
             .query_row(
                 "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                        mtime, missing
+                        size, mtime, missing
                  FROM entries WHERE id = ?1",
                 params![id],
                 map_entry_row,
@@ -1312,8 +1400,9 @@ fn map_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
         ext: row.get(6)?,
         is_dir: row.get::<_, i64>(7)? != 0,
         is_app: row.get::<_, i64>(8)? != 0,
-        mtime: row.get(9)?,
-        missing: row.get::<_, i64>(10)? != 0,
+        size: row.get::<_, i64>(9)?.max(0) as u64,
+        mtime: row.get(10)?,
+        missing: row.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -2092,5 +2181,94 @@ mod tests {
             ),
             "non-boolean semantic flag must fail closed"
         );
+    }
+
+    #[test]
+    fn content_extract_priority_orders_small_and_recent_first() {
+        use crate::model::{
+            compute_extract_priority, UpsertOutcome, SEGMENT_KIND_DOC, SEGMENT_KIND_NAME,
+            SEGMENT_KIND_PDF,
+        };
+        let (mut store, root) = setup();
+        let large_old = entry_id_for(&mut store, root, "C:\\data\\large.pdf", "large.pdf", 701);
+        let small_old = entry_id_for(&mut store, root, "C:\\data\\small_old.txt", "small_old.txt", 702);
+        let small_recent = entry_id_for(&mut store, root, "C:\\data\\small_new.txt", "small_new.txt", 703);
+
+        // Also enqueue a name job to verify claim_content_extract_job ignores kind='name'.
+        store.enqueue_extract_job(large_old, SEGMENT_KIND_NAME).unwrap();
+
+        let p_large_old = compute_extract_priority(20 * 1024 * 1024, 1_000, UpsertOutcome::Inserted);
+        let p_small_old = compute_extract_priority(4 * 1024, 1_000, UpsertOutcome::Inserted);
+        let p_small_recent = compute_extract_priority(4 * 1024, 2_000, UpsertOutcome::Inserted);
+        assert!(p_small_recent > p_small_old);
+        assert!(p_small_old > p_large_old);
+
+        store
+            .enqueue_extract_job_with_priority(large_old, SEGMENT_KIND_PDF, p_large_old)
+            .unwrap();
+        store
+            .enqueue_extract_job_with_priority(small_old, SEGMENT_KIND_DOC, p_small_old)
+            .unwrap();
+        store
+            .enqueue_extract_job_with_priority(small_recent, SEGMENT_KIND_DOC, p_small_recent)
+            .unwrap();
+
+        assert_eq!(store.content_extract_queue_depth().unwrap(), 3);
+
+        // Claim order: small_recent first, then small_old, then large_old.
+        let c1 = store.claim_content_extract_job().unwrap().unwrap();
+        assert_eq!(c1.entry_id, small_recent);
+        let c2 = store.claim_content_extract_job().unwrap().unwrap();
+        assert_eq!(c2.entry_id, small_old);
+        let c3 = store.claim_content_extract_job().unwrap().unwrap();
+        assert_eq!(c3.entry_id, large_old);
+        assert!(store.claim_content_extract_job().unwrap().is_none());
+
+        // Name job is still untouched in the queue.
+        assert_eq!(store.extract_queue_depth_for_kind(SEGMENT_KIND_NAME).unwrap(), 1);
+    }
+
+    #[test]
+    fn content_fts_makes_extracted_text_and_ocr_searchable() {
+        use crate::model::{SearchRequest, SEGMENT_KIND_DOC, SEGMENT_KIND_OCR};
+        let (mut store, root) = setup();
+        let doc_id = entry_id_for(&mut store, root, "C:\\data\\opaque.txt", "opaque.txt", 801);
+        let img_id = entry_id_for(&mut store, root, "C:\\data\\shot.png", "shot.png", 802);
+
+        store
+            .replace_content_fts(
+                doc_id,
+                SEGMENT_KIND_DOC,
+                &["The indemnification obligation survives termination."],
+            )
+            .unwrap();
+        store
+            .replace_content_fts(
+                img_id,
+                SEGMENT_KIND_OCR,
+                &["Fatal error ERR_SSL_PROTOCOL_ERROR in dialog"],
+            )
+            .unwrap();
+
+        let hits = store
+            .search(&SearchRequest {
+                text: "indemnification".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry_id, doc_id);
+        assert_eq!(hits[0].explanation, "Matches extracted content");
+
+        let ocr_hits = store
+            .search(&SearchRequest {
+                text: "ERR_SSL_PROTOCOL_ERROR".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(ocr_hits.len(), 1);
+        assert_eq!(ocr_hits[0].entry_id, img_id);
     }
 }

@@ -150,11 +150,12 @@ pub fn dot_fp16_row_vs_normalized(stored_fp16: &[u8], normed_query: &[f32]) -> f
     dot.clamp(-1.0, 1.0)
 }
 
-/// One scored in-memory hit (ids only; join metadata from SQLite as needed).
+/// One scored in-memory hit (ids + kind; join metadata from SQLite as needed).
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorHit {
     pub id: i64,
     pub entry_id: i64,
+    pub kind: String,
     pub cosine: f32,
 }
 
@@ -317,6 +318,36 @@ impl VectorIndex {
         Some(decode_fp16_vector(&self.data[off..off + stride]))
     }
 
+    /// Segment kind (`name`, `doc`, `image`, `ocr`, `pdf`, `audio`, `video`)
+    /// for `id`, if present.
+    pub fn get_kind(&self, id: i64) -> Option<&str> {
+        let &slot = self.pos.get(&id)?;
+        Some(self.kinds[slot].as_str())
+    }
+
+    /// Counts vectors currently stored for `kind`.
+    pub fn count_by_kind(&self, kind: &str) -> usize {
+        self.kinds.iter().filter(|k| k.as_str() == kind).count()
+    }
+
+    /// Removes every vector matching `kind`. Returns the number removed.
+    pub fn remove_by_kind(&mut self, kind: &str) -> usize {
+        let victims: Vec<i64> = self
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                let slot = self.pos[id];
+                self.kinds[slot] == kind
+            })
+            .collect();
+        let n = victims.len();
+        for id in victims {
+            self.remove(id);
+        }
+        n
+    }
+
     /// Brute-force cosine top-k. The query is normalized once; each stored
     /// FP16 row is scored with [`dot_fp16_row_vs_normalized`] (`f32`
     /// accumulation) — the same kernel `IndexStore::search_vectors` uses.
@@ -378,6 +409,7 @@ impl VectorIndex {
             hits.push(VectorHit {
                 id: self.ids[slot],
                 entry_id: self.entry_ids[slot],
+                kind: self.kinds[slot].clone(),
                 cosine: dot,
             });
         }
@@ -580,5 +612,39 @@ mod tests {
                 actual: 1
             }
         );
+    }
+
+    #[test]
+    fn multi_kind_segments_filter_and_remove_by_kind() {
+        use crate::model::{
+            ALL_SEGMENT_KINDS, CONTENT_SEGMENT_KINDS, SEGMENT_KIND_AUDIO, SEGMENT_KIND_DOC,
+            SEGMENT_KIND_IMAGE, SEGMENT_KIND_NAME, SEGMENT_KIND_OCR, SEGMENT_KIND_PDF,
+            SEGMENT_KIND_VIDEO,
+        };
+        let mut idx = VectorIndex::new(2);
+        for (i, &kind) in ALL_SEGMENT_KINDS.iter().enumerate() {
+            idx.add_or_update((i + 1) as i64, 42, kind, &[1.0, 0.0])
+                .unwrap();
+        }
+        assert_eq!(idx.len(), 7);
+        assert_eq!(idx.get_kind(1), Some(SEGMENT_KIND_NAME));
+        assert_eq!(idx.get_kind(2), Some(SEGMENT_KIND_DOC));
+        assert_eq!(idx.get_kind(3), Some(SEGMENT_KIND_IMAGE));
+        assert_eq!(idx.get_kind(4), Some(SEGMENT_KIND_OCR));
+        assert_eq!(idx.get_kind(5), Some(SEGMENT_KIND_PDF));
+        assert_eq!(idx.get_kind(6), Some(SEGMENT_KIND_AUDIO));
+        assert_eq!(idx.get_kind(7), Some(SEGMENT_KIND_VIDEO));
+
+        // Filter to content kinds excludes `name`.
+        let content_filter = VectorFilter::content_kinds();
+        let hits = idx.search(&[1.0, 0.0], 10, Some(&content_filter)).unwrap();
+        assert_eq!(hits.len(), CONTENT_SEGMENT_KINDS.len());
+        assert!(hits.iter().all(|h| h.kind != SEGMENT_KIND_NAME));
+
+        // Remove by kind removes only that modality.
+        assert_eq!(idx.count_by_kind(SEGMENT_KIND_PDF), 1);
+        assert_eq!(idx.remove_by_kind(SEGMENT_KIND_PDF), 1);
+        assert_eq!(idx.count_by_kind(SEGMENT_KIND_PDF), 0);
+        assert_eq!(idx.len(), 6);
     }
 }

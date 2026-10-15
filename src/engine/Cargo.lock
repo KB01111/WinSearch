@@ -1084,6 +1084,7 @@ dependencies = [
  "tracing-subscriber",
  "windows",
  "ws-embed-protocol",
+ "ws-extract",
  "ws-index",
  "ws-modelmgr",
  "ws-platform",
@@ -1108,6 +1109,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ws-extract"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "ws-index",
 ]
 
 [[package]]

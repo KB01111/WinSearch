@@ -7,6 +7,7 @@ mod catalog;
 mod crawl;
 mod embed_client;
 mod engine;
+mod extract;
 mod indexer;
 mod model;
 mod server;
@@ -74,6 +75,13 @@ fn main() -> anyhow::Result<()> {
     // supervisor call (120 s watchdog); crash-safe via claim/release +
     // idempotent segment upserts.
     indexer.start_embed_scheduler(engine.embed_supervisor());
+    // Content extraction worker pool (P4.1): two background threads drain
+    // non-name modality jobs (`doc`, `pdf`, `image`, `audio`, `video`) in
+    // priority order (small + recent files first) under per-file budgets.
+    indexer.start_extract_workers(
+        engine.embed_supervisor(),
+        Arc::new(extract::ExtractorRegistry::default()),
+    );
     spawn_status_pusher(Arc::clone(&engine));
     // Model progress/completion pushes fan out to every connected client.
     {

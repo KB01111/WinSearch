@@ -1,0 +1,11 @@
+[package]
+name = "ws-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content extraction, budget enforcement, and overlapping text chunking for WinSearch"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+ws-index.workspace = true

@@ -22,6 +22,8 @@ struct Candidate {
     /// True when the match came from the FTS token index (names or keywords)
     /// rather than a whole-string name match.
     via_fts: bool,
+    /// True when the match came from extracted content (`content_fts`).
+    via_content_fts: bool,
 }
 
 impl IndexStore {
@@ -36,17 +38,22 @@ impl IndexStore {
         }
 
         let mut candidates = Vec::new();
-        let mut push_unique = |rows: Vec<EntryRow>, via_fts: bool| {
+        let mut push_unique = |rows: Vec<EntryRow>, via_fts: bool, via_content_fts: bool| {
             for row in rows {
                 if !candidates.iter().any(|c: &Candidate| c.row.id == row.id) {
-                    candidates.push(Candidate { row, via_fts });
+                    candidates.push(Candidate {
+                        row,
+                        via_fts,
+                        via_content_fts,
+                    });
                 }
             }
         };
-        push_unique(self.exact_candidates(&query_lower)?, false);
-        push_unique(self.prefix_candidates(&query_lower)?, false);
-        push_unique(self.substring_candidates(&query_lower)?, false);
-        push_unique(self.fts_candidates(&tokens)?, true);
+        push_unique(self.exact_candidates(&query_lower)?, false, false);
+        push_unique(self.prefix_candidates(&query_lower)?, false, false);
+        push_unique(self.substring_candidates(&query_lower)?, false, false);
+        push_unique(self.fts_candidates(&tokens)?, true, false);
+        push_unique(self.content_fts_candidates(&tokens)?, false, true);
 
         let depth = |path: &str| path.matches('\\').count().max(path.matches('/').count());
         let mut hits: Vec<SearchHit> = candidates
@@ -70,8 +77,14 @@ impl IndexStore {
                 true
             })
             .filter_map(|c| {
-                let (score, explanation) =
-                    rank(&c.row, &query_lower, &tokens, c.via_fts, depth(&c.row.path));
+                let (score, explanation) = rank(
+                    &c.row,
+                    &query_lower,
+                    &tokens,
+                    c.via_fts,
+                    c.via_content_fts,
+                    depth(&c.row.path),
+                );
                 (score > 0.0).then(|| SearchHit {
                     entry_id: c.row.id,
                     kind: hit_kind(&c.row),
@@ -93,7 +106,7 @@ impl IndexStore {
     fn exact_candidates(&self, query_lower: &str) -> Result<Vec<EntryRow>, StoreError> {
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    mtime, missing
+                    size, mtime, missing
              FROM entries
              WHERE missing = 0 AND name_lower = ?1
              LIMIT 8",
@@ -110,7 +123,7 @@ impl IndexStore {
         };
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    mtime, missing
+                    size, mtime, missing
              FROM entries
              WHERE missing = 0 AND name_lower >= ?1 AND name_lower < ?2
              LIMIT ?3",
@@ -129,7 +142,7 @@ impl IndexStore {
         let escaped = query_lower.replace('"', "\"\"");
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    mtime, missing
+                    size, mtime, missing
              FROM entries
              WHERE id IN (
                  SELECT rowid FROM entries_tri WHERE entries_tri MATCH ?1 LIMIT ?2
@@ -149,10 +162,29 @@ impl IndexStore {
             .join(" ");
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    mtime, missing
+                    size, mtime, missing
              FROM entries
              WHERE id IN (
                  SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1 LIMIT ?2
+             )",
+            params![match_expr, CANDIDATE_CAP as i64],
+        )
+    }
+
+    /// All query tokens present as word prefixes in extracted content (`content_fts`).
+    fn content_fts_candidates(&self, tokens: &[String]) -> Result<Vec<EntryRow>, StoreError> {
+        let match_expr = tokens
+            .iter()
+            .map(|t| format!("\"{t}\"*"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.rows_by(
+            "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
+                    size, mtime, missing
+             FROM entries
+             WHERE id IN (
+                 SELECT CAST(entry_id AS INTEGER) FROM content_fts
+                 WHERE content_fts MATCH ?1 LIMIT ?2
              )",
             params![match_expr, CANDIDATE_CAP as i64],
         )
@@ -175,6 +207,7 @@ fn rank(
     query: &str,
     tokens: &[String],
     via_fts: bool,
+    via_content_fts: bool,
     depth: usize,
 ) -> (f64, String) {
     let name = &row.name_lower;
@@ -188,6 +221,8 @@ fn rank(
         (0.74, "All words match the name")
     } else if via_fts {
         (0.5, "Matches name or keywords")
+    } else if via_content_fts {
+        (0.42, "Matches extracted content")
     } else if row.path.to_lowercase().contains(query) {
         (0.35, "Path matches query")
     } else {
@@ -245,8 +280,9 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
         ext: row.get(6)?,
         is_dir: row.get::<_, i64>(7)? != 0,
         is_app: row.get::<_, i64>(8)? != 0,
-        mtime: row.get(9)?,
-        missing: row.get::<_, i64>(10)? != 0,
+        size: row.get::<_, i64>(9)?.max(0) as u64,
+        mtime: row.get(10)?,
+        missing: row.get::<_, i64>(11)? != 0,
     })
 }
 
