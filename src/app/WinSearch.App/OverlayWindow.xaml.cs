@@ -39,6 +39,7 @@ public sealed partial class OverlayWindow : Window
 
         ResultsList.ItemsSource = _viewModel.Results;
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+        SearchBox.TextChanged += OnSearchBoxTextChanged;
         ApplyTheme();
 
         Activated += OnWindowActivated;
@@ -47,6 +48,14 @@ public sealed partial class OverlayWindow : Window
         {
             SearchBox.Text = _settings.LastQuery;
             _viewModel.QueryText = _settings.LastQuery;
+        }
+    }
+
+    private void OnSearchBoxTextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_viewModel.QueryText != SearchBox.Text)
+        {
+            _viewModel.QueryText = SearchBox.Text;
         }
     }
 
@@ -59,6 +68,17 @@ public sealed partial class OverlayWindow : Window
                 break;
             case nameof(MainOverlayViewModel.ModeLabel):
                 ModeIndicator.Text = _viewModel.ModeLabel;
+                break;
+            case nameof(MainOverlayViewModel.IsSemanticPending):
+                SemanticPendingPanel.Visibility = _viewModel.IsSemanticPending
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+                break;
+            case nameof(MainOverlayViewModel.SemanticHintText):
+                SemanticHintText.Text = _viewModel.SemanticHintText;
+                SemanticHintText.Visibility = string.IsNullOrEmpty(_viewModel.SemanticHintText)
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
                 break;
         }
     }

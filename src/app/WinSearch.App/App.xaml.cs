@@ -26,6 +26,7 @@ public partial class App : Application
     private HotkeyManager? _hotkeyManager;
     private TrayIcon? _trayIcon;
     private EngineClient? _engineClient;
+    private MainOverlayViewModel? _overlayViewModel;
     private OverlayWindow? _overlay;
     private SettingsWindow? _settingsWindow;
 
@@ -74,8 +75,8 @@ public partial class App : Application
         _engineClient = new EngineClient(EnginePipe.NameForCurrentUser());
         _engineClient.StatusChanged += OnEngineStatus;
 
-        var viewModel = new MainOverlayViewModel(_engineClient, _settings);
-        _overlay = new OverlayWindow(viewModel, _settings);
+        _overlayViewModel = new MainOverlayViewModel(_engineClient, _settings);
+        _overlay = new OverlayWindow(_overlayViewModel, _settings);
 
         RegisterHotkeyWithFallback();
 
@@ -147,7 +148,7 @@ public partial class App : Application
     {
         if (_settingsWindow is null)
         {
-            _settingsWindow = new SettingsWindow(_settings, _hotkeyManager!);
+            _settingsWindow = new SettingsWindow(_settings, _hotkeyManager!, _engineClient);
             _settingsWindow.Closed += (_, _) => _settingsWindow = null;
         }
         _settingsWindow.Activate();
@@ -162,6 +163,10 @@ public partial class App : Application
         try
         {
             await _engineClient.ConnectAsync();
+            if (_overlayViewModel is not null)
+            {
+                await _overlayViewModel.InitializeAsync();
+            }
         }
         catch (Exception ex)
         {

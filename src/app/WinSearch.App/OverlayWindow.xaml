@@ -126,22 +126,53 @@
                     </ListView.ItemTemplate>
                 </ListView>
 
-                <!-- Status + keyboard hints -->
-                <Grid Grid.Row="2" Height="32" Padding="16,0">
+                <!-- Status + semantic indicator/hint + keyboard hints -->
+                <Grid Grid.Row="2" Height="32" Padding="16,0" ColumnSpacing="12">
                     <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
 
-                    <TextBlock
-                        x:Name="StatusText"
+                    <StackPanel
                         Grid.Column="0"
-                        VerticalAlignment="Center"
-                        FontSize="11"
-                        Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                        Orientation="Horizontal"
+                        Spacing="8"
+                        VerticalAlignment="Center">
+                        <TextBlock
+                            x:Name="StatusText"
+                            VerticalAlignment="Center"
+                            FontSize="11"
+                            Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+
+                        <StackPanel
+                            x:Name="SemanticPendingPanel"
+                            Orientation="Horizontal"
+                            Spacing="6"
+                            VerticalAlignment="Center"
+                            Visibility="Collapsed">
+                            <ProgressRing
+                                Width="12"
+                                Height="12"
+                                IsActive="True" />
+                            <TextBlock
+                                FontSize="11"
+                                Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                Text="Semantic…" />
+                        </StackPanel>
+                    </StackPanel>
 
                     <TextBlock
+                        x:Name="SemanticHintText"
                         Grid.Column="1"
+                        VerticalAlignment="Center"
+                        FontSize="11"
+                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                        TextTrimming="CharacterEllipsis"
+                        Visibility="Collapsed" />
+
+                    <TextBlock
+                        Grid.Column="2"
                         VerticalAlignment="Center"
                         FontSize="11"
                         Foreground="{ThemeResource TextFillColorTertiaryBrush}"

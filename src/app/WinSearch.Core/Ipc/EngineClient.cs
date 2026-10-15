@@ -8,12 +8,35 @@ using WinSearch.Core.Protocol;
 namespace WinSearch.Core.Ipc;
 
 /// <summary>
+/// Contract for engine IPC operations consumed by view models, allowing
+/// deterministic in-memory unit tests alongside the named-pipe <see cref="EngineClient"/>.
+/// </summary>
+public interface IEngineClient : IAsyncDisposable
+{
+    event EventHandler<EngineStatus>? StatusChanged;
+    event EventHandler<ModelStatus>? ModelStatusChanged;
+    event EventHandler<EngineConfig>? ConfigChanged;
+    event EventHandler? Disconnected;
+    event EventHandler? Reconnected;
+
+    Task<EngineStatus> GetStatusAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> StartModelDownloadAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> CancelModelDownloadAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> ImportModelAsync(string path, CancellationToken cancellationToken = default);
+    Task<ModelStatus> DeleteModelAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> GetModelStatusAsync(CancellationToken cancellationToken = default);
+    Task<EngineConfig> GetConfigAsync(CancellationToken cancellationToken = default);
+    Task<EngineConfig> SetConfigAsync(EngineConfig config, CancellationToken cancellationToken = default);
+    IAsyncEnumerable<SearchBatch> SearchAsync(SearchQuery query, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
 /// Async client for the engine's named pipe. Supports request/response with
 /// correlation ids, streamed search batches, per-request cancellation, pushed
 /// status updates, and automatic reconnection (with engine restart) when the
 /// connection drops.
 /// </summary>
-public sealed class EngineClient : IAsyncDisposable
+public sealed class EngineClient : IEngineClient
 {
     private const int MaxFrameBytes = 16 * 1024 * 1024;
     private const int HandshakeTimeoutMs = 5000;

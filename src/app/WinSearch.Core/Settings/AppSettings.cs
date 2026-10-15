@@ -12,7 +12,8 @@ public enum AppTheme
 /// <summary>
 /// Frontend settings (theme, hotkey, search behaviour) stored in
 /// <c>%LOCALAPPDATA%\WinSearch\settings.json</c>. Engine-side policy (folders,
-/// schedules) travels over IPC and lives in the engine database.
+/// schedules, semantic enablement, preferred backend) travels over IPC and
+/// lives in the engine database.
 /// </summary>
 public sealed class AppSettings
 {
@@ -26,14 +27,6 @@ public sealed class AppSettings
 
     public bool RememberLastQuery { get; set; }
     public string LastQuery { get; set; } = "";
-
-    /// <summary>
-    /// Whether searches ask the engine for semantic (embedding) retrieval on
-    /// top of exact matches. The engine additionally requires the model to be
-    /// ready and the policy to allow it, so disabling here is a pure
-    /// client-side opt-out of the later semantic batches.
-    /// </summary>
-    public bool EnableSemanticSearch { get; set; } = true;
 
     public static string SettingsDirectory =>
         Path.Combine(

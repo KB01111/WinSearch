@@ -147,14 +147,19 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
 
 ### Frontend (src/app)
 
-- `WinSearch.Core` — `EngineClient` (async pipe client: correlation ids,
-  streamed batches, cancellation, auto-reconnect with engine restart),
-  protocol models, `AppSettings`.
+- `WinSearch.Core` — `EngineClient` / `IEngineClient` (async pipe client:
+  correlation ids, streamed batches, cancellation, auto-reconnect with engine
+  restart), protocol models, `AppSettings` (UI-owned preferences only).
 - `WinSearch.ViewModels` — `MainOverlayViewModel` (debounce, superseded-query
-  cancellation, stable updates), settings/result item VMs.
+  cancellation, append-only semantic streaming with `IsSemanticPending` and
+  missing-model hint), `SettingsViewModel` (theme/hotkey/query memory plus AI
+  model download/pause/resume/import/delete state machine, progress + speed
+  mapping, and `get_config`/`set_config` policy sync), result item VMs.
 - `WinSearch.App` — overlay window (one instance, reused; DPI/monitor-aware
-  placement, acrylic, composition animations respecting reduced motion),
-  tray icon, global hotkey with conflict detection and fallback, settings.
+  placement, acrylic, composition animations respecting reduced motion,
+  semantic pending indicator + missing-model hint), tray icon, global hotkey
+  with conflict detection and fallback, settings window (incl. AI model group).
+- `WinSearch.Tests` — xUnit unit tests for ViewModel logic and state machines.
 
 ## Data locations
 
