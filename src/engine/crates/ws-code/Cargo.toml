@@ -6,6 +6,7 @@ license.workspace = true
 description = "WinSearch code index: gitignore-aware repo crawler and standalone code.db store"
 
 [dependencies]
+anyhow.workspace = true
 half = "2"
 ignore = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
