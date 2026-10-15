@@ -116,6 +116,14 @@ impl EngineService {
         embed: EmbedSupervisor,
     ) -> SharedEngine {
         let models = ModelService::new(model_dir, Arc::clone(&indexer));
+        Self::new_with_models(indexer, models, embed)
+    }
+
+    pub fn new_with_models(
+        indexer: Arc<Indexer>,
+        models: Arc<ModelService>,
+        embed: EmbedSupervisor,
+    ) -> SharedEngine {
         Arc::new(Self {
             status: Mutex::new(EngineStatus {
                 state: EngineRunState::Idle,
@@ -370,8 +378,10 @@ impl EngineService {
     // ---- semantic query stage (P3.6) ----
 
     /// Whether the embedding model counts as ready for the semantic stage:
-    /// the supervisor's cached handshake flags (real weights or stub
-    /// vectors), unless a test override is set.
+    /// either the supervisor's cached handshake flags report a loaded/stub
+    /// worker, or the on-disk model files are ready (`ModelState::Ready`, so a
+    /// cold-start query lazy-spawns the worker even when the background embed
+    /// queue is empty), unless a test override is set.
     fn model_ready(&self) -> bool {
         if let Some(forced) = *self
             .model_ready_override
@@ -381,6 +391,7 @@ impl EngineService {
             return forced;
         }
         self.embed.model_loaded()
+            || self.models.status().state == ws_modelmgr::ModelState::Ready
     }
 
     /// Whether the `config` policy currently allows semantic retrieval.
@@ -526,13 +537,15 @@ impl EngineService {
     /// Executes one search, streaming result batches to the client. Exact
     /// results stream first under their unchanged contract; when the semantic
     /// gate is open a second stage appends embedding-similarity hits in later
-    /// frames. A request cancelled between the stages closes with an empty
-    /// terminal batch so the client can retire it.
-    pub fn search(&self, client: &ClientHandle, id: RequestId, query: SearchQuery) {
+    /// frames on a background thread so the connection read loop remains free
+    /// to service in-band `Cancel` and superseding `Search` frames. A request
+    /// cancelled between the stages closes with an empty terminal batch so the
+    /// client can retire it.
+    pub fn search(self: &Arc<Self>, client: &ClientHandle, id: RequestId, query: SearchQuery) {
         let cancel = self.begin_request(id);
-        let outcome = self.run_search(client, id, &query, &cancel);
-        self.end_request(id);
+        let outcome = self.run_search(client, id, query, cancel);
         if let Err(e) = outcome {
+            self.end_request(id);
             let _ = client.send(&ServerMessage::Error {
                 id: Some(id),
                 code: ws_protocol::ErrorCode::Internal,
@@ -547,15 +560,16 @@ impl EngineService {
     }
 
     fn run_search(
-        &self,
+        self: &Arc<Self>,
         client: &ClientHandle,
         id: RequestId,
-        query: &SearchQuery,
-        cancel: &AtomicBool,
+        query: SearchQuery,
+        cancel: Arc<AtomicBool>,
     ) -> Result<(), FrameError> {
-        let results = self.plan_results(query);
+        let results = self.plan_results(&query);
 
         if cancel.load(Ordering::Relaxed) {
+            self.end_request(id);
             return client.send(&ServerMessage::Results {
                 id,
                 batch: Vec::new(),
@@ -565,7 +579,7 @@ impl EngineService {
 
         // Whether a semantic stage will follow: when it will, the exact
         // terminal frame says `done: false` so the client keeps listening.
-        let semantic = self.semantic_allowed(query);
+        let semantic = self.semantic_allowed(&query);
 
         // Progressive response: the first batch is what the overlay shows;
         // overflow streams after so typing stays responsive.
@@ -578,6 +592,7 @@ impl EngineService {
         })?;
         if !rest.is_empty() {
             if cancel.load(Ordering::Relaxed) {
+                self.end_request(id);
                 return client.send(&ServerMessage::Results {
                     id,
                     batch: Vec::new(),
@@ -591,12 +606,55 @@ impl EngineService {
             })?;
         }
         if !semantic {
+            self.end_request(id);
             return Ok(());
         }
 
-        // Semantic stage: the exact contract above already streamed
-        // unchanged. A cancel landing between the stages yields an empty
-        // terminal batch (the already-streamed exact batches stand).
+        // Semantic stage runs off the connection read loop so an in-band
+        // `Cancel` or superseding `Search` on the same pipe can be read and
+        // applied while `embed_query` is in flight.
+        let exact_ids = exact_entry_ids(&results);
+        let this = Arc::clone(self);
+        let thread_client = client.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("winsearch-semantic".into())
+            .spawn(move || {
+                let outcome =
+                    this.run_semantic_stage(&thread_client, id, &query, &exact_ids, &cancel);
+                this.end_request(id);
+                if let Err(err) = outcome {
+                    let _ = thread_client.send(&ServerMessage::Error {
+                        id: Some(id),
+                        code: ws_protocol::ErrorCode::Internal,
+                        message: err.to_string(),
+                    });
+                    let _ = thread_client.send(&ServerMessage::Results {
+                        id,
+                        batch: Vec::new(),
+                        done: true,
+                    });
+                }
+            })
+        {
+            warn!(error = %e, "semantic stage: thread spawn failed; closing stream");
+            self.end_request(id);
+            return client.send(&ServerMessage::Results {
+                id,
+                batch: Vec::new(),
+                done: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn run_semantic_stage(
+        &self,
+        client: &ClientHandle,
+        id: RequestId,
+        query: &SearchQuery,
+        exact_ids: &HashSet<i64>,
+        cancel: &AtomicBool,
+    ) -> Result<(), FrameError> {
         if cancel.load(Ordering::Relaxed) {
             return client.send(&ServerMessage::Results {
                 id,
@@ -604,8 +662,7 @@ impl EngineService {
                 done: true,
             });
         }
-        let exact_ids = exact_entry_ids(&results);
-        let hits = self.plan_semantic(query, &exact_ids);
+        let hits = self.plan_semantic(query, exact_ids);
         if cancel.load(Ordering::Relaxed) {
             return client.send(&ServerMessage::Results {
                 id,
@@ -1201,6 +1258,56 @@ mod tests {
             })
             .unwrap();
         assert!(!engine.semantic_allowed(&semantic_query("meeting")));
+    }
+
+    #[test]
+    fn cold_start_model_ready_when_model_service_is_ready() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("banquet-hall.txt"), b"x").unwrap();
+        let store = IndexStore::open_in_memory().unwrap();
+        let indexer = Indexer::open(store, &[tree.0.clone()]).unwrap();
+        indexer.enqueue_initial_scan().unwrap();
+        while indexer.scan_available(64) > 0 {}
+        indexer
+            .embed_once_with(|texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()))
+            .unwrap();
+
+        // Populate a tiny model dir whose manifest file is present on disk so
+        // `ModelService::status().state == ModelState::Ready`, while the fresh
+        // `EmbedSupervisor` has never spawned a worker (`model_loaded() == false`)
+        // and `model_ready_override` is `None`.
+        let model_dir = tree.0.join("models-ready");
+        fs::create_dir_all(&model_dir).unwrap();
+        let body = b"stub-gguf-weights";
+        fs::write(model_dir.join("tiny.gguf"), body).unwrap();
+        let expected = ws_modelmgr::ExpectedFile {
+            name: "tiny.gguf",
+            size: body.len() as u64,
+            sha256: None,
+        };
+        let manager = ws_modelmgr::ModelManager::with_files(
+            model_dir,
+            ws_modelmgr::DownloadOptions::default(),
+            vec![expected],
+        );
+        let models = ModelService::with_manager(manager, Arc::clone(&indexer));
+        assert_eq!(models.status().state, ws_modelmgr::ModelState::Ready);
+
+        let engine = EngineService::new_with_models(indexer, models, EmbedSupervisor::new());
+        assert!(
+            !engine.embed_supervisor().model_loaded(),
+            "cold-start supervisor has not spawned the worker yet"
+        );
+        assert!(
+            engine.model_ready(),
+            "ready ModelService on disk must open the semantic gate on cold start"
+        );
+        assert!(engine.semantic_allowed(&semantic_query("meeting")));
+
+        engine.set_query_embed_hook(Arc::new(|_| Ok(vec![1.0, 0.0, 0.0])));
+        let hits = engine.plan_semantic(&semantic_query("meeting"), &HashSet::new());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "banquet-hall.txt");
     }
 
     #[test]

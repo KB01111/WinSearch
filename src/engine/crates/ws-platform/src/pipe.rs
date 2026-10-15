@@ -18,8 +18,8 @@ use windows::Win32::Security::{
     TokenUser as TokenUserClass,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -71,6 +71,20 @@ impl PipeStream {
             Ok(PipeStream {
                 handle: PipeHandle(handle),
             })
+        }
+    }
+
+    /// Non-blocking check for bytes waiting in the pipe's inbound buffer.
+    /// Returns `Ok(Some(n))` when `n` bytes are queued (possibly 0), or
+    /// `Ok(None)` when the peer has disconnected (`ERROR_BROKEN_PIPE`).
+    pub fn peek_available(&self) -> io::Result<Option<usize>> {
+        let mut avail = 0u32;
+        unsafe {
+            match PeekNamedPipe(self.handle.0, None, 0, None, Some(&mut avail), None) {
+                Ok(()) => Ok(Some(avail as usize)),
+                Err(e) if is_disconnect(&e) => Ok(None),
+                Err(e) => Err(win32_io_error(e)),
+            }
         }
     }
 }
