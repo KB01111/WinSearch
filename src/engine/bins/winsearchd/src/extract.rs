@@ -197,7 +197,7 @@ impl Indexer {
                 let mut store = self.store_lock();
                 if permanent {
                     clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
-                    let _ = store.mark_extract_failed(job.id);
+                    store.mark_extract_failed(job.id)?;
                     drop(store);
                     self.invalidate_vector_cache();
                     return Ok(ExtractStepOutcome {
@@ -207,10 +207,7 @@ impl Indexer {
                         ..Default::default()
                     });
                 }
-                let poisoned = Self::fail_extract_job_capped(&mut store, &job, &entry.name);
-                if poisoned {
-                    clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
-                }
+                let poisoned = Self::fail_extract_job_capped(&mut store, &job, &entry.name)?;
                 drop(store);
                 if poisoned {
                     self.invalidate_vector_cache();
@@ -232,7 +229,7 @@ impl Indexer {
             let mut store = self.store_lock();
             clear_modality_artifacts(&mut store, job.entry_id, &job.kind)?;
             if matches!(output.status, ExtractionStatus::Failed(_)) {
-                let _ = store.mark_extract_failed(job.id);
+                store.mark_extract_failed(job.id)?;
             } else {
                 store.complete_extract_job(job.id)?;
             }
@@ -280,7 +277,7 @@ impl Indexer {
                         );
                         let mut store = self.store_lock();
                         let poisoned =
-                            Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                            Self::fail_extract_job_capped(&mut store, &job, &entry.name)?;
                         drop(store);
                         if poisoned {
                             self.invalidate_vector_cache();
@@ -301,7 +298,7 @@ impl Indexer {
                         );
                         let mut store = self.store_lock();
                         let poisoned =
-                            Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                            Self::fail_extract_job_capped(&mut store, &job, &entry.name)?;
                         drop(store);
                         if poisoned {
                             self.invalidate_vector_cache();
@@ -332,7 +329,7 @@ impl Indexer {
                         );
                         let mut store = self.store_lock();
                         let poisoned =
-                            Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                            Self::fail_extract_job_capped(&mut store, &job, &entry.name)?;
                         drop(store);
                         if poisoned {
                             self.invalidate_vector_cache();
@@ -509,7 +506,7 @@ impl Indexer {
         store: &mut ws_index::IndexStore,
         job: &ExtractJob,
         name: &str,
-    ) -> bool {
+    ) -> Result<bool, StoreError> {
         if job.attempts + 1 >= MAX_EMBED_ATTEMPTS {
             warn!(
                 job = job.id,
@@ -519,12 +516,12 @@ impl Indexer {
                 attempts = job.attempts + 1,
                 "content extract job failing repeatedly; poison-pilled"
             );
-            let _ = clear_modality_artifacts(store, job.entry_id, &job.kind);
-            let _ = store.mark_extract_failed(job.id);
-            true
+            clear_modality_artifacts(store, job.entry_id, &job.kind)?;
+            store.mark_extract_failed(job.id)?;
+            Ok(true)
         } else {
-            let _ = store.fail_extract_job(job.id);
-            false
+            store.fail_extract_job(job.id)?;
+            Ok(false)
         }
     }
 }

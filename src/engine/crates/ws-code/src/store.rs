@@ -374,7 +374,10 @@ impl CodeStore {
                         .optional()?;
                     cand.and_then(|(id, old_path, old_gen)| {
                         let in_batch = records.iter().any(|r| r.path == old_path);
-                        let still_exists = std::path::Path::new(&old_path).exists();
+                        let case_only_rename =
+                            old_path.to_lowercase() == rec.path.to_lowercase();
+                        let still_exists =
+                            !case_only_rename && std::path::Path::new(&old_path).exists();
                         if old_gen != scan_generation && !in_batch && !still_exists {
                             Some(id)
                         } else {
@@ -1257,5 +1260,89 @@ mod tests {
         assert_eq!(stats.chunks_total, 2);
         assert_eq!(stats.embedded_chunks_total, 2);
         assert_eq!(stats.symbols_total, 2);
+    }
+
+    #[test]
+    fn case_only_rename_on_disk_preserves_file_row_and_symbols() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-code-case-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_file = dir.join("Engine.rs");
+        let new_file = dir.join("engine.rs");
+        std::fs::write(&old_file, "pub struct SearchEngine;").unwrap();
+
+        let mut store = CodeStore::open_in_memory().unwrap();
+        let repo_id = store
+            .ensure_repo(&DetectedRepo {
+                root_path: dir.to_string_lossy().into_owned(),
+                name: "demo".into(),
+                has_git: true,
+            })
+            .unwrap();
+
+        let g1 = store.begin_generation(repo_id).unwrap();
+        let out1 = store
+            .apply_file_batch(
+                repo_id,
+                g1,
+                &[CodeFileRecord {
+                    path: old_file.to_string_lossy().into_owned(),
+                    rel_path: "Engine.rs".into(),
+                    name: "Engine.rs".into(),
+                    ext: "rs".into(),
+                    language: "rust".into(),
+                    size: 24,
+                    mtime: 1000,
+                    volume_serial: 77,
+                    file_id: 888,
+                }],
+            )
+            .unwrap();
+        let initial_id = out1[0].file_id();
+        store
+            .replace_symbols_for_file(
+                initial_id,
+                &[NewCodeSymbol {
+                    file_id: initial_id,
+                    name: "SearchEngine",
+                    kind: "struct",
+                    role: SymbolRole::Definition,
+                    line: 1,
+                    end_line: 1,
+                    signature: "pub struct SearchEngine;",
+                }],
+            )
+            .unwrap();
+
+        // On Windows, `old_file.exists()` remains true even after a case-only rename.
+        let g2 = store.begin_generation(repo_id).unwrap();
+        let out2 = store
+            .apply_file_batch(
+                repo_id,
+                g2,
+                &[CodeFileRecord {
+                    path: new_file.to_string_lossy().into_owned(),
+                    rel_path: "engine.rs".into(),
+                    name: "engine.rs".into(),
+                    ext: "rs".into(),
+                    language: "rust".into(),
+                    size: 24,
+                    mtime: 1000,
+                    volume_serial: 77,
+                    file_id: 888,
+                }],
+            )
+            .unwrap();
+        assert_eq!(out2, vec![FileUpsertOutcome::Renamed { id: initial_id }]);
+        assert_eq!(store.sweep_generation(repo_id, g2).unwrap(), 0);
+        assert_eq!(store.list_symbols_for_file(initial_id).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

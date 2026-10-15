@@ -132,9 +132,13 @@ impl Indexer {
         for root in roots {
             let path = root.to_string_lossy().into_owned();
             let id = store.ensure_root(&path)?;
+            let present = root.is_dir();
+            if !present {
+                store.set_missing_for_root(id, true)?;
+            }
             infos.push(RootInfo {
                 id,
-                offline: AtomicBool::new(!root.is_dir()),
+                offline: AtomicBool::new(!present),
                 path: root.clone(),
             });
         }
@@ -297,6 +301,19 @@ impl Indexer {
             .get_entry(id)
     }
 
+    /// Non-missing entry ids matching the given mode/category filters.
+    pub fn matching_entry_ids(
+        &self,
+        apps_only: bool,
+        exclude_apps: bool,
+        kinds: &[ws_index::HitKind],
+    ) -> Result<Vec<i64>, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .matching_entry_ids(apps_only, exclude_apps, kinds)
+    }
+
     /// Engine search policy for the semantic stage (`semantic_enabled`
     /// gates the stage; unknown/missing keys read back as defaults).
     pub fn get_engine_config(&self) -> Result<EngineConfig, StoreError> {
@@ -426,10 +443,10 @@ impl Indexer {
                 .store
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .claim_dir();
+                .claim_dir_with_generation();
             match work {
-                Ok(Some((queue_id, root_id, dir_path))) => {
-                    if let Err(e) = self.process_dir(queue_id, root_id, &dir_path) {
+                Ok(Some((queue_id, root_id, dir_path, claimed_gen))) => {
+                    if let Err(e) = self.process_dir(queue_id, root_id, &dir_path, claimed_gen) {
                         warn!(dir = %dir_path, error = %e, "directory scan failed");
                     }
                     processed += 1;
@@ -449,10 +466,10 @@ impl Indexer {
                 .store
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .claim_dir();
+                .claim_dir_with_generation();
             match work {
-                Ok(Some((queue_id, root_id, dir_path))) => {
-                    if let Err(e) = self.process_dir(queue_id, root_id, &dir_path) {
+                Ok(Some((queue_id, root_id, dir_path, claimed_gen))) => {
+                    if let Err(e) = self.process_dir(queue_id, root_id, &dir_path, claimed_gen) {
                         warn!(dir = %dir_path, error = %e, "directory scan failed");
                     }
                 }
@@ -517,6 +534,7 @@ impl Indexer {
         queue_id: i64,
         root_id: i64,
         dir_path: &str,
+        claimed_generation: i64,
     ) -> Result<(), StoreError> {
         let depth = self.relative_depth(root_id, dir_path);
         let parent_id = self
@@ -538,25 +556,32 @@ impl Indexer {
 
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.current_generation(&store, root_id)?;
-        if scan_failed {
-            store.touch_subtree_generation(root_id, dir_path, generation)?;
-        } else {
-            let outcomes = store.apply_batch(root_id, generation, &scan.entries)?;
-            Self::enqueue_name_jobs_for_outcomes(&mut store, &scan.entries, &outcomes)?;
-            for sub in &scan.subdirs {
-                store.enqueue_dir(root_id, sub)?;
-            }
-            if !scan.complete {
+        let superseded = claimed_generation != generation;
+        if !superseded {
+            if scan_failed {
                 store.touch_subtree_generation(root_id, dir_path, generation)?;
+            } else {
+                let outcomes = store.apply_batch(root_id, generation, &scan.entries)?;
+                Self::enqueue_name_jobs_for_outcomes(&mut store, &scan.entries, &outcomes)?;
+                for sub in &scan.subdirs {
+                    store.enqueue_dir(root_id, sub)?;
+                }
+                if !scan.complete {
+                    store.touch_subtree_generation(root_id, dir_path, generation)?;
+                }
             }
         }
         store.complete_dir(queue_id)?;
 
-        let entries = scan.entries.len() as u64;
+        let entries = if superseded {
+            0
+        } else {
+            scan.entries.len() as u64
+        };
         let root_done = store.pending_for_root(root_id)? == 0;
         drop(store);
 
-        {
+        if !superseded {
             let mut counters = self.counters.lock().unwrap_or_else(|p| p.into_inner());
             counters.files_discovered += entries;
             counters.files_indexed += scan
@@ -1139,25 +1164,23 @@ impl Indexer {
         for root in &self.roots {
             let present = root.path.is_dir();
             let was_offline = root.offline.load(Ordering::Acquire);
-            let marked_missing = self.root_marked_missing(root.id).unwrap_or(false) || was_offline;
-            match (present, marked_missing) {
-                (true, true) => {
+            let has_missing = self.root_marked_missing(root.id).unwrap_or(false);
+            if present {
+                if was_offline || has_missing {
                     info!(root = %root.path.display(), "volume reconnected; reconciling");
                     root.offline.store(false, Ordering::Release);
                     if let Err(e) = self.reconnect_root(root) {
                         warn!(error = %e, "reconnect failed");
                     }
                 }
-                (false, false) => {
-                    info!(root = %root.path.display(), "volume disconnected; preserving index");
-                    root.offline.store(true, Ordering::Release);
-                    let mut store =
-                        self.store.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Err(e) = store.set_missing_for_root(root.id, true) {
-                        warn!(error = %e, "marking missing failed");
-                    }
+            } else if !was_offline || !has_missing {
+                info!(root = %root.path.display(), "volume disconnected; preserving index");
+                root.offline.store(true, Ordering::Release);
+                let mut store =
+                    self.store.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = store.set_missing_for_root(root.id, true) {
+                    warn!(error = %e, "marking missing failed");
                 }
-                _ => {}
             }
         }
     }
@@ -1922,5 +1945,122 @@ mod tests {
             })
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn startup_offline_root_marks_entries_missing_and_reconnects_on_presence() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("vanished.txt"), b"hello").unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "winsearchd-startup-offline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("index.db");
+
+        {
+            let store = IndexStore::open(&db).unwrap();
+            let indexer = Indexer::open(store, &[tree.0.clone()]).unwrap();
+            indexer.enqueue_initial_scan().unwrap();
+            while indexer.scan_available(64) > 0 {}
+        }
+
+        // Remove the root directory while the daemon is stopped, then reopen.
+        fs::remove_dir_all(&tree.0).unwrap();
+        let store = IndexStore::open(&db).unwrap();
+        let indexer = Indexer::open(store, &[tree.0.clone()]).unwrap();
+        indexer.reconcile_drives();
+
+        assert!(
+            indexer
+                .search(&SearchRequest {
+                    text: "vanished".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "entries under an initially absent root must be marked missing"
+        );
+
+        // Recreate the root with a new file; reconcile_drives must reconnect and rescan.
+        fs::create_dir_all(&tree.0).unwrap();
+        fs::write(tree.0.join("restored.txt"), b"back").unwrap();
+        indexer.reconcile_drives();
+        while indexer.scan_available(64) > 0 {}
+
+        let hits = indexer
+            .search(&SearchRequest {
+                text: "restored".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        drop(indexer);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn superseded_inflight_scan_does_not_stamp_overflow_generation() {
+        let tree = TempTree::new();
+        let sub = tree.0.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let doomed = sub.join("doomed.txt");
+        fs::write(&doomed, b"bye").unwrap();
+        let keep = tree.0.join("keep.txt");
+        fs::write(&keep, b"stay").unwrap();
+
+        let indexer = seeded(&tree);
+        let root_id = indexer.roots[0].id;
+        let sub_str = sub.to_string_lossy().to_string();
+
+        // Enqueue and claim `sub` under the pre-overflow generation.
+        let (qid, _, dir, claimed_gen) = {
+            let mut store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            store.enqueue_dir(root_id, &sub_str).unwrap();
+            store.claim_dir_with_generation().unwrap().unwrap()
+        };
+
+        // Now `sub` is deleted and an overflow triggers a new generation + root rescan
+        // before the claimed scan of `sub` finishes (or while `sub` was still visible).
+        indexer.handle_event(root_id, WatchEvent::Overflow);
+
+        // Even if `process_dir` runs while `sub` is still on disk, its pre-overflow
+        // `claimed_gen` must prevent it from stamping `doomed.txt` into the new generation.
+        indexer
+            .process_dir(qid, root_id, &dir, claimed_gen)
+            .unwrap();
+
+        // Remove `sub` before the new generation's root rescan runs.
+        fs::remove_dir_all(&sub).unwrap();
+        while indexer.scan_available(64) > 0 {}
+
+        assert!(
+            indexer
+                .search(&SearchRequest {
+                    text: "doomed".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty(),
+            "superseded in-flight scan must not retain deleted files across overflow sweep"
+        );
+        assert_eq!(
+            indexer
+                .search(&SearchRequest {
+                    text: "keep".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

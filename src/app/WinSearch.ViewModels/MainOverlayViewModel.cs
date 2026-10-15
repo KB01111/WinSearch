@@ -23,6 +23,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     private readonly IEngineClient _client;
     private readonly AppSettings _settings;
     private readonly SynchronizationContext? _ui;
+    private readonly object _searchStateLock = new();
     private CancellationTokenSource? _searchCts;
     private Timer? _debounceTimer;
     private bool _debouncePending;
@@ -121,20 +122,28 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
 
     partial void OnQueryTextChanged(string value)
     {
-        _pendingQuery = value;
-        _debouncePending = true;
+        lock (_searchStateLock)
+        {
+            _pendingQuery = value;
+            Volatile.Write(ref _debouncePending, true);
+            _debounceTimer?.Dispose();
+            _debounceTimer = new Timer(
+                static state => ((MainOverlayViewModel)state!).OnDebounceElapsed(),
+                this,
+                DebounceMs,
+                Timeout.Infinite);
+        }
         UpdateSemanticHint();
-        _debounceTimer?.Dispose();
-        _debounceTimer = new Timer(
-            static state => ((MainOverlayViewModel)state!).OnDebounceElapsed(),
-            this,
-            DebounceMs,
-            Timeout.Infinite);
     }
 
     private void OnDebounceElapsed()
     {
-        _ = RunSearchAsync(_pendingQuery);
+        string query;
+        lock (_searchStateLock)
+        {
+            query = _pendingQuery;
+        }
+        _ = RunSearchAsync(query);
     }
 
     /// <summary>True when a query change is waiting on the debounce timer.</summary>
@@ -143,15 +152,22 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     /// <summary>Flushes any pending debounced query or awaits an in-flight search.</summary>
     public async Task FlushOrWaitForSearchAsync()
     {
-        if (HasPendingSearch)
+        Task? toAwait;
+        lock (_searchStateLock)
         {
-            await SearchNowAsync();
-            return;
+            if (Volatile.Read(ref _debouncePending))
+            {
+                toAwait = RunSearchAsync(QueryText);
+            }
+            else
+            {
+                toAwait = _activeSearchTask;
+            }
         }
 
-        if (_activeSearchTask is { IsCompleted: false } inflight)
+        if (toAwait is { IsCompleted: false })
         {
-            await inflight;
+            await toAwait;
         }
     }
 
@@ -161,9 +177,15 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
 
     public Task RunSearchAsync(string query)
     {
-        var task = RunSearchCoreAsync(query);
-        _activeSearchTask = task;
-        return task;
+        lock (_searchStateLock)
+        {
+            _debounceTimer?.Dispose();
+            _debounceTimer = null;
+            var task = RunSearchCoreAsync(query);
+            _activeSearchTask = task;
+            Volatile.Write(ref _debouncePending, false);
+            return task;
+        }
     }
 
     private async Task RunSearchCoreAsync(string query)
@@ -172,10 +194,6 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
         {
             return;
         }
-
-        Volatile.Write(ref _debouncePending, false);
-        _debounceTimer?.Dispose();
-        _debounceTimer = null;
 
         _searchCts?.Cancel();
         _searchCts?.Dispose();

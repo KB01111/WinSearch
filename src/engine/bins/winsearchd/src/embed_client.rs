@@ -327,6 +327,26 @@ impl EmbedSupervisor {
         }
     }
 
+    fn begin_bounded(&self) {
+        let _slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        self.active_bounded.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish_bounded(&self, timed_out: bool) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+        if timed_out && prev == 1 {
+            match kill_locked(&mut slot) {
+                Ok(true) => {
+                    self.worker_gen.fetch_add(1, Ordering::Release);
+                    info!("embed worker killed");
+                }
+                Ok(false) => {}
+                Err(e) => warn!(error = %e, "embed worker kill failed"),
+            }
+        }
+    }
+
     /// Embed texts, one job per [`MAX_TEXTS_PER_JOB`] chunk, in order.
     /// Spawns the worker on first use; restarts it and retries once when the
     /// connection breaks mid-job.
@@ -419,7 +439,7 @@ impl EmbedSupervisor {
             ));
         }
         let call_id = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
-        self.active_bounded.fetch_add(1, Ordering::AcqRel);
+        self.begin_bounded();
         let sup = std::sync::Arc::clone(self);
         let owned: Vec<String> = texts.to_vec();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
@@ -433,7 +453,7 @@ impl EmbedSupervisor {
                 let _ = tx.send(r);
             });
         if let Err(e) = spawned {
-            self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+            self.finish_bounded(false);
             return Err(EmbedError::Transport(format!(
                 "cannot spawn embed helper: {e}"
             )));
@@ -441,28 +461,24 @@ impl EmbedSupervisor {
         let outcome = rx.recv_timeout(timeout);
         match outcome {
             Ok(r) => {
-                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                self.finish_bounded(false);
                 r
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Stop the helper promptly: flag it and cancel only this
-                // caller's synchronous pipe IO. Check whether we are the sole
-                // bounded caller BEFORE decrementing `active_bounded` so a new
-                // bounded call starting right after cannot see a stale zero and
-                // have its worker killed.
+                // caller's synchronous pipe IO. `finish_bounded(true)` atomically
+                // decrements `active_bounded` and kills any hung worker under the
+                // `slot` mutex when this was the last active bounded caller.
                 cancel.store(true, Ordering::Relaxed);
                 self.cancel_inflight_read_for(call_id);
-                if self.active_bounded.load(Ordering::Acquire) == 1 {
-                    self.terminate_worker();
-                }
-                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                self.finish_bounded(true);
                 warn!("embed job timed out after {timeout:?}; helper cancelled, batch fails for retry");
                 Err(EmbedError::Transport(format!(
                     "embed job timed out after {timeout:?}"
                 )))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                self.finish_bounded(false);
                 Err(EmbedError::Transport(
                     "embed helper died before answering".into(),
                 ))
@@ -551,7 +567,7 @@ impl EmbedSupervisor {
             return Err(EmbedError::InvalidRequest("empty image path".into()));
         }
         let call_id = self.cancel_seq.fetch_add(1, Ordering::Relaxed);
-        self.active_bounded.fetch_add(1, Ordering::AcqRel);
+        self.begin_bounded();
         let sup = std::sync::Arc::clone(self);
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let cancel2 = std::sync::Arc::clone(&cancel);
@@ -564,7 +580,7 @@ impl EmbedSupervisor {
                 let _ = tx.send(r);
             });
         if let Err(e) = spawned {
-            self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+            self.finish_bounded(false);
             return Err(EmbedError::Transport(format!(
                 "cannot spawn image embed helper: {e}"
             )));
@@ -572,23 +588,20 @@ impl EmbedSupervisor {
         let outcome = rx.recv_timeout(timeout);
         match outcome {
             Ok(r) => {
-                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                self.finish_bounded(false);
                 r
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 cancel.store(true, Ordering::Relaxed);
                 self.cancel_inflight_read_for(call_id);
-                if self.active_bounded.load(Ordering::Acquire) == 1 {
-                    self.terminate_worker();
-                }
-                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                self.finish_bounded(true);
                 warn!("image embed job timed out after {timeout:?}; helper cancelled");
                 Err(EmbedError::Transport(format!(
                     "image embed job timed out after {timeout:?}"
                 )))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.active_bounded.fetch_sub(1, Ordering::AcqRel);
+                self.finish_bounded(false);
                 Err(EmbedError::Transport(
                     "image embed helper died before answering".into(),
                 ))

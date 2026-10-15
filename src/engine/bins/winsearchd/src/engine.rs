@@ -488,15 +488,34 @@ impl EngineService {
                 return Vec::new();
             }
         };
-        let candidate_limit =
-            if query.mode == SearchMode::Auto && query.categories.is_empty() {
-                SEMANTIC_TOP_K.saturating_mul(8)
-            } else {
-                usize::MAX
+        let candidate_limit = (query.limit.max(1) as usize)
+            .max(SEMANTIC_TOP_K)
+            .saturating_mul(8);
+        let filter = if query.mode == SearchMode::Auto && kinds.is_empty() {
+            None
+        } else {
+            let matching_ids = match self.indexer.matching_entry_ids(
+                query.mode == SearchMode::Apps,
+                query.mode == SearchMode::Files,
+                &kinds,
+            ) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!(error = %e, "semantic stage: entry filter query failed; exact results stand");
+                    return Vec::new();
+                }
             };
+            if matching_ids.is_empty() {
+                return Vec::new();
+            }
+            Some(ws_index::VectorFilter {
+                kinds: Vec::new(),
+                entry_ids: matching_ids,
+            })
+        };
         let scored = match self
             .indexer
-            .search_vectors(&query_vec, candidate_limit, None)
+            .search_vectors(&query_vec, candidate_limit, filter.as_ref())
         {
             Ok(s) => s,
             Err(e) => {

@@ -192,6 +192,48 @@ public sealed class MainOverlayViewModelTests
         Assert.Equal("e2", vm.Results[0].Result.Id);
     }
 
+    [Fact]
+    public async Task FlushOrWaitForSearchAsync_DoesNotMissInFlightTaskWhenDebounceStartsRunning()
+    {
+        var channel = Channel.CreateUnbounded<SearchBatch>();
+        Task? flushTask = null;
+        MainOverlayViewModel? vmRef = null;
+
+        var fake = new FakeEngineClient
+        {
+            CurrentConfig = new EngineConfig { SemanticEnabled = false, PreferredBackend = "auto" },
+            SearchHandler = (_, ct) =>
+            {
+                // Called synchronously inside RunSearchCoreAsync before its first await.
+                // Start FlushOrWaitForSearchAsync right at this suspension point to verify
+                // it never observes HasPendingSearch == false before _activeSearchTask is set.
+                flushTask = Task.Run(() => vmRef!.FlushOrWaitForSearchAsync());
+                return ReadBatchesAsync(channel.Reader, ct);
+            },
+        };
+
+        await using var vm = new MainOverlayViewModel(fake, new AppSettings());
+        vmRef = vm;
+
+        vm.QueryText = "race";
+        var runTask = vm.RunSearchAsync("race");
+
+        Assert.NotNull(flushTask);
+        await Task.Delay(30);
+        Assert.False(flushTask!.IsCompleted);
+
+        channel.Writer.TryWrite(new SearchBatch
+        {
+            Results = [new SearchResult { Id = "r1", Title = "race.txt", Score = 1.0 }],
+            Done = true,
+        });
+        channel.Writer.TryComplete();
+
+        await Task.WhenAll(runTask, flushTask);
+        Assert.Single(vm.Results);
+        Assert.Equal("r1", vm.Results[0].Result.Id);
+    }
+
     private static async IAsyncEnumerable<SearchBatch> ReadBatchesAsync(
         ChannelReader<SearchBatch> reader,
         [EnumeratorCancellation] CancellationToken cancellationToken)

@@ -93,7 +93,20 @@ fn scan_dir(dir: &Path, depth: usize, apps: &mut Vec<AppEntry>) -> bool {
             }
         };
         let path = entry.path();
-        if ft.is_dir() {
+        let is_dir = if ft.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        complete = false;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            ft.is_dir()
+        };
+        if is_dir {
             if depth < 8 && !scan_dir(&path, depth + 1, apps) {
                 complete = false;
             }

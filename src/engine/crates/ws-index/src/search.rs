@@ -194,26 +194,20 @@ impl IndexStore {
 
     /// Substring match against `entries.path` (for queries matching a parent
     /// directory substring or multi-segment path fragment of length >= 3).
+    /// Backed by the `entries_path_tri` trigram FTS index over lowercased paths.
     fn path_candidates(&self, query_lower: &str) -> Result<Vec<EntryRow>, StoreError> {
         if query_lower.chars().count() < 3 {
             return Ok(Vec::new());
         }
-        let mut pattern = String::with_capacity(query_lower.len() + 4);
-        pattern.push('%');
-        for ch in query_lower.chars() {
-            if matches!(ch, '%' | '_' | '\\') {
-                pattern.push('\\');
-            }
-            pattern.push(ch);
-        }
-        pattern.push('%');
+        let escaped = format!("\"{}\"", query_lower.replace('"', "\"\""));
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
                     size, mtime, missing, thumbnail_path
              FROM entries
-             WHERE missing = 0 AND LOWER(path) LIKE ?1 ESCAPE '\\'
-             LIMIT ?2",
-            params![pattern, CANDIDATE_CAP as i64],
+             WHERE missing = 0 AND id IN (
+                 SELECT rowid FROM entries_path_tri WHERE entries_path_tri MATCH ?1 LIMIT ?2
+             )",
+            params![escaped, CANDIDATE_CAP as i64],
         )
     }
 
@@ -536,6 +530,34 @@ mod tests {
         let hits = store
             .search(&SearchRequest {
                 text: "soupproject".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "readme.txt");
+        assert_eq!(hits[0].explanation, "Path matches query");
+    }
+
+    #[test]
+    fn unicode_parent_directory_substring_matches_case_insensitively() {
+        let mut store = IndexStore::open_in_memory().unwrap();
+        let root = store.ensure_root("C:\\data").unwrap();
+        let gen = store.begin_generation(root).unwrap();
+        store
+            .apply_batch(
+                root,
+                gen,
+                &[rec(
+                    "C:\\data\\BioÄpfelErnte\\readme.txt",
+                    "readme.txt",
+                    false,
+                )],
+            )
+            .unwrap();
+        let hits = store
+            .search(&SearchRequest {
+                text: "äpfelernt".into(),
                 limit: 10,
                 ..Default::default()
             })

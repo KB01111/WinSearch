@@ -118,11 +118,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_tri USING fts5(
     tokenize = 'trigram case_sensitive 0'
 );
 
+-- Trigram index over lowercased full paths for fast Unicode-aware path substring matching.
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_path_tri USING fts5(
+    path,
+    tokenize = 'trigram case_sensitive 0'
+);
+
 CREATE TABLE IF NOT EXISTS crawl_queue (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    root_id INTEGER NOT NULL,
-    dir_path TEXT NOT NULL,
-    claimed INTEGER NOT NULL DEFAULT 0,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id    INTEGER NOT NULL,
+    dir_path   TEXT NOT NULL,
+    claimed    INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
     UNIQUE(root_id, dir_path)
 );
 
@@ -216,6 +223,7 @@ impl IndexStore {
         // SCHEMA_V2 above) BEFORE creating the priority index. `schema_version`
         // stays "2": the column is a queue-ordering hint, not a format break.
         Self::ensure_extract_jobs_priority_column(&conn)?;
+        Self::ensure_crawl_queue_generation_column(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_extract_jobs_priority ON extract_jobs(state, claimed, priority, id);",
         )?;
@@ -231,6 +239,7 @@ impl IndexStore {
                 )?;
             }
         }
+        Self::ensure_entries_path_tri_backfilled(&conn)?;
         // Additive migration 1 → 2: fresh DBs land directly on 2, v1 files
         // keep every existing row and just gain the new tables.
         let version: Option<String> = conn
@@ -279,6 +288,56 @@ impl IndexStore {
                 "ALTER TABLE extract_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_crawl_queue_generation_column(conn: &Connection) -> Result<(), StoreError> {
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(crawl_queue)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        if !cols.iter().any(|c| c == "generation") {
+            conn.execute(
+                "ALTER TABLE crawl_queue ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE crawl_queue
+                 SET generation = COALESCE(
+                     (SELECT current_generation FROM roots WHERE roots.id = crawl_queue.root_id),
+                     0
+                 )",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_entries_path_tri_backfilled(conn: &Connection) -> Result<(), StoreError> {
+        let has_path_tri: bool = conn
+            .query_row("SELECT 1 FROM entries_path_tri LIMIT 1", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if has_path_tri {
+            return Ok(());
+        }
+        let has_entries: bool = conn
+            .query_row("SELECT 1 FROM entries LIMIT 1", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !has_entries {
+            return Ok(());
+        }
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare("SELECT id, path FROM entries")?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            mapped.collect::<Result<_, _>>()?
+        };
+        let mut insert =
+            conn.prepare("INSERT INTO entries_path_tri(rowid, path) VALUES(?1, ?2)")?;
+        for (id, path) in rows {
+            insert.execute(params![id, path.to_lowercase()])?;
         }
         Ok(())
     }
@@ -337,6 +396,10 @@ impl IndexStore {
         )?;
         tx.execute(
             &format!("DELETE FROM entries_tri WHERE rowid IN ({stale})"),
+            params![root_id, gen],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM entries_path_tri WHERE rowid IN ({stale})"),
             params![root_id, gen],
         )?;
         tx.execute(
@@ -423,9 +486,14 @@ impl IndexStore {
                 tx.prepare_cached("INSERT INTO entries_tri(rowid, name) VALUES(?1, ?2)")?;
             let mut tri_delete =
                 tx.prepare_cached("DELETE FROM entries_tri WHERE rowid = ?1")?;
+            let mut path_tri_insert =
+                tx.prepare_cached("INSERT INTO entries_path_tri(rowid, path) VALUES(?1, ?2)")?;
+            let mut path_tri_delete =
+                tx.prepare_cached("DELETE FROM entries_path_tri WHERE rowid = ?1")?;
 
             for rec in records {
                 let name_lower = rec.name.to_lowercase();
+                let path_lower = rec.path.to_lowercase();
                 let keywords = fts_keywords(rec);
                 let existing: Option<(i64, i64, i64, String, bool, String, String, i64, i64)> =
                     select
@@ -529,6 +597,8 @@ impl IndexStore {
                                 fts_insert.execute(params![id, eff_name, keywords])?;
                                 tri_delete.execute(params![id])?;
                                 tri_insert.execute(params![id, eff_name_lower])?;
+                                path_tri_delete.execute(params![id])?;
+                                path_tri_insert.execute(params![id, path_lower])?;
                             }
                             outcomes.push(UpsertOutcome::Updated);
                         }
@@ -553,6 +623,7 @@ impl IndexStore {
                         let id = tx.last_insert_rowid();
                         fts_insert.execute(params![id, rec.name, keywords])?;
                         tri_insert.execute(params![id, name_lower])?;
+                        path_tri_insert.execute(params![id, path_lower])?;
                         outcomes.push(UpsertOutcome::Inserted);
                     }
                 }
@@ -575,6 +646,7 @@ impl IndexStore {
         let tx = self.conn.transaction()?;
         {
             let name_lower = new_name.to_lowercase();
+            let path_lower = new_path.to_lowercase();
             tx.execute(
                 "UPDATE entries SET parent_id=?2, path=?3, name=?4, name_lower=?5, ext=?6
                  WHERE id=?1",
@@ -603,6 +675,11 @@ impl IndexStore {
             tx.execute(
                 "INSERT INTO entries_tri(rowid, name) VALUES(?1, ?2)",
                 params![id, name_lower],
+            )?;
+            tx.execute("DELETE FROM entries_path_tri WHERE rowid = ?1", params![id])?;
+            tx.execute(
+                "INSERT INTO entries_path_tri(rowid, path) VALUES(?1, ?2)",
+                params![id, path_lower],
             )?;
         }
         tx.commit()?;
@@ -652,6 +729,7 @@ impl IndexStore {
             Some(id) => {
                 tx.execute("DELETE FROM entries_fts WHERE rowid = ?1", params![id])?;
                 tx.execute("DELETE FROM entries_tri WHERE rowid = ?1", params![id])?;
+                tx.execute("DELETE FROM entries_path_tri WHERE rowid = ?1", params![id])?;
                 tx.execute("DELETE FROM content_fts WHERE entry_id = ?1", params![id])?;
                 tx.execute("DELETE FROM entries WHERE id = ?1", params![id])? > 0
             }
@@ -680,6 +758,7 @@ impl IndexStore {
         for id in ids {
             tx.execute("DELETE FROM entries_fts WHERE rowid = ?1", params![id])?;
             tx.execute("DELETE FROM entries_tri WHERE rowid = ?1", params![id])?;
+            tx.execute("DELETE FROM entries_path_tri WHERE rowid = ?1", params![id])?;
             tx.execute("DELETE FROM content_fts WHERE entry_id = ?1", params![id])?;
             deleted += tx.execute("DELETE FROM entries WHERE id = ?1", params![id])? as u64;
         }
@@ -691,7 +770,12 @@ impl IndexStore {
 
     pub fn enqueue_dir(&mut self, root_id: i64, dir_path: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO crawl_queue(root_id, dir_path) VALUES(?1, ?2)
+            "INSERT INTO crawl_queue(root_id, dir_path, generation)
+             VALUES(
+                 ?1,
+                 ?2,
+                 COALESCE((SELECT current_generation FROM roots WHERE id = ?1), 0)
+             )
              ON CONFLICT(root_id, dir_path) DO NOTHING",
             params![root_id, dir_path],
         )?;
@@ -702,14 +786,21 @@ impl IndexStore {
     /// with a fresh queue id (used on watcher overflow so an already-claimed
     /// scan cannot swallow the rescan request when it completes).
     pub fn requeue_dir(&mut self, root_id: i64, dir_path: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM crawl_queue WHERE root_id = ?1 AND dir_path = ?2",
             params![root_id, dir_path],
         )?;
-        self.conn.execute(
-            "INSERT INTO crawl_queue(root_id, dir_path) VALUES(?1, ?2)",
+        tx.execute(
+            "INSERT INTO crawl_queue(root_id, dir_path, generation)
+             VALUES(
+                 ?1,
+                 ?2,
+                 COALESCE((SELECT current_generation FROM roots WHERE id = ?1), 0)
+             )",
             params![root_id, dir_path],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -717,13 +808,22 @@ impl IndexStore {
     /// stays in the queue until [`Self::complete_dir`] runs, so a crash at any
     /// point re-runs the (idempotent) scan of that directory on restart.
     pub fn claim_dir(&mut self) -> Result<Option<(i64, i64, String)>, StoreError> {
+        self.claim_dir_with_generation()
+            .map(|opt| opt.map(|(id, root_id, dir_path, _gen)| (id, root_id, dir_path)))
+    }
+
+    /// Atomically claims the oldest unclaimed directory for a worker along
+    /// with the `generation` in which it was enqueued.
+    pub fn claim_dir_with_generation(
+        &mut self,
+    ) -> Result<Option<(i64, i64, String, i64)>, StoreError> {
         self.conn
             .query_row(
                 "UPDATE crawl_queue SET claimed = 1
                  WHERE id = (SELECT id FROM crawl_queue WHERE claimed = 0 ORDER BY id LIMIT 1)
-                 RETURNING id, root_id, dir_path",
+                 RETURNING id, root_id, dir_path, generation",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(Into::into)
@@ -787,7 +887,12 @@ impl IndexStore {
             let mut fts_insert = tx.prepare_cached(
                 "INSERT INTO entries_fts(rowid, name, keywords) VALUES(?1, ?2, ?3)",
             )?;
+            let mut path_tri_delete =
+                tx.prepare_cached("DELETE FROM entries_path_tri WHERE rowid = ?1")?;
+            let mut path_tri_insert =
+                tx.prepare_cached("INSERT INTO entries_path_tri(rowid, path) VALUES(?1, ?2)")?;
             for (id, name, ext, app_target, new_path) in descendants {
+                let path_lower = new_path.to_lowercase();
                 update_path.execute(params![id, new_path])?;
                 let keywords = fts_keywords(&EntryRecord {
                     root_id: 0,
@@ -800,6 +905,8 @@ impl IndexStore {
                 });
                 fts_delete.execute(params![id])?;
                 fts_insert.execute(params![id, name, keywords])?;
+                path_tri_delete.execute(params![id])?;
+                path_tri_insert.execute(params![id, path_lower])?;
             }
         }
         tx.commit()?;
@@ -1549,6 +1656,54 @@ impl IndexStore {
         let mut stmt = self.conn.prepare("SELECT id FROM entries ORDER BY id")?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Returns non-missing entry ids matching the given `apps_only`,
+    /// `exclude_apps`, and `kinds` filters. Used to pre-filter semantic vector
+    /// candidates before top-k truncation so filtered queries stay bounded.
+    pub fn matching_entry_ids(
+        &self,
+        apps_only: bool,
+        exclude_apps: bool,
+        kinds: &[crate::model::HitKind],
+    ) -> Result<Vec<i64>, StoreError> {
+        let mut sql = String::from(
+            "SELECT id, path, ext, is_dir, is_app FROM entries WHERE missing = 0",
+        );
+        if apps_only {
+            sql.push_str(" AND is_app = 1");
+        }
+        if exclude_apps {
+            sql.push_str(" AND is_app = 0");
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?;
+        let mut ids = Vec::new();
+        for r in rows {
+            let (id, path, ext, is_dir, is_app) = r?;
+            if !kinds.is_empty() {
+                let kind = if is_app {
+                    crate::model::HitKind::Application
+                } else if is_dir {
+                    crate::model::HitKind::Folder
+                } else {
+                    crate::model::kind_for_path_and_ext(&path, &ext).hit_kind()
+                };
+                if !kinds.contains(&kind) {
+                    continue;
+                }
+            }
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Deletes every segment of one kind (model-swap purge path). Returns the

@@ -399,7 +399,7 @@ impl VectorIndex {
         });
 
         let stride = self.dim * 2;
-        let mut hits = Vec::with_capacity(self.ids.len().min(top_k * 2));
+        let mut hits = Vec::with_capacity(self.ids.len().min(top_k.saturating_mul(2)));
         for slot in 0..self.ids.len() {
             if let Some(f) = filter {
                 if !f.matches_kind(&self.kinds[slot]) {
