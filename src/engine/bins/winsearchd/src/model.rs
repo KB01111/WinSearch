@@ -1,0 +1,691 @@
+//! Embedding-model lifecycle for `winsearchd`: download/import run on a
+//! single background thread (the engine is `std::thread`-only), progress is
+//! shared through a mutex snapshot, and completion pushes `model_status` to
+//! all IPC clients through a notifier installed by `main.rs`.
+//!
+//! The on-disk truth lives in [`ws_modelmgr::ModelManager`]; this service
+//! adds the in-flight dimension (downloading/paused/error) plus the DB
+//! compat record (`meta` key `embedding_model`). A stored record whose model
+//! id or embedding width differs from the manifest invalidates every stored
+//! vector — [`ModelService::check_compat`] reports that; the re-embed queue
+//! that acts on it lands with the semantic pipeline (Tasks P3.4/P3.5), which
+//! is also where vectors first exist.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tracing::{info, warn};
+use ws_modelmgr::{
+    DownloadError, ManagerError, ModelCompat, ModelManager, ModelState, ModelStatus,
+    EMBEDDING_MODEL_META_KEY,
+};
+use ws_protocol::ServerMessage;
+
+use crate::indexer::Indexer;
+
+/// Pushes a server message to all connected clients (wired to
+/// `EngineService::push_to_all` in `main.rs`; unset in unit tests).
+pub type PushFn = Arc<dyn Fn(ServerMessage) + Send + Sync>;
+
+/// Minimum interval between progress pushes (the counter itself updates per
+/// chunk; only the broadcast is throttled).
+const PUSH_THROTTLE: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Download,
+    Import,
+}
+
+struct ActiveOp {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    Ok,
+    Cancelled,
+    Failed(String),
+}
+
+/// Typed worker result: cancellation is matched on the error variant, never
+/// on message text, so an unrelated failure that merely mentions "cancelled"
+/// cannot be misclassified as a clean cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpError {
+    Cancelled,
+    Failed(String),
+}
+
+impl OpError {
+    fn from_download(e: DownloadError) -> Self {
+        match e {
+            DownloadError::Cancelled(..) => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+
+    fn from_manager(e: ManagerError) -> Self {
+        match e {
+            ManagerError::Download(DownloadError::Cancelled(..)) => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+/// What the stored compat record says about the current manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompatCheck {
+    /// No record yet (fresh database): nothing to invalidate.
+    NoRecord,
+    /// Stored vectors (once they exist) are still usable.
+    Compatible,
+    /// Model id or embedding width changed: vectors must be re-embedded.
+    Incompatible(ModelCompat),
+}
+
+pub struct ModelService {
+    manager: ModelManager,
+    indexer: Arc<Indexer>,
+    active: Mutex<Option<ActiveOp>>,
+    next_op_id: Mutex<u64>,
+    /// Live byte counters while an op runs.
+    progress: Mutex<ModelStatus>,
+    /// Terminal state of the last op (cleared when the next one starts).
+    outcome: Mutex<Option<Outcome>>,
+    notifier: Mutex<Option<PushFn>>,
+}
+
+impl ModelService {
+    pub fn new(model_dir: PathBuf, indexer: Arc<Indexer>) -> Arc<Self> {
+        Self::with_manager(ModelManager::new(model_dir), indexer)
+    }
+
+    pub fn with_manager(manager: ModelManager, indexer: Arc<Indexer>) -> Arc<Self> {
+        let this = Arc::new(Self {
+            manager,
+            indexer,
+            active: Mutex::new(None),
+            next_op_id: Mutex::new(1),
+            progress: Mutex::new(ModelStatus::default()),
+            outcome: Mutex::new(None),
+            notifier: Mutex::new(None),
+        });
+        // A changed model id or embedding width invalidates every stored
+        // vector. No vectors exist before Task P3.4, so today this is an
+        // honest log line; the semantic pipeline turns it into a re-embed
+        // queue (Tasks P3.4/P3.5 consume `check_compat`).
+        match this.check_compat() {
+            Ok(CompatCheck::Incompatible(stored)) => warn!(
+                model_id = %stored.model_id,
+                embedding_dim = stored.embedding_dim,
+                "embedding model changed: stored vectors (if any) must be re-embedded"
+            ),
+            Err(e) => warn!(error = %e, "cannot read embedding compat record"),
+            _ => {}
+        }
+        this
+    }
+
+    pub fn set_notifier(&self, push: PushFn) {
+        *self.notifier.lock().unwrap_or_else(|p| p.into_inner()) = Some(push);
+    }
+
+    fn push(&self, status: &ModelStatus) {
+        let push = self.notifier.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(push) = push {
+            push(ServerMessage::ModelStatus {
+                id: None,
+                status: status.clone(),
+            });
+        }
+    }
+
+    /// Current lifecycle snapshot: live progress while an op runs, the
+    /// terminal error after a failure, otherwise the filesystem truth.
+    pub fn status(&self) -> ModelStatus {
+        if self.active.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            return self.progress.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        }
+        if let Some(Outcome::Failed(msg)) = self.outcome.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            let mut s = self.manager.status();
+            s.state = ModelState::Error;
+            s.error = Some(msg);
+            return s;
+        }
+        self.manager.status()
+    }
+
+    /// Starts (or resumes) the download. Idempotent while running: returns
+    /// the live snapshot instead of spawning a second thread.
+    pub fn start_download(self: &Arc<Self>) -> ModelStatus {
+        self.start_op(OpKind::Download, None)
+    }
+
+    /// Signals the running op to stop; partial files stay for resume.
+    /// No-op when idle.
+    pub fn cancel_download(&self) -> ModelStatus {
+        if let Some(op) = self.active.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            info!("cancelling model operation");
+            op.cancel.store(true, Ordering::Relaxed);
+        }
+        self.status()
+    }
+
+    /// Imports from a local path on the background thread (copies can be
+    /// hundreds of MB; never block the IPC loop on them).
+    pub fn start_import(self: &Arc<Self>, path: PathBuf) -> Result<ModelStatus, String> {
+        self.start_op_result(OpKind::Import, Some(path))
+    }
+
+    /// Deletes the model files. Refused while an op runs.
+    pub fn delete(&self) -> Result<ModelStatus, String> {
+        if self.active.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            return Err("a model download/import is already running".into());
+        }
+        *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let status = self.manager.delete().map_err(|e| e.to_string())?;
+        info!("model files deleted");
+        self.push(&status);
+        Ok(status)
+    }
+
+    /// Compares the stored compat record against this build's manifest.
+    pub fn check_compat(&self) -> Result<CompatCheck, String> {
+        let raw = self.indexer.meta_get(EMBEDDING_MODEL_META_KEY).map_err(|e| e.to_string())?;
+        let Some(raw) = raw else {
+            return Ok(CompatCheck::NoRecord);
+        };
+        let Some(stored) = ModelCompat::from_json(&raw) else {
+            // Unparseable record: fail closed (vectors untrusted).
+            warn!("unparseable embedding_model compat record; treating as incompatible");
+            return Ok(CompatCheck::Incompatible(ModelCompat::current()));
+        };
+        if ModelCompat::current().is_compatible_with(&stored) {
+            Ok(CompatCheck::Compatible)
+        } else {
+            Ok(CompatCheck::Incompatible(stored))
+        }
+    }
+
+    fn start_op(self: &Arc<Self>, kind: OpKind, path: Option<PathBuf>) -> ModelStatus {
+        self.start_op_result(kind, path)
+            .unwrap_or_else(|e| ModelStatus {
+                state: ModelState::Error,
+                error: Some(e),
+                ..self.manager.status()
+            })
+    }
+
+    fn start_op_result(
+        self: &Arc<Self>,
+        kind: OpKind,
+        path: Option<PathBuf>,
+    ) -> Result<ModelStatus, String> {
+        if self.active.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            return match kind {
+                // A second start is the same resumable work: idempotent.
+                OpKind::Download => Ok(self.status()),
+                // Import is not idempotent (it copies), so a concurrent
+                // import is refused and surfaces as Error{invalid_request}.
+                OpKind::Import => Err("a model download/import is already running".into()),
+            };
+        }
+        if kind == OpKind::Import && path.is_none() {
+            return Err("import needs a local path".into());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let id = {
+            let mut next = self.next_op_id.lock().unwrap_or_else(|p| p.into_inner());
+            let id = *next;
+            *next += 1;
+            id
+        };
+        *self.active.lock().unwrap_or_else(|p| p.into_inner()) = Some(ActiveOp {
+            id,
+            cancel: Arc::clone(&cancel),
+        });
+        *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let total = self.manager.total_bytes();
+        *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = ModelStatus {
+            state: ModelState::Downloading,
+            total_bytes: total,
+            ..Default::default()
+        };
+
+        let this = Arc::clone(self);
+        let started = self.status();
+        self.push(&started);
+        std::thread::Builder::new()
+            .name("winsearch-model".into())
+            .spawn(move || this.run_op(id, kind, path.as_deref(), &cancel))
+            .map_err(|e| format!("cannot spawn model thread: {e}"))?;
+        info!(?kind, "model operation started");
+        Ok(started)
+    }
+
+    fn run_op(&self, id: u64, kind: OpKind, path: Option<&Path>, cancel: &AtomicBool) {
+        let last_push = Mutex::new(Instant::now());
+        let progress_cb = |downloaded: u64, total: u64| {
+            let snapshot = ModelStatus {
+                state: ModelState::Downloading,
+                bytes: downloaded,
+                total_bytes: total,
+                error: None,
+            };
+            *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = snapshot.clone();
+            let mut last = last_push.lock().unwrap_or_else(|p| p.into_inner());
+            if last.elapsed() >= PUSH_THROTTLE {
+                *last = Instant::now();
+                self.push(&snapshot);
+            }
+        };
+
+        let result: Result<(), OpError> = match kind {
+            OpKind::Download => self
+                .manager
+                .download_all(&progress_cb, cancel)
+                .map_err(OpError::from_download),
+            OpKind::Import => {
+                let path = path.expect("import path checked at start");
+                self.manager
+                    .import(path, cancel)
+                    .map(|_| ())
+                    .map_err(OpError::from_manager)
+            }
+        };
+
+        // Only the op that is still current may clear the slot (a newer op
+        // never exists while one runs, but the id makes that invariant
+        // explicit rather than assumed).
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.as_ref().is_some_and(|op| op.id == id) {
+            *active = None;
+        }
+        drop(active);
+
+        match result {
+            Ok(()) => {
+                *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(Outcome::Ok);
+                if let Err(e) = self.record_compat() {
+                    warn!(error = %e, "cannot write embedding compat record");
+                }
+                let status = self.manager.status();
+                info!("model operation complete: {:?}", status.state);
+                self.push(&status);
+            }
+            Err(OpError::Cancelled) => {
+                *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(Outcome::Cancelled);
+                // Downloads keep `.part` files (state: paused); cancelled
+                // imports leave no residue (state: not_downloaded).
+                let status = self.manager.status();
+                info!("model operation cancelled");
+                self.push(&status);
+            }
+            Err(OpError::Failed(msg)) => {
+                *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(Outcome::Failed(msg.clone()));
+                warn!(error = %msg, "model operation failed");
+                self.push(&self.status());
+            }
+        }
+    }
+
+    fn record_compat(&self) -> Result<(), String> {
+        self.indexer
+            .meta_set(EMBEDDING_MODEL_META_KEY, &ModelCompat::current().to_json())
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::sync::Mutex as StdMutex;
+    use ws_index::IndexStore;
+    use ws_modelmgr::{DownloadOptions, ExpectedFile};
+
+    fn test_indexer() -> Arc<Indexer> {
+        let store = IndexStore::open_in_memory().unwrap();
+        Indexer::open(store, &[]).unwrap()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "winsearch-model-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Tiny fixture server: serves fixed blobs per file name, honoring
+    /// `Range`, with an optional per-KB drip delay for cancel tests.
+    struct Fixture {
+        base_url: String,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Fixture {
+        fn serve(files: HashMap<String, Vec<u8>>, drip: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let thread = std::thread::Builder::new()
+                .name("winsearch-model-fixture".into())
+                .spawn(move || {
+                    for stream in listener.incoming().take(32) {
+                        let mut stream = match stream {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        let mut head = vec![0u8; 4096];
+                        let n = std::io::Read::read(&mut stream, &mut head).unwrap_or(0);
+                        head.truncate(n);
+                        let head = String::from_utf8_lossy(&head).into_owned();
+                        let mut range: Option<usize> = None;
+                        for line in head.lines().skip(1) {
+                            if line.is_empty() {
+                                break;
+                            }
+                            if let Some(v) = line
+                                .strip_prefix("Range:")
+                                .or_else(|| line.strip_prefix("range:"))
+                            {
+                                range = v
+                                    .trim()
+                                    .strip_prefix("bytes=")
+                                    .and_then(|r| r.strip_suffix('-'))
+                                    .and_then(|s| s.parse().ok());
+                            }
+                        }
+                        let path = head
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("/")
+                            .trim_start_matches('/')
+                            .to_string();
+                        let body = files.get(&path).cloned().unwrap_or_default();
+                        if !files.contains_key(&path) {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                            continue;
+                        }
+                        let start = range.unwrap_or(0).min(body.len());
+                        let slice = &body[start..];
+                        let status = if range.is_some() {
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\n",
+                                body.len().saturating_sub(1),
+                                body.len()
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\n".to_string()
+                        };
+                        let header = format!(
+                            "{status}Content-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        );
+                        if stream.write_all(header.as_bytes()).is_err() {
+                            continue;
+                        }
+                        for piece in slice.chunks(1024) {
+                            if stream.write_all(piece).is_err() {
+                                break;
+                            }
+                            if drip > Duration::ZERO {
+                                std::thread::sleep(drip);
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+            Self {
+                base_url,
+                _thread: thread,
+            }
+        }
+    }
+
+    /// A service wired to tiny stand-in files served by `fx`.
+    fn tiny_service(
+        dir: PathBuf,
+        fx: &Fixture,
+        blobs: &[(String, Vec<u8>)],
+    ) -> Arc<ModelService> {
+        use sha2::{Digest, Sha256};
+        let files: Vec<ExpectedFile> = blobs
+            .iter()
+            .map(|(name, body)| ExpectedFile {
+                // Leaked: tests are short-lived; the manifest borrows static.
+                name: Box::leak(name.clone().into_boxed_str()),
+                size: body.len() as u64,
+                sha256: Some(Box::leak(
+                    format!("{:x}", Sha256::digest(body)).into_boxed_str(),
+                )),
+            })
+            .collect();
+        let options = DownloadOptions {
+            base_url_override: Some(fx.base_url.clone()),
+            ..DownloadOptions::default()
+        };
+        let manager = ModelManager::with_files(dir, options, files);
+        ModelService::with_manager(manager, test_indexer())
+    }
+
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while !cond() {
+            if start.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    #[test]
+    fn compat_record_written_and_checked() {
+        let service = ModelService::new(temp_dir("compat"), test_indexer());
+
+        assert_eq!(service.check_compat().unwrap(), CompatCheck::NoRecord);
+
+        // Simulate a finished download's bookkeeping.
+        service.record_compat().unwrap();
+        assert_eq!(service.check_compat().unwrap(), CompatCheck::Compatible);
+
+        // An incompatible record is detected (vectors would be invalidated).
+        service
+            .indexer
+            .meta_set(
+                EMBEDDING_MODEL_META_KEY,
+                &ModelCompat {
+                    embedding_dim: 384,
+                    ..ModelCompat::current()
+                }
+                .to_json(),
+            )
+            .unwrap();
+        assert!(matches!(
+            service.check_compat().unwrap(),
+            CompatCheck::Incompatible(_)
+        ));
+    }
+
+    #[test]
+    fn cancel_without_active_op_is_noop() {
+        let service = ModelService::new(temp_dir("idle-cancel"), test_indexer());
+        assert_eq!(service.status().state, ModelState::NotDownloaded);
+        assert_eq!(service.cancel_download().state, ModelState::NotDownloaded);
+    }
+
+    #[test]
+    fn cancelled_word_in_other_errors_is_not_cancel() {
+        // A failure that merely mentions "cancelled" must stay a failure.
+        let e = OpError::from_download(DownloadError::Http("upstream cancelled by admin".into()));
+        assert!(matches!(e, OpError::Failed(_)), "got {e:?}");
+        let e = OpError::from_manager(ManagerError::Import("source cancelled mid-read".into()));
+        assert!(matches!(e, OpError::Failed(_)), "got {e:?}");
+        // ...while the real variants still classify as cancel.
+        assert_eq!(
+            OpError::from_download(DownloadError::Cancelled(1, 2)),
+            OpError::Cancelled
+        );
+        assert_eq!(
+            OpError::from_manager(ManagerError::Download(DownloadError::Cancelled(3, 4))),
+            OpError::Cancelled
+        );
+    }
+
+    #[test]
+    fn busy_import_refused_while_download_runs() {
+        let body = vec![5u8; 512 * 1024];
+        let blobs = vec![("slow-busy.gguf".to_string(), body)];
+        let files: HashMap<String, Vec<u8>> = blobs.iter().cloned().collect();
+        let fx = Fixture::serve(files, Duration::from_millis(2));
+        let dir = temp_dir("svc-busy-import");
+        let service = tiny_service(dir.clone(), &fx, &blobs);
+
+        service.start_download();
+        assert!(wait_until(Duration::from_secs(10), || service.status().bytes > 0));
+        // Refused (engine maps this to Error{invalid_request}), not merged.
+        let err = service.start_import(dir.join("whatever.gguf")).unwrap_err();
+        assert!(err.contains("already running"), "got {err}");
+        service.cancel_download();
+        assert!(
+            wait_until(Duration::from_secs(10), || service.status().state == ModelState::Paused),
+            "cancel never settled, got {:?}",
+            service.status()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn busy_second_import_refused_while_import_runs() {
+        // 96 MB: the first import is still copying when the second arrives
+        // (copy + debug-build hashing take seconds).
+        let body = vec![7u8; 96 * 1024 * 1024];
+        let blobs = vec![("huge.gguf".to_string(), body)];
+        let fx = Fixture::serve(HashMap::new(), Duration::ZERO);
+        let srcdir = temp_dir("svc-import-big-src");
+        std::fs::write(srcdir.join("huge.gguf"), &blobs[0].1).unwrap();
+        let dir = temp_dir("svc-import-big");
+        let service = tiny_service(dir.clone(), &fx, &blobs);
+
+        let first = service.start_import(srcdir.join("huge.gguf")).unwrap();
+        assert_eq!(first.state, ModelState::Downloading);
+        // A concurrent import is refused...
+        let err = service.start_import(srcdir.join("huge.gguf")).unwrap_err();
+        assert!(err.contains("already running"), "got {err}");
+        // ...while a download start stays idempotent-ok (no second thread).
+        assert_eq!(service.start_download().state, ModelState::Downloading);
+
+        // The first import still completes byte-identical with compat written.
+        assert!(
+            wait_until(Duration::from_secs(90), || service.status().state == ModelState::Ready),
+            "import never reached ready, got {:?}",
+            service.status()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("huge.gguf")).unwrap(),
+            std::fs::read(srcdir.join("huge.gguf")).unwrap()
+        );
+        assert_eq!(service.check_compat().unwrap(), CompatCheck::Compatible);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&srcdir);
+    }
+
+    #[test]
+    fn delete_while_idle_clears_files() {
+        let dir = temp_dir("delete");
+        let service = ModelService::new(dir.clone(), test_indexer());
+        std::fs::write(dir.join(ws_modelmgr::TEXT_FILE), b"x").unwrap();
+        let s = service.delete().unwrap();
+        assert_eq!(s.state, ModelState::NotDownloaded);
+        assert!(!dir.join(ws_modelmgr::TEXT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_download_thread_reports_ready_and_writes_compat() {
+        let blobs = vec![
+            ("tiny-a.gguf".to_string(), vec![9u8; 8192]),
+            ("tiny-b.gguf".to_string(), vec![3u8; 16384]),
+        ];
+        let files: HashMap<String, Vec<u8>> = blobs.iter().cloned().collect();
+        let fx = Fixture::serve(files, Duration::ZERO);
+        let dir = temp_dir("svc-full");
+        let service = tiny_service(dir.clone(), &fx, &blobs);
+
+        let pushes: Arc<StdMutex<Vec<ModelStatus>>> = Arc::new(StdMutex::new(Vec::new()));
+        let pushes2 = Arc::clone(&pushes);
+        service.set_notifier(Arc::new(move |msg: ServerMessage| {
+            if let ServerMessage::ModelStatus { status, .. } = msg {
+                pushes2.lock().unwrap().push(status);
+            }
+        }));
+
+        let started = service.start_download();
+        assert_eq!(started.state, ModelState::Downloading);
+        // Second start while running is idempotent (no second thread).
+        assert_eq!(service.start_download().state, ModelState::Downloading);
+
+        assert!(
+            wait_until(Duration::from_secs(30), || service.status().state == ModelState::Ready),
+            "download never reached ready"
+        );
+        assert_eq!(service.check_compat().unwrap(), CompatCheck::Compatible);
+        // Start + completion pushes arrived (progress pushes are throttled).
+        let pushes = pushes.lock().unwrap();
+        assert!(pushes.iter().any(|s| s.state == ModelState::Downloading));
+        assert!(pushes.iter().any(|s| s.state == ModelState::Ready));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_mid_download_then_resume_to_ready() {
+        let body = vec![5u8; 512 * 1024];
+        let blobs = vec![("slow.gguf".to_string(), body.clone())];
+        let files: HashMap<String, Vec<u8>> = blobs.iter().cloned().collect();
+        // ~1 s for the whole blob: the cancel below lands mid-stream.
+        let fx = Fixture::serve(files, Duration::from_millis(2));
+        let dir = temp_dir("svc-resume");
+        let service = tiny_service(dir.clone(), &fx, &blobs);
+
+        service.start_download();
+        assert!(wait_until(Duration::from_secs(10), || {
+            service.status().bytes > 0
+        }));
+        service.cancel_download();
+        assert!(
+            wait_until(Duration::from_secs(10), || service.status().state == ModelState::Paused),
+            "cancel never settled to paused, got {:?}",
+            service.status()
+        );
+        assert!(dir.join("slow.gguf.part").exists());
+
+        // Resume on a fresh op completes byte-identical.
+        service.start_download();
+        assert!(
+            wait_until(Duration::from_secs(30), || service.status().state == ModelState::Ready),
+            "resume never reached ready"
+        );
+        assert_eq!(std::fs::read(dir.join("slow.gguf")).unwrap(), body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

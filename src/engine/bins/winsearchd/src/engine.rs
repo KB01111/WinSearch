@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 use ws_index::model::{SearchRequest, HitKind};
 use ws_index::{evaluate, search_settings};
+use ws_platform::paths;
 use ws_platform::pipe::PipeStream;
 use ws_protocol::{
     write_message, EngineRunState, EngineStatus, FrameError, MatchLocation, RequestId, ResultKind,
@@ -20,6 +21,7 @@ use ws_protocol::{
 };
 
 use crate::indexer::Indexer;
+use crate::model::ModelService;
 
 /// A connected client that can receive pushed messages.
 #[derive(Clone)]
@@ -49,12 +51,19 @@ pub struct EngineService {
     cancels: Mutex<HashMap<RequestId, Arc<AtomicBool>>>,
     next_client_id: std::sync::atomic::AtomicU64,
     indexer: Arc<Indexer>,
+    models: Arc<ModelService>,
 }
 
 pub type SharedEngine = Arc<EngineService>;
 
 impl EngineService {
     pub fn new(indexer: Arc<Indexer>) -> SharedEngine {
+        Self::new_with_model_dir(indexer, paths::model_dir())
+    }
+
+    /// Test hook: same engine with an isolated model directory.
+    pub fn new_with_model_dir(indexer: Arc<Indexer>, model_dir: std::path::PathBuf) -> SharedEngine {
+        let models = ModelService::new(model_dir, Arc::clone(&indexer));
         Arc::new(Self {
             status: Mutex::new(EngineStatus {
                 state: EngineRunState::Idle,
@@ -65,7 +74,12 @@ impl EngineService {
             cancels: Mutex::new(HashMap::new()),
             next_client_id: std::sync::atomic::AtomicU64::new(1),
             indexer,
+            models,
         })
+    }
+
+    pub fn model_service(&self) -> &Arc<ModelService> {
+        &self.models
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -118,6 +132,12 @@ impl EngineService {
     }
 
     fn broadcast(&self, msg: &ServerMessage) {
+        self.push_to_all(msg);
+    }
+
+    /// Sends one message to every connected client (used by the model
+    /// service's progress pushes as well as status broadcasts).
+    pub fn push_to_all(&self, msg: &ServerMessage) {
         let clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         for client in clients.iter() {
             if let Err(e) = client.send(msg) {
@@ -151,6 +171,60 @@ impl EngineService {
         {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+
+    // ---- model management (P3.3) ----
+
+    fn answer_model_status(&self, client: &ClientHandle, id: RequestId) {
+        let _ = client.send(&ServerMessage::ModelStatus {
+            id: Some(id),
+            status: self.models.status(),
+        });
+    }
+
+    pub fn model_download_start(&self, client: &ClientHandle, id: RequestId) {
+        self.models.start_download();
+        self.answer_model_status(client, id);
+    }
+
+    pub fn model_download_cancel(&self, client: &ClientHandle, id: RequestId) {
+        self.models.cancel_download();
+        self.answer_model_status(client, id);
+    }
+
+    pub fn model_import(&self, client: &ClientHandle, id: RequestId, path: String) {
+        match self.models.start_import(std::path::PathBuf::from(path)) {
+            Ok(_) => self.answer_model_status(client, id),
+            Err(e) => {
+                let _ = client.send(&ServerMessage::Error {
+                    id: Some(id),
+                    code: ws_protocol::ErrorCode::InvalidRequest,
+                    message: e,
+                });
+            }
+        }
+    }
+
+    pub fn model_delete(&self, client: &ClientHandle, id: RequestId) {
+        match self.models.delete() {
+            Ok(status) => {
+                let _ = client.send(&ServerMessage::ModelStatus {
+                    id: Some(id),
+                    status,
+                });
+            }
+            Err(e) => {
+                let _ = client.send(&ServerMessage::Error {
+                    id: Some(id),
+                    code: ws_protocol::ErrorCode::InvalidRequest,
+                    message: e,
+                });
+            }
+        }
+    }
+
+    pub fn model_status(&self, client: &ClientHandle, id: RequestId) {
+        self.answer_model_status(client, id);
     }
 
     /// Executes one search, streaming result batches to the client. Exact

@@ -40,9 +40,26 @@ WinSearch incorporates or references the following third-party software.
    Usage:    Error handling and logging in the engine.
 
 7. .NET / Windows App SDK / CommunityToolkit.Mvvm
-   Project:  https://dotnet.microsoft.com/
-             https://github.com/microsoft/WindowsAppSDK
-             https://github.com/CommunityToolkit/dotnet
-   License:  MIT
-   Usage:    WinUI 3 frontend (referenced as NuGet packages; not
-             redistributed in this repository).
+    Project:  https://dotnet.microsoft.com/
+              https://github.com/microsoft/WindowsAppSDK
+              https://github.com/CommunityToolkit/dotnet
+    License:  MIT
+    Usage:    WinUI 3 frontend (referenced as NuGet packages; not
+              redistributed in this repository).
+
+8. ureq (with rustls)
+    Project:  https://github.com/algesten/ureq
+    License:  MIT OR Apache-2.0
+    Usage:    Embedding-model download in ws-modelmgr (blocking HTTP with
+              Range resume; TLS via rustls with platform roots).
+
+9. rustls
+    Project:  https://github.com/rustls/rustls
+    License:  MIT OR Apache-2.0 OR ISC
+    Usage:    TLS for model downloads (pulled in via ureq).
+
+10. sha2, hex
+    Project:  https://github.com/RustCrypto/hashes (sha2)
+              https://github.com/KokaKiwi/rust-hex (hex)
+    License:  MIT OR Apache-2.0
+    Usage:    SHA-256 verification of downloaded/imported model files.

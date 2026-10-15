@@ -7,6 +7,7 @@ mod catalog;
 mod crawl;
 mod engine;
 mod indexer;
+mod model;
 mod server;
 mod watcher;
 
@@ -60,6 +61,15 @@ fn main() -> anyhow::Result<()> {
     let pipe_name = identity::pipe_name()?;
     let engine = EngineService::new(Arc::clone(&indexer));
     spawn_status_pusher(Arc::clone(&engine));
+    // Model progress/completion pushes fan out to every connected client.
+    {
+        let weak = Arc::downgrade(&engine);
+        engine.model_service().set_notifier(Arc::new(move |msg| {
+            if let Some(engine) = weak.upgrade() {
+                engine.push_to_all(&msg);
+            }
+        }));
+    }
     let handler_engine = Arc::clone(&engine);
 
     info!(pipe = %pipe_name, "serving IPC");

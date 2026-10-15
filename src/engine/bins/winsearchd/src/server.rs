@@ -111,6 +111,21 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
                     status: engine.status(),
                 });
             }
+            ClientMessage::ModelDownloadStart { id } => {
+                engine.model_download_start(&client, id);
+            }
+            ClientMessage::ModelDownloadCancel { id } => {
+                engine.model_download_cancel(&client, id);
+            }
+            ClientMessage::ModelImport { id, path } => {
+                engine.model_import(&client, id, path);
+            }
+            ClientMessage::ModelDelete { id } => {
+                engine.model_delete(&client, id);
+            }
+            ClientMessage::GetModelStatus { id } => {
+                engine.model_status(&client, id);
+            }
         }
     }
 

@@ -544,6 +544,29 @@ impl IndexStore {
         Ok(n > 0)
     }
 
+    // ---- meta (unversioned key/value records, e.g. embedding compat) ----
+
+    /// Reads a `meta` value (e.g. the `embedding_model` compat record).
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Upserts a `meta` value. Additive by design: new keys never disturb
+    /// existing rows, and `schema_version` handling is untouched.
+    pub fn meta_set(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     // ---- checkpoints ----
 
     pub fn set_checkpoint(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
@@ -784,6 +807,25 @@ mod tests {
         store.set_checkpoint("phase", "crawling").unwrap();
         store.set_checkpoint("phase", "done").unwrap();
         assert_eq!(store.checkpoint("phase").unwrap().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn meta_round_trip_is_additive() {
+        let (mut store, _root) = setup();
+        assert_eq!(store.meta_get("embedding_model").unwrap(), None);
+        store.meta_set("embedding_model", r#"{"model_id":"x","embedding_dim":768}"#).unwrap();
+        assert_eq!(
+            store.meta_get("embedding_model").unwrap().as_deref(),
+            Some(r#"{"model_id":"x","embedding_dim":768}"#)
+        );
+        // Overwrite + unrelated keys coexist (schema_version untouched).
+        store.meta_set("embedding_model", "{}").unwrap();
+        store.meta_set("other_key", "1").unwrap();
+        assert_eq!(store.meta_get("embedding_model").unwrap().as_deref(), Some("{}"));
+        assert_eq!(
+            store.meta_get("schema_version").unwrap().as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
