@@ -2,6 +2,7 @@
 //! data paths, current-user identity, and single-instance guards.
 
 pub mod identity;
+pub mod ifilter;
 pub mod paths;
 pub mod pipe;
 pub mod single_instance;

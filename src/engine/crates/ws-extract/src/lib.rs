@@ -3,6 +3,7 @@
 
 pub mod budget;
 pub mod chunk;
+pub mod docs;
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,7 @@ pub use chunk::{
     chunk_text, chunk_text_default, chunk_text_with_lines, select_excerpt, TextChunk,
     DEFAULT_CHUNK_CHARS, DEFAULT_EXCERPT_CHARS, DEFAULT_OVERLAP_CHARS, DEFAULT_OVERLAP_RATIO,
 };
+pub use docs::{build_document_output, is_numeric_dominated, strip_rtf, DocumentExtractor};
 
 /// Outcome status of running an [`Extractor`] on a file.
 #[derive(Debug, Clone, PartialEq, Eq)]

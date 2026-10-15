@@ -68,3 +68,15 @@ WinSearch incorporates or references the following third-party software.
               https://github.com/KokaKiwi/rust-hex (hex)
     License:  MIT OR Apache-2.0
     Usage:    SHA-256 verification of downloaded/imported model files.
+
+11. quick-xml
+    Project:  https://github.com/tafia/quick-xml
+    License:  MIT
+    Usage:    Streaming XML/HTML text extraction for `.html`, `.xml`, `.docx`,
+              and `.odt` documents in ws-extract.
+
+12. zip
+    Project:  https://github.com/zip-rs/zip2
+    License:  MIT
+    Usage:    Archive reading for `.docx` and `.odt` document containers in
+              ws-extract.

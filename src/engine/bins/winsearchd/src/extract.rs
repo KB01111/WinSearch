@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tracing::warn;
 use ws_extract::{
-    ExtractBudget, ExtractError, ExtractOutput, ExtractionStatus, Extractor, PlainTextExtractor,
+    DocumentExtractor, ExtractBudget, ExtractError, ExtractOutput, ExtractionStatus, Extractor,
     SegmentDraft,
 };
 use ws_index::model::{NewSegment, SEGMENT_KIND_DOC};
@@ -61,10 +61,14 @@ impl Default for ExtractorRegistry {
             extractors: HashMap::new(),
             budget_factory: Box::new(|_kind| ExtractBudget::default()),
         };
-        reg.register(SEGMENT_KIND_DOC, Arc::new(PlainTextExtractor));
+        reg.register(SEGMENT_KIND_DOC, Arc::new(DocumentExtractor));
         reg
     }
 }
+
+/// Alias for [`ExtractorRegistry`].
+#[allow(dead_code)]
+pub type ExtractionPool = ExtractorRegistry;
 
 impl ExtractorRegistry {
     /// Registers (or replaces) the extractor for `kind`.
@@ -625,6 +629,48 @@ mod tests {
         assert!(third.poisoned);
         assert!(matches!(third.status, Some(ExtractionStatus::Failed(_))));
         assert_eq!(indexer.content_extract_queue_depth().unwrap(), 0);
+    }
+
+    #[test]
+    fn numeric_heavy_csv_indexes_fts_without_storing_vectors() {
+        let tree = TempTree::new();
+        let mut csv = String::from("invoice_id,date,subtotal,tax,total\n");
+        for i in 1..=25 {
+            csv.push_str(&format!(
+                "{},2026-10-{:02},{:.2},{:.2},{:.2}\n",
+                98000 + i,
+                (i % 28) + 1,
+                i as f64 * 100.0,
+                i as f64 * 19.0,
+                i as f64 * 119.0
+            ));
+        }
+        fs::write(tree.0.join("invoices.csv"), &csv).unwrap();
+
+        let indexer = seeded_indexer(&tree);
+        let registry = ExtractorRegistry::default();
+        let out = indexer.extract_once_with(&registry, fake_embed).unwrap();
+        assert!(out.claimed);
+        assert_eq!(out.status, Some(ExtractionStatus::ExactOnly));
+        assert_eq!(out.segments_stored, 0, "numeric CSV must not store vectors");
+        assert!(out.fts_chunks_indexed >= 1, "numeric CSV must still index in FTS");
+
+        // Exact FTS search finds the invoice number inside the CSV.
+        let hits = indexer
+            .search(&SearchRequest {
+                text: "98017".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "invoices.csv");
+        assert_eq!(hits[0].explanation, "Matches extracted content");
+
+        // And zero `doc` vectors were stored for the entry.
+        let store = indexer.store_lock();
+        let segs = store.list_segments_for_entry(hits[0].entry_id).unwrap();
+        assert!(segs.iter().all(|s| s.kind != SEGMENT_KIND_DOC));
     }
 }
 

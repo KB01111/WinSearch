@@ -6,6 +6,9 @@ license.workspace = true
 description = "Content extraction, budget enforcement, and overlapping text chunking for WinSearch"
 
 [dependencies]
+quick-xml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ws-index.workspace = true
+ws-platform.workspace = true
+zip.workspace = true
