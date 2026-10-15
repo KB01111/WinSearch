@@ -1,22 +1,36 @@
 //! The indexer orchestrator: crawl workers, watcher event handling, the
-//! application catalog, and disconnected-drive reconciliation.
+//! application catalog, disconnected-drive reconciliation, and the semantic
+//! (name-embedding) pipeline.
 //!
 //! Concurrency model: a bounded pool of crawl workers pulls directory work
 //! from the crash-safe queue inside the index database; all database access
 //! is serialized through one `Mutex<IndexStore>`; watchers feed events into
-//! the same store. Nothing here blocks the IPC/serve path.
+//! the same store. The embed scheduler (P3.5) is one more `std::thread` that
+//! claims `extract_jobs(kind='name')` in batches of [`EMBED_BATCH`], embeds
+//! via the supervisor's bounded call ([`EMBED_JOB_TIMEOUT`], Task2-I1), and
+//! upserts `segments(kind='name')` idempotently. Nothing here blocks the
+//! IPC/serve path.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use tracing::{info, warn};
-use ws_index::model::{EntryRecord, SearchRequest, UpsertOutcome};
+use ws_index::model::{
+    EntryRecord, NewSegment, SearchRequest, UpsertOutcome, EMBED_BATCH_SIZE,
+    EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED, SEGMENT_KIND_NAME,
+};
 use ws_index::{HitKind, IndexStats, IndexStore, SearchHit, StoreError};
 
 use crate::catalog;
 use crate::crawl;
+use crate::embed_client::{EmbedSupervisor, EMBED_JOB_TIMEOUT};
 use crate::watcher::{self, WatchEvent, Watcher};
+
+/// One pipeline batch: up to this many names per worker round-trip (P3.5).
+/// Mirrors `ws_index::model::EMBED_BATCH_SIZE` (128, well under the 256-text
+/// worker cap so one pipeline batch is always one worker job).
+pub const EMBED_BATCH: usize = EMBED_BATCH_SIZE;
 
 /// Crawl worker count: bounded on purpose (indexing must never starve the
 /// interactive search path).
@@ -43,6 +57,21 @@ pub struct IndexerStatus {
     pub queue_depth: u64,
     pub indexing: bool,
     pub stats: IndexStats,
+    /// Name-segments stored (`segments.kind='name'` → `EngineStatus.segments_indexed`).
+    pub segments_indexed: u64,
+    /// True while name embeddings are still outstanding.
+    pub embedding: bool,
+}
+
+/// Outcome of one [`Indexer::embed_once_with`] batch (test-observable).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbedBatchOutcome {
+    /// Jobs claimed for this batch.
+    pub claimed: usize,
+    /// Segments successfully (up)inserted.
+    pub embedded: usize,
+    /// Jobs released for retry (`fail_extract_job`, attempts+1).
+    pub failed: usize,
 }
 
 struct RootInfo {
@@ -63,8 +92,13 @@ impl Indexer {
     /// Opens the index and registers the given roots (idempotent).
     pub fn open(store: IndexStore, roots: &[PathBuf]) -> Result<Arc<Self>, StoreError> {
         let mut store = store;
-        // Claims left by a crashed run become work again.
+        // Claims left by a crashed run become work again (crawl queue and
+        // embed queue alike: a crash mid-batch re-runs the idempotent work).
         store.release_claims()?;
+        let released = store.release_extract_claims()?;
+        if released > 0 {
+            info!(released, "released embed claims left by a previous run");
+        }
         let mut infos = Vec::new();
         for root in roots {
             let path = root.to_string_lossy().into_owned();
@@ -167,13 +201,59 @@ impl Indexer {
         let counters = self.counters.lock().unwrap_or_else(|p| p.into_inner());
         let queue_depth = store.queue_depth()?;
         let stats = store.stats()?;
+        let segments_indexed = store.count_segments_by_kind(SEGMENT_KIND_NAME).unwrap_or(0);
+        let embed_queue_depth = store
+            .extract_queue_depth_for_kind(SEGMENT_KIND_NAME)
+            .unwrap_or(0);
         Ok(IndexerStatus {
             files_discovered: counters.files_discovered,
             files_indexed: counters.files_indexed,
             queue_depth,
             indexing: queue_depth > 0,
             stats,
+            segments_indexed,
+            embedding: embed_queue_depth > 0,
         })
+    }
+
+    /// Name-segments stored (→ `EngineStatus.segments_indexed`).
+    pub fn segments_indexed(&self) -> Result<u64, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .count_segments_by_kind(SEGMENT_KIND_NAME)
+    }
+
+    /// Pending-or-claimed `extract_jobs(kind='name')` (embed backlog).
+    pub fn embed_queue_depth(&self) -> Result<u64, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extract_queue_depth_for_kind(SEGMENT_KIND_NAME)
+    }
+
+    /// Model-swap recovery (Task3-S4): when `check_compat` reports
+    /// `Incompatible`, purge every `segments(kind='name')` vector (they belong
+    /// to the old model) and enqueue one `extract_jobs(kind='name')` per
+    /// surviving entry so the new model re-embeds everything. Returns
+    /// `(purged_segments, enqueued_jobs)`.
+    pub fn purge_name_vectors_and_requeue(&self) -> Result<(u64, u64), StoreError> {
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let purged = store.purge_segments_by_kind(SEGMENT_KIND_NAME)?;
+        let ids = store.all_entry_ids()?;
+        let mut enqueued = 0u64;
+        for id in ids {
+            store.enqueue_extract_job_with_priority(
+                id,
+                SEGMENT_KIND_NAME,
+                EXTRACT_PRIORITY_UPDATED,
+            )?;
+            enqueued += 1;
+        }
+        if purged > 0 || enqueued > 0 {
+            info!(purged, enqueued, "purged stale name vectors; requeued for re-embed");
+        }
+        Ok((purged, enqueued))
     }
 
     // ---- crawl workers ----
@@ -269,7 +349,8 @@ impl Indexer {
 
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.current_generation(&store, root_id)?;
-        store.apply_batch(root_id, generation, &scan.entries)?;
+        let outcomes = store.apply_batch(root_id, generation, &scan.entries)?;
+        Self::enqueue_name_jobs_for_outcomes(&mut store, &scan.entries, &outcomes)?;
         for sub in &scan.subdirs {
             store.enqueue_dir(root_id, sub)?;
         }
@@ -355,6 +436,14 @@ impl Indexer {
                             .find_by_path(&parent_of(&to_str))?
                             .map(|e| e.id);
                         store.move_entry(row.id, parent_id, &to_str, &name, &ext)?;
+                        // The name changed: the stored name vector is stale.
+                        // Re-enqueue so the scheduler embeds the new name;
+                        // entry id (and its segment rows) is preserved.
+                        store.enqueue_extract_job_with_priority(
+                            row.id,
+                            SEGMENT_KIND_NAME,
+                            EXTRACT_PRIORITY_UPDATED,
+                        )?;
                         if row.is_dir {
                             store.rename_tree_paths(&from_str, &to_str)?;
                             drop(store);
@@ -416,12 +505,17 @@ impl Indexer {
 
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let generation = self.current_generation(&store, root_id)?;
-        let outcomes = store.apply_batch(root_id, generation, &[record])?;
-        for outcome in outcomes {
-            if outcome != UpsertOutcome::Unchanged {
+        let outcomes = store.apply_batch(root_id, generation, std::slice::from_ref(&record))?;
+        let mut changed = false;
+        for outcome in &outcomes {
+            if *outcome != UpsertOutcome::Unchanged {
+                changed = true;
                 let mut counters = self.counters.lock().unwrap_or_else(|p| p.into_inner());
                 counters.files_indexed += 1;
             }
+        }
+        if changed {
+            Self::enqueue_name_jobs_for_outcomes(&mut store, std::slice::from_ref(&record), &outcomes)?;
         }
         Ok(())
     }
@@ -471,10 +565,204 @@ impl Indexer {
             })
             .collect();
 
-        store.apply_batch(root_id, generation, &records)?;
+        let outcomes = store.apply_batch(root_id, generation, &records)?;
+        Self::enqueue_name_jobs_for_outcomes(&mut store, &records, &outcomes)?;
         let swept = store.sweep_generation(root_id, generation)?;
         info!(apps = records.len(), swept, "application catalog refreshed");
         Ok(())
+    }
+
+    // ---- drive supervision ----
+
+    // ---- semantic feed helper ----
+
+    /// Enqueues one `extract_jobs(kind='name')` per changed record
+    /// (`UpsertOutcome != Unchanged`). `Inserted` (new files) enqueues at
+    /// `EXTRACT_PRIORITY_NEW` so fresh discoveries jump the queue; `Updated`
+    /// uses `EXTRACT_PRIORITY_UPDATED`. LIFO within priority is the claim
+    /// order (`priority DESC, id DESC`). Must hold the store lock.
+    fn enqueue_name_jobs_for_outcomes(
+        store: &mut IndexStore,
+        records: &[EntryRecord],
+        outcomes: &[UpsertOutcome],
+    ) -> Result<(), StoreError> {
+        for (rec, outcome) in records.iter().zip(outcomes.iter()) {
+            let priority = match outcome {
+                UpsertOutcome::Unchanged => continue,
+                UpsertOutcome::Inserted => EXTRACT_PRIORITY_NEW,
+                UpsertOutcome::Updated => EXTRACT_PRIORITY_UPDATED,
+            };
+            // The upsert just wrote the row: resolve its id by path.
+            if let Some(row) = store.find_by_path(&rec.path)? {
+                store.enqueue_extract_job_with_priority(
+                    row.id,
+                    SEGMENT_KIND_NAME,
+                    priority,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- semantic pipeline (P3.5) ----
+
+    /// Runs one embed batch synchronously: claims up to [`EMBED_BATCH`]
+    /// `name` jobs, embeds their current entry names via `embed`, and upserts
+    /// one `segments(kind='name', chunk 0)` per success (replacing the prior
+    /// vector for the entry, stable segment id). Failures release their claims
+    /// (`fail_extract_job`, attempts+1) for retry. Entries deleted between
+    /// claim and write complete their job without a segment. The store lock
+    /// is never held across the embed call, so crawl workers keep moving
+    /// while a batch (or its [`EMBED_JOB_TIMEOUT`] watchdog) is in flight.
+    ///
+    /// `embed` is injectable so tests use deterministic fake vectors without
+    /// a worker process; production passes the supervisor's bounded call.
+    pub fn embed_once_with<F>(&self, embed: F) -> Result<EmbedBatchOutcome, StoreError>
+    where
+        F: Fn(&[String]) -> Result<Vec<Vec<f32>>, String>,
+    {
+        struct Claimed {
+            job_id: i64,
+            entry_id: i64,
+            name: String,
+        }
+        let claimed: Vec<Claimed> = {
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            let jobs = store.claim_extract_jobs_batch_for_kind(SEGMENT_KIND_NAME, EMBED_BATCH)?;
+            let mut out = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                match store.get_entry(job.entry_id)? {
+                    Some(row) => out.push(Claimed {
+                        job_id: job.id,
+                        entry_id: job.entry_id,
+                        name: row.name,
+                    }),
+                    None => {
+                        // Entry vanished after enqueue (delete cascades the
+                        // job row too, but a pre-claim delete can strand the
+                        // claim): drop the job, no segment.
+                        store.complete_extract_job(job.id)?;
+                    }
+                }
+            }
+            out
+        };
+        if claimed.is_empty() {
+            return Ok(EmbedBatchOutcome::default());
+        }
+        let texts: Vec<String> = claimed.iter().map(|c| c.name.clone()).collect();
+        let vecs = match embed(&texts) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, batch = claimed.len(), "embed batch failed; releasing claims for retry");
+                let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+                for c in &claimed {
+                    // Best-effort: the entry may have been deleted mid-batch
+                    // (cascade already removed the job → 0 rows touched).
+                    let _ = store.fail_extract_job(c.job_id);
+                }
+                return Ok(EmbedBatchOutcome {
+                    claimed: claimed.len(),
+                    embedded: 0,
+                    failed: claimed.len(),
+                });
+            }
+        };
+        if vecs.len() != claimed.len() {
+            warn!(got = vecs.len(), want = claimed.len(), "embed arity mismatch; releasing batch for retry");
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            for c in &claimed {
+                let _ = store.fail_extract_job(c.job_id);
+            }
+            return Ok(EmbedBatchOutcome {
+                claimed: claimed.len(),
+                embedded: 0,
+                failed: claimed.len(),
+            });
+        }
+        let mut embedded = 0usize;
+        {
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            for (c, vec) in claimed.iter().zip(vecs.iter()) {
+                // The entry may have been deleted while embedding: then the
+                // job row is already gone via cascade; completing is a no-op.
+                if store.get_entry(c.entry_id)?.is_none() {
+                    let _ = store.complete_extract_job(c.job_id);
+                    continue;
+                }
+                match store.upsert_segment(NewSegment {
+                    entry_id: c.entry_id,
+                    kind: SEGMENT_KIND_NAME,
+                    chunk_index: 0,
+                    text: &c.name,
+                    page: None,
+                    start_ms: None,
+                    end_ms: None,
+                    line: None,
+                    vector: vec,
+                }) {
+                    Ok(_) => {
+                        store.complete_extract_job(c.job_id)?;
+                        embedded += 1;
+                    }
+                    Err(e) => {
+                        warn!(job = c.job_id, error = %e, "segment upsert failed; releasing for retry");
+                        let _ = store.fail_extract_job(c.job_id);
+                    }
+                }
+            }
+        }
+        let failed = claimed.len() - embedded;
+        Ok(EmbedBatchOutcome {
+            claimed: claimed.len(),
+            embedded,
+            failed,
+        })
+    }
+
+    /// Production entry: one batch through the supervisor's bounded call
+    /// ([`EMBED_JOB_TIMEOUT`]; a hung worker fails the batch instead of
+    /// stalling the scheduler).
+    pub fn embed_once_with_supervisor(
+        &self,
+        sup: &Arc<EmbedSupervisor>,
+    ) -> Result<EmbedBatchOutcome, StoreError> {
+        self.embed_once_with(|texts| {
+            sup.embed_texts_bounded(texts, EMBED_JOB_TIMEOUT)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Starts the background embed scheduler (one `std::thread`): drains
+    /// `extract_jobs(kind='name')` in [`EMBED_BATCH`] batches until shutdown.
+    /// Crash-safe: claims are held per batch and released on failure or on
+    /// restart (`release_extract_claims` in [`Self::open`]); segment upserts
+    /// are idempotent (stable id, replace-prior-vector).
+    pub fn start_embed_scheduler(self: &Arc<Self>, embed: Arc<EmbedSupervisor>) {
+        let weak: Weak<Self> = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("winsearch-embed-sched".into())
+            .spawn(move || {
+                loop {
+                    let Some(indexer) = weak.upgrade() else {
+                        return;
+                    };
+                    if indexer.shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    match indexer.embed_once_with_supervisor(&embed) {
+                        Ok(out) if out.claimed == 0 => {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(error = %e, "embed batch error");
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     // ---- drive supervision ----
@@ -783,5 +1071,307 @@ mod tests {
         fn path_string(&self) -> String {
             self.0.to_string_lossy().into_owned()
         }
+    }
+
+    // ---- semantic pipeline (P3.5) ----
+
+    /// Deterministic fake embed: stub vectors, never the real model.
+    fn fake_embed(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        Ok(ws_embed_protocol::stub_embed_texts(
+            texts,
+            ws_embed_protocol::STUB_DIM,
+        ))
+    }
+
+    fn drain_embed_queue(indexer: &Arc<Indexer>) -> (usize, usize) {
+        let mut embedded = 0usize;
+        let mut batches = 0usize;
+        for _ in 0..32 {
+            let out = indexer.embed_once_with(fake_embed).unwrap();
+            if out.claimed == 0 {
+                break;
+            }
+            embedded += out.embedded;
+            batches += 1;
+            assert_eq!(out.failed, 0, "fake embed must not fail");
+        }
+        (embedded, batches)
+    }
+
+    fn entry_id_by_name(indexer: &Arc<Indexer>, text: &str) -> i64 {
+        indexer
+            .search(&SearchRequest {
+                text: text.into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("entry should be searchable")
+            .entry_id
+    }
+
+    #[test]
+    fn pipeline_crawl_enqueues_and_embeds_names() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("alpha-report.txt"), b"x").unwrap();
+        fs::write(tree.0.join("beta-notes.txt"), b"y").unwrap();
+        let indexer = seeded(&tree);
+
+        let depth = indexer.embed_queue_depth().unwrap();
+        assert!(depth >= 2, "crawl must enqueue name jobs, got {depth}");
+
+        let (embedded, _) = drain_embed_queue(&indexer);
+        assert!(embedded >= 2, "fake embed should store segments");
+        assert_eq!(indexer.embed_queue_depth().unwrap(), 0);
+        let segs = indexer.segments_indexed().unwrap();
+        assert!(segs >= 2, "segments_indexed counts name-segments, got {segs}");
+
+        // Stored vectors are the deterministic stub for the file name
+        // (idempotent upsert: a second drain claims nothing, segments stay).
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let row = store
+                .find_by_path(&tree.0.join("alpha-report.txt").to_string_lossy())
+                .unwrap()
+                .unwrap();
+            let segs = store.list_segments_for_entry(row.id).unwrap();
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0].kind, "name");
+            assert_eq!(segs[0].text, "alpha-report.txt");
+            let want =
+                ws_embed_protocol::stub_vector("alpha-report.txt", ws_embed_protocol::STUB_DIM);
+            assert_eq!(segs[0].vector.len(), want.len());
+            // FP16 round-trip: cosine ~1 to the stub reference.
+            let cos = ws_index::vectors::cosine_similarity(&segs[0].vector, &want);
+            assert!(cos > 0.99, "stored vector diverged: cosine {cos}");
+        }
+        let before = indexer.segments_indexed().unwrap();
+        let (embedded2, _) = drain_embed_queue(&indexer);
+        assert_eq!(embedded2, 0, "idempotent: no jobs left");
+        assert_eq!(indexer.segments_indexed().unwrap(), before);
+    }
+
+    #[test]
+    fn pipeline_new_files_first_lifo_within_priority() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("old.txt"), b"x").unwrap();
+        let indexer = seeded(&tree);
+        drain_embed_queue(&indexer);
+        assert_eq!(indexer.embed_queue_depth().unwrap(), 0);
+
+        // An update (low priority) enqueued before a new file (high priority):
+        // the new file must embed first even though it arrived later.
+        fs::write(tree.0.join("old.txt"), b"changed-contents-longer").unwrap();
+        let root_id = indexer.roots[0].id;
+        indexer
+            .handle_event(
+                root_id,
+                WatchEvent::Modified(tree.0.join("old.txt")),
+            );
+        fs::write(tree.0.join("brand-new.txt"), b"n").unwrap();
+        indexer.handle_event(root_id, WatchEvent::Created(tree.0.join("brand-new.txt")));
+        // Drain one batch at a time and record order via segment creation?
+        // Simpler: assert priorities at the queue level (store order).
+        {
+            let mut store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let batch = store
+                .claim_extract_jobs_batch_for_kind("name", 10)
+                .unwrap();
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[0].priority, ws_index::EXTRACT_PRIORITY_NEW);
+            assert_eq!(batch[1].priority, ws_index::EXTRACT_PRIORITY_UPDATED);
+            for j in batch {
+                store.fail_extract_job(j.id).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_rename_keeps_segment_identity_and_reembeds() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("draft.txt"), b"x").unwrap();
+        let indexer = seeded(&tree);
+        drain_embed_queue(&indexer);
+
+        let id_before = entry_id_by_name(&indexer, "draft");
+        let seg_before = {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let segs = store.list_segments_for_entry(id_before).unwrap();
+            assert_eq!(segs.len(), 1);
+            segs[0].id
+        };
+
+        // Rename on disk + watcher event: entry id preserved, segment row
+        // stays attached (identity), and a re-embed job is queued.
+        let renamed = tree.0.join("final.txt");
+        fs::rename(tree.0.join("draft.txt"), &renamed).unwrap();
+        let root_id = indexer.roots[0].id;
+        indexer.handle_event(
+            root_id,
+            WatchEvent::Renamed {
+                from: tree.0.join("draft.txt"),
+                to: renamed.clone(),
+            },
+        );
+        let id_after = entry_id_by_name(&indexer, "final");
+        assert_eq!(id_before, id_after, "rename must preserve entry identity");
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let segs = store.list_segments_for_entry(id_after).unwrap();
+            assert_eq!(segs.len(), 1, "segment stays attached across rename");
+            assert_eq!(segs[0].id, seg_before, "segment id stable");
+        }
+        assert!(
+            indexer.embed_queue_depth().unwrap() >= 1,
+            "rename must requeue the new name"
+        );
+        drain_embed_queue(&indexer);
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let segs = store.list_segments_for_entry(id_after).unwrap();
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0].id, seg_before, "re-embed replaces vector in place");
+            assert_eq!(segs[0].text, "final.txt");
+        }
+    }
+
+    #[test]
+    fn pipeline_delete_removes_segments() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("obsolete.txt"), b"x").unwrap();
+        let indexer = seeded(&tree);
+        drain_embed_queue(&indexer);
+        let id = entry_id_by_name(&indexer, "obsolete");
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(store.list_segments_for_entry(id).unwrap().len(), 1);
+        }
+        fs::remove_file(tree.0.join("obsolete.txt")).unwrap();
+        indexer.handle_event(
+            indexer.roots[0].id,
+            WatchEvent::Deleted(tree.0.join("obsolete.txt")),
+        );
+        {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                store.list_segments_for_entry(id).unwrap().is_empty(),
+                "delete must cascade to segments"
+            );
+        }
+        assert!(
+            indexer
+                .search(&SearchRequest {
+                    text: "obsolete".into(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pipeline_crash_mid_queue_restart_resumes_idempotently() {
+        let tree = TempTree::new();
+        fs::write(tree.0.join("crash-a.txt"), b"x").unwrap();
+        fs::write(tree.0.join("crash-b.txt"), b"y").unwrap();
+        let indexer = seeded(&tree);
+        assert!(indexer.embed_queue_depth().unwrap() >= 2);
+
+        // Simulate a crash mid-batch: claim jobs but never complete them.
+        let claimed_ids: Vec<i64> = {
+            let mut store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let batch = store
+                .claim_extract_jobs_batch_for_kind("name", 10)
+                .unwrap();
+            assert!(!batch.is_empty());
+            batch.into_iter().map(|j| j.id).collect()
+        };
+        // Restart path: `Indexer::open` releases claims; here the same store
+        // (the unit equivalent) releases them back to pending.
+        {
+            let mut store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            let released = store.release_extract_claims().unwrap();
+            assert_eq!(released as usize, claimed_ids.len());
+        }
+        // Resume: the full batch embeds, and a repeat embed is a no-op
+        // (idempotent upsert, stable segment ids).
+        let (embedded, _) = drain_embed_queue(&indexer);
+        assert!(embedded >= 2);
+        let ids_before: Vec<i64> = {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            store
+                .all_segments()
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        // Re-enqueue everything (model-swap style) and re-embed: same ids.
+        {
+            let mut store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            for eid in store.all_entry_ids().unwrap() {
+                store.enqueue_extract_job(eid, "name").unwrap();
+            }
+        }
+        drain_embed_queue(&indexer);
+        let ids_after: Vec<i64> = {
+            let store = indexer.store.lock().unwrap_or_else(|p| p.into_inner());
+            store
+                .all_segments()
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert_eq!(ids_before, ids_after, "re-embed must be idempotent");
+    }
+
+    #[test]
+    fn pipeline_failed_batch_releases_claims_for_retry() {
+        // A hung worker surfaces as a batch error (the supervisor's bounded
+        // call maps the watchdog to `Transport("... timed out ...")`); the
+        // pipeline must release every claim (attempts+1) instead of stalling.
+        let tree = TempTree::new();
+        fs::write(tree.0.join("retry-me.txt"), b"x").unwrap();
+        let indexer = seeded(&tree);
+        assert!(indexer.embed_queue_depth().unwrap() >= 1);
+
+        let out = indexer
+            .embed_once_with(|_| Err("embed job timed out after 120s".to_string()))
+            .unwrap();
+        assert!(out.claimed >= 1);
+        assert_eq!(out.embedded, 0);
+        assert_eq!(out.failed, out.claimed);
+        // Claims released: still pending, attempts bumped, embeddable after
+        // the worker recovers.
+        assert!(indexer.embed_queue_depth().unwrap() >= 1);
+        let (embedded, _) = drain_embed_queue(&indexer);
+        assert!(embedded >= 1);
+        assert_eq!(indexer.embed_queue_depth().unwrap(), 0);
+    }
+
+    #[test]
+    fn pipeline_purge_and_requeue_reembeds_everything() {
+        // Task3-S4: seed vectors, then purge + requeue (the `Incompatible`
+        // restart path) empties segments and makes every entry re-embeddable.
+        let tree = TempTree::new();
+        fs::write(tree.0.join("keep-a.txt"), b"x").unwrap();
+        fs::write(tree.0.join("keep-b.txt"), b"y").unwrap();
+        let indexer = seeded(&tree);
+        drain_embed_queue(&indexer);
+        let segs_before = indexer.segments_indexed().unwrap();
+        assert!(segs_before >= 2);
+
+        let (purged, enqueued) = indexer.purge_name_vectors_and_requeue().unwrap();
+        assert_eq!(purged, segs_before);
+        assert!(enqueued >= 2);
+        assert_eq!(indexer.segments_indexed().unwrap(), 0);
+
+        let (embedded, _) = drain_embed_queue(&indexer);
+        assert_eq!(embedded as u64, enqueued);
+        assert_eq!(indexer.segments_indexed().unwrap(), segs_before);
     }
 }

@@ -55,8 +55,9 @@ pub struct EngineService {
     models: Arc<ModelService>,
     /// Embed worker supervisor (lazy: spawns on first embed request).
     /// `winsearchd` links no native inference code; all embeddings flow
-    /// through this supervisor over the internal pipe.
-    embed: EmbedSupervisor,
+    /// through this supervisor over the internal pipe. Shared (`Arc`) with
+    /// the indexer's embed scheduler thread (P3.5).
+    embed: Arc<EmbedSupervisor>,
 }
 
 pub type SharedEngine = Arc<EngineService>;
@@ -93,7 +94,7 @@ impl EngineService {
             next_client_id: std::sync::atomic::AtomicU64::new(1),
             indexer,
             models,
-            embed,
+            embed: Arc::new(embed),
         })
     }
 
@@ -101,8 +102,8 @@ impl EngineService {
         &self.models
     }
 
-    pub fn embed_supervisor(&self) -> &EmbedSupervisor {
-        &self.embed
+    pub fn embed_supervisor(&self) -> Arc<EmbedSupervisor> {
+        Arc::clone(&self.embed)
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -122,9 +123,15 @@ impl EngineService {
             status.files_indexed = s.files_indexed;
             status.queue_depth = s.queue_depth;
             status.index_size_bytes = s.stats.index_size_bytes;
-            if status.state == EngineRunState::Idle && s.indexing {
-                status.state = EngineRunState::Indexing;
-                status.current_activity = "Indexing".into();
+            status.segments_indexed = s.segments_indexed;
+            if status.state == EngineRunState::Idle {
+                if s.indexing {
+                    status.state = EngineRunState::Indexing;
+                    status.current_activity = "Indexing".into();
+                } else if s.embedding {
+                    status.state = EngineRunState::Indexing;
+                    status.current_activity = "Embedding names…".into();
+                }
             }
         }
         status
@@ -540,5 +547,46 @@ mod tests {
         q.categories = vec![ResultKind::Image];
         let results = engine.plan_results(&q);
         assert!(results.iter().all(|r| r.kind != ResultKind::Document));
+    }
+
+    #[test]
+    fn status_reports_segments_and_embedding_activity() {
+        // P3.5: `segments_indexed` counts name-segments; pending name jobs
+        // surface as "Embedding names…" (crawl drained, embed backlog live).
+        let tree = TempTree::new();
+        for f in ["alpha-embed.txt", "beta-embed.txt"] {
+            fs::write(tree.0.join(f), b"x").unwrap();
+        }
+        let store = IndexStore::open_in_memory().unwrap();
+        let indexer = Indexer::open(store, &[tree.0.clone()]).unwrap();
+        indexer.enqueue_initial_scan().unwrap();
+        while indexer.scan_available(64) > 0 {}
+        let engine = EngineService::new(indexer);
+
+        let s = engine.status();
+        assert_eq!(s.segments_indexed, 0);
+        assert!(!s.model_loaded, "fresh supervisor spawns nothing");
+        assert_eq!(s.current_activity, "Embedding names…");
+        assert_eq!(s.state, EngineRunState::Indexing);
+
+        // Drain via deterministic fakes: segments land, activity idles.
+        let idx = engine.indexer.clone();
+        loop {
+            let out = idx
+                .embed_once_with(|texts| {
+                    Ok(ws_embed_protocol::stub_embed_texts(
+                        texts,
+                        ws_embed_protocol::STUB_DIM,
+                    ))
+                })
+                .unwrap();
+            if out.claimed == 0 {
+                break;
+            }
+        }
+        let s = engine.status();
+        assert!(s.segments_indexed >= 2, "got {}", s.segments_indexed);
+        assert_eq!(s.current_activity, String::new());
+        assert_eq!(s.state, EngineRunState::Idle);
     }
 }

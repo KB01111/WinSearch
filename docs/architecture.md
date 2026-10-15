@@ -83,7 +83,20 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
 - `indexer.rs` — orchestrator: bounded crawl worker pool (4 threads) draining
   the crash-safe queue, watcher event handling, the application catalog
   refresh, and a drive supervisor that preserves the index of disconnected
-  volumes (`missing` flag) and reconciles them on reconnect.
+  volumes (`missing` flag) and reconciles them on reconnect. Plus the
+  semantic pipeline (P3.5): `UpsertOutcome != Unchanged` (from `process_dir`
+  batches, `point_upsert`, renames, and catalog refreshes) enqueues
+  `extract_jobs(kind='name')` — `Inserted` at high priority (new files first),
+  `Updated`/requeues low; claim order is `priority DESC, id DESC` (LIFO
+  within priority). One scheduler thread (`winsearch-embed-sched`) drains the
+  queue in batches of 128 names through the supervisor's bounded call
+  (**120 s** job-IO watchdog: a hung worker fails the batch as `Transport`,
+  claims are released for retry, the scheduler never stalls). Results upsert
+  `segments(kind='name', chunk 0)` idempotently (stable id, replace prior
+  vector). Deletes cascade via FK (`sweep`/`remove_tree`); claims left by a
+  crash are released on open (`release_extract_claims`). A model swap
+  (`check_compat == Incompatible`) purges `segments(kind='name')` and
+  requeues one name job per entry at startup.
 - `catalog.rs` — Start Menu/Desktop scan; `.lnk` targets resolved via the
   shell's `IShellLinkW`.
 - `engine.rs` — the search pipeline: calculator → settings → index hits,
@@ -91,14 +104,20 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
   queries map to the code mode (index lands in Phase 5) and return nothing
   rather than mixing in normal results. `status()` reports `model_loaded`
   from the embed supervisor's cache (real weights resident, or stub vectors
-  flowing in test setups); the engine reaches the supervisor through
-  `embed_supervisor()` — the pipeline's `embed_texts()` entry lands with the
-  semantic pipeline (P3.5).
+  flowing in test setups); `segments_indexed` counts `segments(kind='name')`;
+  `current_activity` is `"Indexing"` while the crawl queue drains and
+  `"Embedding names…"` while only the embed queue remains. The engine reaches
+  the supervisor through `embed_supervisor()` (an `Arc` shared with the
+  indexer's scheduler); the pipeline embeds through its bounded call.
 - `embed_client.rs` — supervisor for the inference worker: spawns
   `winsearch-embed` on the first embed request (never before), handshakes
   every connection (health ping + version check + flag refresh), restarts
   with backoff after a transport failure and retries the in-flight job once.
   Definitive worker errors are never retried. Links no native inference code.
+  The pipeline never calls `embed_texts` directly: `embed_texts_bounded`
+  (helper thread + `recv_timeout`, **`EMBED_JOB_TIMEOUT` = 120 s**) bounds
+  every scheduler batch; on timeout the owned child is killed to break the
+  hung pipe IO and the batch fails for retry.
 
 ### `winsearch-embed` (bins/winsearch-embed) + `ws-embed-protocol`
 
@@ -129,7 +148,7 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
 
 | Path | Contents |
 |---|---|
-| `%LOCALAPPDATA%\WinSearch\db\index.db` | entries + FTS + crawl queue + checkpoints |
+| `%LOCALAPPDATA%\WinSearch\db\index.db` | entries + FTS + crawl queue + checkpoints + vector segments + embed queue |
 | `%LOCALAPPDATA%\WinSearch\db\code.db` | code index (Phase 5) |
 | `%LOCALAPPDATA%\WinSearch\models` | embedding models (Phase 3) |
 | `%LOCALAPPDATA%\WinSearch\cache\thumbs` | thumbnail cache |
@@ -138,14 +157,24 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
 
 ## Indexing lifecycle
 
-1. Startup: open DB, release claims left by a crash, enqueue every present
-   root, start workers/watchers/catalog/drive supervisor.
+1. Startup: open DB, release claims left by a crash (crawl + embed queues),
+   enqueue every present root, start workers/watchers/catalog/drive
+   supervisor and the embed scheduler. A model swap (`check_compat ==
+   Incompatible`) first purges `segments(kind='name')` and requeues one name
+   job per entry.
 2. Crawl workers claim directories, scan them, upsert children and enqueue
    subdirectories in per-directory batches, then mark the directory done.
-3. When a root's queue drains, a generation sweep deletes entries that were
-   not seen in this scan (files removed while indexing was away).
-4. Watchers keep the index fresh between scans; renames keep row identity.
-5. Disconnected volumes: entries are flagged `missing` (hidden from search,
+   Every changed entry also enqueues a name-embed job (new files first, LIFO
+   within priority).
+3. The embed scheduler claims up to 128 name jobs, embeds the current entry
+   names through the bounded supervisor call, and upserts one segment per
+   entry (replace prior vector, stable id); failures release claims for retry.
+4. When a root's queue drains, a generation sweep deletes entries that were
+   not seen in this scan (files removed while indexing was away) — segments
+   and pending jobs cascade via FK.
+5. Watchers keep the index fresh between scans; renames keep row identity
+   (and requeue the new name); deletes cascade to segments.
+6. Disconnected volumes: entries are flagged `missing` (hidden from search,
    never deleted). On reconnect the root is rescanned and unflagged.
 
 ## Performance posture

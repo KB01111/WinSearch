@@ -154,10 +154,12 @@ CREATE TABLE IF NOT EXISTS extract_jobs (
     state    TEXT NOT NULL DEFAULT 'pending',
     claimed  INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0,
+    priority INTEGER NOT NULL DEFAULT 0,
     UNIQUE(entry_id, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_entry ON extract_jobs(entry_id);
 CREATE INDEX IF NOT EXISTS idx_extract_jobs_state ON extract_jobs(state, claimed);
+CREATE INDEX IF NOT EXISTS idx_extract_jobs_priority ON extract_jobs(state, claimed, priority, id);
 "#;
 
 impl IndexStore {
@@ -181,6 +183,22 @@ impl IndexStore {
         conn.pragma_update(None, "case_sensitive_like", "ON")?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(SCHEMA_V2)?;
+        // Additive migration for pre-priority v2 files: v2 DBs created before
+        // the `priority` column gain it here (fresh DBs already have it from
+        // SCHEMA_V2 above). `schema_version` stays "2": the column is a
+        // queue-ordering hint, not a format break.
+        {
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(extract_jobs)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            if !cols.iter().any(|c| c == "priority") {
+                conn.execute(
+                    "ALTER TABLE extract_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
         // Additive migration 1 → 2: fresh DBs land directly on 2, v1 files
         // keep every existing row and just gain the new tables.
         let version: Option<String> = conn
@@ -923,19 +941,39 @@ impl IndexStore {
 
     // ---- extract jobs (schema v2, crash-safe queue for Phase 4) ----
 
-    /// Enqueues `(entry_id, kind)` idempotently.
+    /// Enqueues `(entry_id, kind)` idempotently at default priority
+    /// (`EXTRACT_PRIORITY_UPDATED`). See [`Self::enqueue_extract_job_with_priority`].
     pub fn enqueue_extract_job(&mut self, entry_id: i64, kind: &str) -> Result<(), StoreError> {
+        self.enqueue_extract_job_with_priority(
+            entry_id,
+            kind,
+            crate::model::EXTRACT_PRIORITY_UPDATED,
+        )
+    }
+
+    /// Enqueues `(entry_id, kind)` idempotently at `priority`. A repeat enqueue
+    /// for an already-queued job keeps the higher of the two priorities so a
+    /// later `Inserted` upgrades a pending `Updated` instead of being dropped.
+    pub fn enqueue_extract_job_with_priority(
+        &mut self,
+        entry_id: i64,
+        kind: &str,
+        priority: i64,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO extract_jobs(entry_id, kind, state, claimed, attempts)
-             VALUES(?1, ?2, 'pending', 0, 0)
-             ON CONFLICT(entry_id, kind) DO NOTHING",
-            params![entry_id, kind],
+            "INSERT INTO extract_jobs(entry_id, kind, state, claimed, attempts, priority)
+             VALUES(?1, ?2, 'pending', 0, 0, ?3)
+             ON CONFLICT(entry_id, kind) DO UPDATE SET
+                 priority = CASE WHEN excluded.priority > extract_jobs.priority
+                                 THEN excluded.priority ELSE extract_jobs.priority END",
+            params![entry_id, kind, priority],
         )?;
         Ok(())
     }
 
-    /// Atomically claims the oldest pending job (sets `claimed = 1`,
-    /// `state = 'claimed'`). The row stays queued until
+    /// Atomically claims the highest-priority pending job (new files first,
+    /// LIFO within priority: `priority DESC, id DESC`). Sets `claimed = 1`,
+    /// `state = 'claimed'`. The row stays queued until
     /// [`Self::complete_extract_job`], so a crash re-runs it after
     /// [`Self::release_extract_claims`].
     pub fn claim_extract_job(&mut self) -> Result<Option<ExtractJob>, StoreError> {
@@ -944,13 +982,58 @@ impl IndexStore {
                 "UPDATE extract_jobs SET claimed = 1, state = 'claimed'
                  WHERE id = (SELECT id FROM extract_jobs
                              WHERE claimed = 0 AND state = 'pending'
-                             ORDER BY id LIMIT 1)
-                 RETURNING id, entry_id, kind, state, claimed, attempts",
+                             ORDER BY priority DESC, id DESC LIMIT 1)
+                 RETURNING id, entry_id, kind, state, claimed, attempts, priority",
                 [],
                 map_extract_job_row,
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Claims up to `limit` pending jobs in priority order (one
+    /// [`Self::claim_extract_job`] per job). Returns the claimed batch, which
+    /// the caller embeds and then completes/fails per job.
+    pub fn claim_extract_jobs_batch(&mut self, limit: usize) -> Result<Vec<ExtractJob>, StoreError> {
+        let mut out = Vec::new();
+        for _ in 0..limit {
+            match self.claim_extract_job()? {
+                Some(job) => out.push(job),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Claims up to `limit` pending jobs of one `kind` in priority order
+    /// (`priority DESC, id DESC`: new files first, LIFO within priority).
+    /// The embed scheduler (P3.5) claims `kind='name'` so Phase-4 kinds are
+    /// never stolen.
+    pub fn claim_extract_jobs_batch_for_kind(
+        &mut self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<ExtractJob>, StoreError> {
+        let mut out = Vec::new();
+        for _ in 0..limit {
+            let job: Option<ExtractJob> = self
+                .conn
+                .query_row(
+                    "UPDATE extract_jobs SET claimed = 1, state = 'claimed'
+                     WHERE id = (SELECT id FROM extract_jobs
+                                 WHERE claimed = 0 AND state = 'pending' AND kind = ?1
+                                 ORDER BY priority DESC, id DESC LIMIT 1)
+                     RETURNING id, entry_id, kind, state, claimed, attempts, priority",
+                    params![kind],
+                    map_extract_job_row,
+                )
+                .optional()?;
+            match job {
+                Some(j) => out.push(j),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Releases claims held by a previous (crashed) process back to pending.
@@ -1002,16 +1085,60 @@ impl IndexStore {
         Ok(n as u64)
     }
 
+    /// Pending-or-claimed depth for one job kind (e.g. `name` → the embed
+    /// scheduler's backlog behind `EngineStatus` activity strings).
+    pub fn extract_queue_depth_for_kind(&self, kind: &str) -> Result<u64, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM extract_jobs
+              WHERE kind = ?1 AND (state = 'pending' OR claimed = 1)",
+            params![kind],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn get_extract_job(&self, id: i64) -> Result<Option<ExtractJob>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, entry_id, kind, state, claimed, attempts
+                "SELECT id, entry_id, kind, state, claimed, attempts, priority
                  FROM extract_jobs WHERE id = ?1",
                 params![id],
                 map_extract_job_row,
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// One entry by id (embed scheduler resolves names for claimed jobs).
+    pub fn get_entry(&self, id: i64) -> Result<Option<EntryRow>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
+                        mtime, missing
+                 FROM entries WHERE id = ?1",
+                params![id],
+                map_entry_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every entry id, ordered (model-swap requeue path enqueues one name job
+    /// per entry).
+    pub fn all_entry_ids(&self) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id FROM entries ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Deletes every segment of one kind (model-swap purge path). Returns the
+    /// number removed.
+    pub fn purge_segments_by_kind(&self, kind: &str) -> Result<u64, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM segments WHERE kind = ?1",
+            params![kind],
+        )?;
+        Ok(n as u64)
     }
 
     // ---- stats ----
@@ -1114,6 +1241,7 @@ fn map_extract_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractJob> 
         state: row.get(3)?,
         claimed: row.get::<_, i64>(4)? != 0,
         attempts: row.get(5)?,
+        priority: row.get::<_, i64>(6).unwrap_or(0),
     })
 }
 
@@ -1601,17 +1729,18 @@ mod tests {
         store.enqueue_extract_job(b, "name").unwrap();
         assert_eq!(store.extract_queue_depth().unwrap(), 2);
 
+        // Claim order is LIFO within priority (newest first): b before a.
         let first = store.claim_extract_job().unwrap().unwrap();
-        assert_eq!(first.entry_id, a);
+        assert_eq!(first.entry_id, b);
         assert!(first.claimed);
         let second = store.claim_extract_job().unwrap().unwrap();
-        assert_eq!(second.entry_id, b);
+        assert_eq!(second.entry_id, a);
         assert!(store.claim_extract_job().unwrap().is_none());
 
         // Simulated crash: claims go back to pending, jobs are not lost.
         assert_eq!(store.release_extract_claims().unwrap(), 2);
         let retry = store.claim_extract_job().unwrap().unwrap();
-        assert_eq!(retry.entry_id, a);
+        assert_eq!(retry.entry_id, b);
 
         // Retryable failure bumps attempts and re-queues.
         store.fail_extract_job(retry.id).unwrap();
@@ -1631,6 +1760,79 @@ mod tests {
         let failed = store.get_extract_job(job.id).unwrap().unwrap();
         assert_eq!(failed.state, crate::model::EXTRACT_STATE_FAILED);
         assert!(store.claim_extract_job().unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_jobs_new_files_first_lifo_within_priority() {
+        use crate::model::{EXTRACT_PRIORITY_NEW, EXTRACT_PRIORITY_UPDATED};
+        let (mut store, root) = setup();
+        let updated_old = entry_id_for(&mut store, root, "C:\\data\\u1.txt", "u1.txt", 511);
+        let new_file = entry_id_for(&mut store, root, "C:\\data\\n1.txt", "n1.txt", 512);
+        let updated_new = entry_id_for(&mut store, root, "C:\\data\\u2.txt", "u2.txt", 513);
+        store
+            .enqueue_extract_job_with_priority(updated_old, "name", EXTRACT_PRIORITY_UPDATED)
+            .unwrap();
+        store
+            .enqueue_extract_job_with_priority(new_file, "name", EXTRACT_PRIORITY_NEW)
+            .unwrap();
+        store
+            .enqueue_extract_job_with_priority(updated_new, "name", EXTRACT_PRIORITY_UPDATED)
+            .unwrap();
+
+        // New files first regardless of enqueue order ...
+        let first = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(first.entry_id, new_file);
+        // ... then LIFO within the updated priority (most recent first).
+        let second = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(second.entry_id, updated_new);
+        let third = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(third.entry_id, updated_old);
+
+        // A repeat enqueue upgrades a pending job to the higher priority.
+        store.complete_extract_job(first.id).unwrap();
+        for j in [second.id, third.id] {
+            store.fail_extract_job(j).unwrap();
+        }
+        store
+            .enqueue_extract_job_with_priority(updated_old, "name", EXTRACT_PRIORITY_NEW)
+            .unwrap();
+        let upgraded = store.claim_extract_job().unwrap().unwrap();
+        assert_eq!(upgraded.entry_id, updated_old);
+        assert_eq!(upgraded.priority, EXTRACT_PRIORITY_NEW);
+    }
+
+    #[test]
+    fn extract_jobs_entry_helpers_and_purge() {
+        let (mut store, root) = setup();
+        let eid = entry_id_for(&mut store, root, "C:\\data\\a.txt", "a.txt", 521);
+        let row = store.get_entry(eid).unwrap().unwrap();
+        assert_eq!(row.name, "a.txt");
+        assert!(store.get_entry(eid + 9999).unwrap().is_none());
+        assert_eq!(store.all_entry_ids().unwrap(), vec![eid]);
+
+        store
+            .upsert_segment(NewSegment {
+                entry_id: eid,
+                kind: "name",
+                chunk_index: 0,
+                text: "a.txt",
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: &[1.0, 0.0],
+            })
+            .unwrap();
+        assert_eq!(store.count_segments_by_kind("name").unwrap(), 1);
+        assert_eq!(
+            store.extract_queue_depth_for_kind("name").unwrap(),
+            0,
+            "no jobs enqueued yet"
+        );
+        store.enqueue_extract_job(eid, "name").unwrap();
+        assert_eq!(store.extract_queue_depth_for_kind("name").unwrap(), 1);
+        assert_eq!(store.purge_segments_by_kind("name").unwrap(), 1);
+        assert_eq!(store.segment_count().unwrap(), 0);
     }
 
     #[test]

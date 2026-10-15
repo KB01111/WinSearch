@@ -111,8 +111,15 @@ both sides code against. This protocol is **internal**: it is never mirrored
 to `WinSearch.Core` and `PROTOCOL_VERSION` above is untouched by it.
 
 `winsearchd` is the only client (one connection at a time; concurrent
-connections serialize). The supervisor batches 32–256 texts per job; larger
-batches are split into one `embed_texts` job per 256-text chunk.
+connections serialize). The semantic pipeline (P3.5) batches **128 names**
+per scheduler round-trip through the supervisor's bounded call; larger
+`embed_texts` inputs are still split into one `embed_texts` job per 256-text
+chunk. The `extract_jobs` claim order is `priority DESC, id DESC` (new files
+first, LIFO within priority). Every scheduler batch is bounded by
+**`EMBED_JOB_TIMEOUT` = 120 s** (`embed_texts_bounded`: helper thread +
+`recv_timeout`; timeout kills the owned worker to break hung pipe IO and
+fails the batch as `Transport` so claims release for retry instead of
+stalling the scheduler).
 
 | direction | `type` | fields | description |
 |---|---|---|---|

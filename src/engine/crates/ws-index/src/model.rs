@@ -135,6 +135,21 @@ pub enum UpsertOutcome {
 /// Stored in `segments.kind` / `extract_jobs.kind`.
 pub const SEGMENT_KIND_NAME: &str = "name";
 
+/// Priority for `extract_jobs.priority`: new files first, LIFO within priority.
+///
+/// `claim_extract_job` orders by `priority DESC, id DESC`: higher priority
+/// drains first, and within one priority the most recently enqueued job wins
+/// (LIFO). Newly inserted entries (`UpsertOutcome::Inserted`) enqueue at
+/// `EXTRACT_PRIORITY_NEW`; updates, re-embeds, and model-swap requeues use
+/// `EXTRACT_PRIORITY_UPDATED` so fresh discoveries jump the queue.
+pub const EXTRACT_PRIORITY_NEW: i64 = 10;
+pub const EXTRACT_PRIORITY_UPDATED: i64 = 0;
+
+/// How many name texts the winsearchd embed scheduler batches into one
+/// worker round-trip (P3.5). Well under `MAX_TEXTS_PER_JOB` (256) so one
+/// pipeline batch is always one worker job.
+pub const EMBED_BATCH_SIZE: usize = 128;
+
 /// States for `extract_jobs.state`.
 pub const EXTRACT_STATE_PENDING: &str = "pending";
 pub const EXTRACT_STATE_CLAIMED: &str = "claimed";
@@ -186,6 +201,9 @@ pub struct ExtractJob {
     pub state: String,
     pub claimed: bool,
     pub attempts: i64,
+    /// Scheduling priority: higher drains first (`priority DESC, id DESC`
+    /// claim order gives new-files-first, LIFO within priority).
+    pub priority: i64,
 }
 
 /// Filter for vector search. Empty lists mean "no restriction".

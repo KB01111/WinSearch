@@ -7,9 +7,9 @@
 //! adds the in-flight dimension (downloading/paused/error) plus the DB
 //! compat record (`meta` key `embedding_model`). A stored record whose model
 //! id or embedding width differs from the manifest invalidates every stored
-//! vector — [`ModelService::check_compat`] reports that; the re-embed queue
-//! that acts on it lands with the semantic pipeline (Tasks P3.4/P3.5), which
-//! is also where vectors first exist.
+//! vector — [`ModelService::check_compat`] reports that, and construction
+//! purges `segments(kind='name')` + requeues one name job per entry so the
+//! new model re-embeds everything (P3.5 pipeline consumes the queue).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,15 +115,26 @@ impl ModelService {
             notifier: Mutex::new(None),
         });
         // A changed model id or embedding width invalidates every stored
-        // vector. No vectors exist before Task P3.4, so today this is an
-        // honest log line; the semantic pipeline turns it into a re-embed
-        // queue (Tasks P3.4/P3.5 consume `check_compat`).
+        // vector (Task3-S4, wired in P3.5 now that vectors exist): purge
+        // `segments(kind='name')` and enqueue one name job per entry so the
+        // new model re-embeds everything. Fresh DBs (`NoRecord`) and
+        // compatible installs are no-ops.
         match this.check_compat() {
-            Ok(CompatCheck::Incompatible(stored)) => warn!(
-                model_id = %stored.model_id,
-                embedding_dim = stored.embedding_dim,
-                "embedding model changed: stored vectors (if any) must be re-embedded"
-            ),
+            Ok(CompatCheck::Incompatible(stored)) => {
+                warn!(
+                    model_id = %stored.model_id,
+                    embedding_dim = stored.embedding_dim,
+                    "embedding model changed: purging name vectors and requeueing for re-embed"
+                );
+                match this.indexer.purge_name_vectors_and_requeue() {
+                    Ok((purged, enqueued)) => info!(
+                        purged,
+                        enqueued,
+                        "model swap: stale vectors purged, re-embed queued"
+                    ),
+                    Err(e) => warn!(error = %e, "model-swap purge/requeue failed"),
+                }
+            }
             Err(e) => warn!(error = %e, "cannot read embedding compat record"),
             _ => {}
         }
@@ -521,6 +532,83 @@ mod tests {
             service.check_compat().unwrap(),
             CompatCheck::Incompatible(_)
         ));
+    }
+
+    #[test]
+    fn incompatible_compat_purges_vectors_and_requeues_on_restart() {
+        // Task3-S4: seed name vectors, flip the compat record, and take the
+        // restart path (`with_manager` again): stale vectors are purged and
+        // every entry is requeued so the new model re-embeds everything.
+        let tree = std::env::temp_dir().join(format!(
+            "winsearch-model-incompat-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("keep.txt"), b"x").unwrap();
+
+        let dir = temp_dir("incompat-restart");
+        let store = ws_index::IndexStore::open_in_memory().unwrap();
+        let indexer =
+            crate::indexer::Indexer::open(store, &[tree.clone()]).unwrap();
+        indexer.enqueue_initial_scan().unwrap();
+        while indexer.scan_available(64) > 0 {}
+        // Seed one name vector through the pipeline's fake path.
+        let out = indexer
+            .embed_once_with(|texts| {
+                Ok(ws_embed_protocol::stub_embed_texts(
+                    texts,
+                    ws_embed_protocol::STUB_DIM,
+                ))
+            })
+            .unwrap();
+        assert!(out.embedded >= 1);
+        assert!(indexer.segments_indexed().unwrap() >= 1);
+
+        let first = ModelService::with_manager(
+            ws_modelmgr::ModelManager::new(dir.clone()),
+            Arc::clone(&indexer),
+        );
+        first.record_compat().unwrap();
+        assert_eq!(first.check_compat().unwrap(), CompatCheck::Compatible);
+        // Flip to an incompatible dim (simulating a model swap on disk).
+        indexer
+            .meta_set(
+                EMBEDDING_MODEL_META_KEY,
+                &ModelCompat {
+                    embedding_dim: 384,
+                    ..ModelCompat::current()
+                }
+                .to_json(),
+            )
+            .unwrap();
+        // Restart path: constructing the service again purges + requeues.
+        let _second = ModelService::with_manager(
+            ws_modelmgr::ModelManager::new(dir.clone()),
+            Arc::clone(&indexer),
+        );
+        assert_eq!(
+            indexer.segments_indexed().unwrap(),
+            0,
+            "stale vectors must be purged"
+        );
+        assert!(
+            indexer.embed_queue_depth().unwrap() >= 1,
+            "re-embed jobs must be queued"
+        );
+        // The queued job re-embeds through the pipeline's fake path.
+        let out = indexer
+            .embed_once_with(|texts| {
+                Ok(ws_embed_protocol::stub_embed_texts(
+                    texts,
+                    ws_embed_protocol::STUB_DIM,
+                ))
+            })
+            .unwrap();
+        assert!(out.embedded >= 1);
+        let _ = std::fs::remove_dir_all(&tree);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

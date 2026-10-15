@@ -49,6 +49,22 @@ const SPAWN_WAIT: Duration = Duration::from_secs(30);
 const CONNECT_RETRY: Duration = Duration::from_secs(15);
 const CONNECT_POLL: Duration = Duration::from_millis(25);
 
+/// Bounded job-IO timeout for the semantic pipeline's embed calls (P3.5,
+/// Task2-I1 carried requirement).
+///
+/// The pipe transport itself is blocking with no per-read deadline, so the
+/// scheduler never calls [`EmbedSupervisor::embed_texts`] directly: it calls
+/// [`EmbedSupervisor::embed_texts_bounded`] with this timeout. A worker that
+/// hangs mid-job (never answers) fails the batch as `Transport` (claims are
+/// released for retry) instead of stalling the scheduler thread forever.
+///
+/// Value: **120 s** per `embed_texts` call (up to 256 texts; the pipeline
+/// batches 128). Budget: spawn wait (30 s) + connect retries (15 s) + model
+/// lazy-load on a cold worker (tens of seconds for ~865 MB) + CPU embedding
+/// of the batch (seconds). The success path returns in seconds; only a truly
+/// wedged worker ever hits the cap.
+pub const EMBED_JOB_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
     #[error("embed worker transport: {0}")]
@@ -306,6 +322,50 @@ impl EmbedSupervisor {
             }
         }
         Ok(all)
+    }
+
+    /// Bounded [`Self::embed_texts`] for the semantic pipeline (Task2-I1).
+    ///
+    /// Runs the whole call on a helper thread and waits `timeout`
+    /// ([`EMBED_JOB_TIMEOUT`] in production). A hung worker — handshake done
+    /// but no `embeddings` answer — surfaces as `Transport("... timed out
+    /// after ...")` instead of stalling the scheduler thread forever. On
+    /// timeout the owned child (if any) is killed to break the hung pipe IO;
+    /// the helper thread then unblocks with `Transport` and its late send is
+    /// dropped. Takes `Arc<Self>` so the helper thread owns a share.
+    ///
+    /// `std::thread`-only (no async): one helper thread + `mpsc::recv_timeout`.
+    pub fn embed_texts_bounded(
+        self: &std::sync::Arc<Self>,
+        texts: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        use std::sync::mpsc;
+        let sup = std::sync::Arc::clone(self);
+        let owned: Vec<String> = texts.to_vec();
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("winsearch-embed-bounded".into())
+            .spawn(move || {
+                let r = sup.embed_texts(&owned);
+                let _ = tx.send(r);
+            })
+            .map_err(|e| EmbedError::Transport(format!("cannot spawn embed helper: {e}")))?;
+        match rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Break the hung IO so the helper unblocks; its late result
+                // is dropped with the (now disconnected) sender.
+                self.terminate_worker();
+                warn!("embed job timed out after {timeout:?}; worker killed, batch fails for retry");
+                Err(EmbedError::Transport(format!(
+                    "embed job timed out after {timeout:?}"
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EmbedError::Transport(
+                "embed helper died before answering".into(),
+            )),
+        }
     }
 
     /// Health ping: handshake + `status` round-trip, spawning the worker if
@@ -636,6 +696,9 @@ mod tests {
         AlwaysUnavailable,
         /// Serve stub vectors immediately.
         Serve,
+        /// Handshake then never answer the job (hung worker): the client
+        /// blocks on the reply until the pipeline watchdog fires.
+        Hang,
     }
 
     static PIPE_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -688,6 +751,13 @@ mod tests {
                             Some(EmbedRequest::EmbedTexts { id, texts }) => {
                                 jobs2.lock().unwrap().push(texts.len());
                                 match mode {
+                                    Mode::Hang => {
+                                        // Hung worker: sleep past any test
+                                        // watchdog, then close without
+                                        // answering (client must time out).
+                                        let _ = id;
+                                        std::thread::sleep(Duration::from_secs(30));
+                                    }
                                     Mode::AlwaysUnavailable => {
                                         write_message(
                                             &mut stream,
@@ -853,6 +923,32 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(sup.stats().retries, 0);
+        assert_eq!(fake.jobs_seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounded_call_times_out_on_hanging_worker() {
+        // Task2-I1: a worker that handshakes but never answers must fail the
+        // bounded call instead of stalling the caller forever. The fake hangs
+        // 30 s; the watchdog fires in 500 ms.
+        let fake = FakeWorker::start(Mode::Hang);
+        let sup = Arc::new(test_supervisor(fake.pipe_name.clone()));
+
+        let start = Instant::now();
+        let err = sup
+            .embed_texts_bounded(&["never answered".to_string()], Duration::from_millis(500))
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, EmbedError::Transport(ref msg) if msg.contains("timed out")),
+            "got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "bounded call stalled the caller for {elapsed:?}"
+        );
+        // The job reached the worker (it is hanging on it); the watchdog, not
+        // a successful reply, ended the call.
         assert_eq!(fake.jobs_seen.lock().unwrap().len(), 1);
     }
 

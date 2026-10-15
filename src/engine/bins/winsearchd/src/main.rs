@@ -69,6 +69,11 @@ fn main() -> anyhow::Result<()> {
         pipe = %engine.embed_supervisor().pipe_name(),
         "embed supervisor wired to engine"
     );
+    // Semantic pipeline (P3.5): one background thread drains
+    // `extract_jobs(kind='name')` in 128-name batches through the bounded
+    // supervisor call (120 s watchdog); crash-safe via claim/release +
+    // idempotent segment upserts.
+    indexer.start_embed_scheduler(engine.embed_supervisor());
     spawn_status_pusher(Arc::clone(&engine));
     // Model progress/completion pushes fan out to every connected client.
     {
