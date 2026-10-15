@@ -1291,17 +1291,9 @@ mod tests {
             .apply_file_batch(
                 repo_id,
                 g1,
-                &[CodeFileRecord {
-                    path: old_file.to_string_lossy().into_owned(),
-                    rel_path: "Engine.rs".into(),
-                    name: "Engine.rs".into(),
-                    ext: "rs".into(),
-                    language: "rust".into(),
-                    size: 24,
-                    mtime: 1000,
-                    volume_serial: 77,
-                    file_id: 888,
-                }],
+                &[crate::crawl::record_for_code_path(&dir, &old_file)
+                    .unwrap()
+                    .unwrap()],
             )
             .unwrap();
         let initial_id = out1[0].file_id();
@@ -1321,22 +1313,15 @@ mod tests {
             .unwrap();
 
         // On Windows, `old_file.exists()` remains true even after a case-only rename.
+        std::fs::rename(&old_file, &new_file).unwrap();
         let g2 = store.begin_generation(repo_id).unwrap();
         let out2 = store
             .apply_file_batch(
                 repo_id,
                 g2,
-                &[CodeFileRecord {
-                    path: new_file.to_string_lossy().into_owned(),
-                    rel_path: "engine.rs".into(),
-                    name: "engine.rs".into(),
-                    ext: "rs".into(),
-                    language: "rust".into(),
-                    size: 24,
-                    mtime: 1000,
-                    volume_serial: 77,
-                    file_id: 888,
-                }],
+                &[crate::crawl::record_for_code_path(&dir, &new_file)
+                    .unwrap()
+                    .unwrap()],
             )
             .unwrap();
         assert_eq!(out2, vec![FileUpsertOutcome::Renamed { id: initial_id }]);

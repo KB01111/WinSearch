@@ -26,6 +26,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     private readonly object _searchStateLock = new();
     private CancellationTokenSource? _searchCts;
     private Timer? _debounceTimer;
+    private long _debounceGeneration;
     private bool _debouncePending;
     private Task? _activeSearchTask;
     private long _searchSequence;
@@ -127,23 +128,26 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
             _pendingQuery = value;
             Volatile.Write(ref _debouncePending, true);
             _debounceTimer?.Dispose();
+            var generation = ++_debounceGeneration;
             _debounceTimer = new Timer(
-                static state => ((MainOverlayViewModel)state!).OnDebounceElapsed(),
-                this,
+                _ => OnDebounceElapsed(generation),
+                null,
                 DebounceMs,
                 Timeout.Infinite);
         }
         UpdateSemanticHint();
     }
 
-    private void OnDebounceElapsed()
+    private void OnDebounceElapsed(long generation)
     {
-        string query;
         lock (_searchStateLock)
         {
-            query = _pendingQuery;
+            if (generation != _debounceGeneration || !_debouncePending)
+            {
+                return;
+            }
+            _ = RunSearchAsync(_pendingQuery);
         }
-        _ = RunSearchAsync(query);
     }
 
     /// <summary>True when a query change is waiting on the debounce timer.</summary>
@@ -179,6 +183,7 @@ public sealed partial class MainOverlayViewModel : ObservableObject, IAsyncDispo
     {
         lock (_searchStateLock)
         {
+            ++_debounceGeneration;
             _debounceTimer?.Dispose();
             _debounceTimer = null;
             var task = RunSearchCoreAsync(query);

@@ -196,6 +196,7 @@ public sealed class MainOverlayViewModelTests
     public async Task FlushOrWaitForSearchAsync_DoesNotMissInFlightTaskWhenDebounceStartsRunning()
     {
         var channel = Channel.CreateUnbounded<SearchBatch>();
+        var flushStarted = new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously);
         Task? flushTask = null;
         MainOverlayViewModel? vmRef = null;
 
@@ -207,7 +208,12 @@ public sealed class MainOverlayViewModelTests
                 // Called synchronously inside RunSearchCoreAsync before its first await.
                 // Start FlushOrWaitForSearchAsync right at this suspension point to verify
                 // it never observes HasPendingSearch == false before _activeSearchTask is set.
-                flushTask = Task.Run(() => vmRef!.FlushOrWaitForSearchAsync());
+                flushTask = Task.Run(() =>
+                {
+                    var pendingFlush = vmRef!.FlushOrWaitForSearchAsync();
+                    flushStarted.SetResult(pendingFlush);
+                    return pendingFlush;
+                });
                 return ReadBatchesAsync(channel.Reader, ct);
             },
         };
@@ -219,7 +225,8 @@ public sealed class MainOverlayViewModelTests
         var runTask = vm.RunSearchAsync("race");
 
         Assert.NotNull(flushTask);
-        await Task.Delay(30);
+        var pendingFlush = await flushStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(pendingFlush.IsCompleted);
         Assert.False(flushTask!.IsCompleted);
 
         channel.Writer.TryWrite(new SearchBatch
@@ -232,6 +239,47 @@ public sealed class MainOverlayViewModelTests
         await Task.WhenAll(runTask, flushTask);
         Assert.Single(vm.Results);
         Assert.Equal("r1", vm.Results[0].Result.Id);
+    }
+
+    [Fact]
+    public async Task SupersededDebounceCallback_DoesNotStartOrCancelSearch()
+    {
+        var channel = Channel.CreateUnbounded<SearchBatch>();
+        var fake = new FakeEngineClient
+        {
+            SearchHandler = (_, ct) => ReadBatchesAsync(channel.Reader, ct),
+        };
+        await using var vm = new MainOverlayViewModel(fake, new AppSettings());
+
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var stateLock = typeof(MainOverlayViewModel).GetField("_searchStateLock", flags)!.GetValue(vm)!;
+        var generationField = typeof(MainOverlayViewModel).GetField("_debounceGeneration", flags)!;
+        var timerField = typeof(MainOverlayViewModel).GetField("_debounceTimer", flags)!;
+        var callback = typeof(MainOverlayViewModel).GetMethod("OnDebounceElapsed", flags)!;
+        Task searchTask;
+
+        // Hold the state lock to control callback delivery without timer delays.
+        lock (stateLock)
+        {
+            vm.QueryText = "old";
+            var staleGeneration = generationField.GetValue(vm);
+            vm.QueryText = "current";
+            var currentTimer = timerField.GetValue(vm);
+
+            callback.Invoke(vm, [staleGeneration]);
+            Assert.Empty(fake.SearchCalls);
+            Assert.True(vm.HasPendingSearch);
+            Assert.Same(currentTimer, timerField.GetValue(vm));
+
+            searchTask = vm.SearchNowAsync();
+            callback.Invoke(vm, [staleGeneration]);
+            Assert.Equal("current", Assert.Single(fake.SearchCalls).Text);
+            Assert.False(vm.HasPendingSearch);
+        }
+
+        channel.Writer.TryComplete();
+        await searchTask.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     private static async IAsyncEnumerable<SearchBatch> ReadBatchesAsync(

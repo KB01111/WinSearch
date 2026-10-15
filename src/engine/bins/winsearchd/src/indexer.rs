@@ -1173,7 +1173,7 @@ impl Indexer {
                         warn!(error = %e, "reconnect failed");
                     }
                 }
-            } else if !was_offline || !has_missing {
+            } else if !was_offline {
                 info!(root = %root.path.display(), "volume disconnected; preserving index");
                 root.offline.store(true, Ordering::Release);
                 let mut store =
