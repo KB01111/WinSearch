@@ -1,11 +1,21 @@
 //! Blocking download with `Range` resume, progress, cancellation, and
-//! post-download verification (exact size + SHA-256 when the manifest pins
-//! one).
+//! streamed SHA-256 verification (exact size always, hash whenever the
+//! manifest pins one).
+//!
+//! Chunks are fed to the hasher as they arrive — including any resumed `.part`
+//! prefix, which is hashed before appending — so commit-time verification
+//! needs no second pass over the file.
 //!
 //! The engine is `std::thread`-only, so this is deliberately blocking: the
 //! caller runs it on a worker thread and polls a shared [`ProgressFn`] /
 //! [`std::sync::atomic::AtomicBool`] cancel flag. Partial downloads live next
 //! to the destination as `<name>.part`; a later call resumes them.
+//!
+//! Stall semantics: the cancel flag is checked between socket reads, so a
+//! fully stalled connection blocks cancellation until the transfer-level
+//! `timeout_global` (30 min) fires; resume then recovers. ureq 3 offers no
+//! per-read timeout (only a total-body budget, which would break slow
+//! multi-hundred-MB downloads), so there is deliberately no read-timeout knob.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -29,16 +39,12 @@ pub type ProgressFn<'a> = dyn Fn(u64, u64) + Send + Sync + 'a;
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
     pub base_url_override: Option<String>,
-    /// How often the cancel flag is checked is per-chunk; this only bounds
-    /// how long a single socket read may block.
-    pub read_timeout: Duration,
 }
 
 impl Default for DownloadOptions {
     fn default() -> Self {
         Self {
             base_url_override: None,
-            read_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -69,7 +75,8 @@ pub enum DownloadError {
 
 /// Downloads one manifest file into `dir`, resuming `<name>.part` when
 /// present. Returns the final path. Verifies exact size always, and SHA-256
-/// whenever the manifest pins one.
+/// whenever the manifest pins one (hashed inline during the transfer; see
+/// module docs).
 pub fn download_file(
     expected: &ExpectedFile,
     dir: &Path,
@@ -147,6 +154,16 @@ pub fn download_file(
         out.set_len(0)?;
     }
 
+    // Streamed SHA-256 over exactly the bytes committed: when appending to a
+    // resumed prefix, hash what is already on disk first, then every network
+    // chunk below. No hasher when the manifest pins no hash (zero overhead).
+    let mut hasher: Option<Sha256> = expected.sha256.map(|_| Sha256::new());
+    if let Some(h) = hasher.as_mut() {
+        if !truncate && resume_from > 0 {
+            hash_existing(&part, h)?;
+        }
+    }
+
     progress(downloaded, total);
     let mut reader = response.body_mut().as_reader();
     let mut chunk = vec![0u8; 64 * 1024];
@@ -160,23 +177,58 @@ pub fn download_file(
             break;
         }
         out.write_all(&chunk[..n])?;
+        if let Some(h) = hasher.as_mut() {
+            h.update(&chunk[..n]);
+        }
         downloaded += n as u64;
         progress(downloaded, total);
     }
     out.flush()?;
     drop(out);
 
-    // Commit, then verify the committed file (size always, hash when pinned).
-    // A rejected file is deleted so the next attempt restarts clean instead
-    // of tripping over (or byte-counting) an unusable leftover.
+    // Commit, then verify the committed file: exact size always, then the
+    // streamed digest when the manifest pins a hash. A rejected file is
+    // deleted so the next attempt restarts clean instead of tripping over
+    // (or byte-counting) an unusable leftover.
     fs::rename(&part, &dest)?;
-    if let Err(e) = verify_file(&dest, expected) {
+    let got_len = dest.metadata()?.len();
+    if got_len != expected.size {
         let _ = fs::remove_file(&dest);
-        return Err(e);
+        return Err(DownloadError::SizeMismatch {
+            name: expected.name.to_string(),
+            got: got_len,
+            expected: expected.size,
+        });
+    }
+    if let (Some(hasher), Some(pinned)) = (hasher, expected.sha256) {
+        let got = hex::encode(hasher.finalize());
+        if got != pinned {
+            let _ = fs::remove_file(&dest);
+            return Err(DownloadError::HashMismatch {
+                name: expected.name.to_string(),
+                got,
+                expected: pinned.to_string(),
+            });
+        }
     }
     progress(expected.size, expected.size);
     info!(file = expected.name, bytes = downloaded, "download complete");
     Ok(dest)
+}
+
+/// Feeds an already-on-disk prefix (a resumed `.part`) through the running
+/// digest so the final hash covers the whole committed file.
+fn hash_existing(path: &Path, hasher: &mut Sha256) -> Result<(), DownloadError> {
+    let mut file = fs::File::open(path)?;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&chunk[..n]);
+    }
+    Ok(())
 }
 
 /// Best-effort total for progress: `Content-Range` total on 206, else the

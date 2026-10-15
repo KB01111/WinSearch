@@ -87,10 +87,11 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
 - **Engine independence**: `winsearchd` runs with or without any client
   attached; closing the UI never interrupts indexing.
 - **Model lifecycle**: `model_download_start` resumes `<name>.part` files via
-  HTTP `Range`; progress and completion arrive as pushed `model_status`
-  frames (throttled to ~4 Hz server-side). `model_delete` refuses to run
-  while a download/import is in flight. Every message above is additive:
-  `PROTOCOL_VERSION` stays **1**.
+  HTTP `Range` and is idempotent while running; progress and completion
+  arrive as pushed `model_status` frames (throttled to ~4 Hz server-side).
+  A concurrent `model_import` is refused with `error: invalid_request`
+  (like `model_delete`, which also refuses while a download/import is in
+  flight). Every message above is additive: `PROTOCOL_VERSION` stays **1**.
 
 ## Versioning
 

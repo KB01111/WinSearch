@@ -1,21 +1,19 @@
 //! Pinned model manifest: which files make up the embedding model, where to
 //! fetch them, and how to recognise a compatible install afterwards.
 //!
-//! ## How the constants were obtained (2026-10-15)
+//! ## How the constants were obtained
 //!
 //! - File list and sizes come from the Hugging Face repo metadata for
 //!   [`MODEL_ID`] at commit [`REPO_COMMIT`]: `HEAD` requests against
 //!   `https://huggingface.co/<id>/resolve/main/<file>` return
 //!   `X-Linked-Size` (309855456 for the text GGUF, 554821024 for mmproj).
-//! - The repo is Xet-backed, so Hugging Face publishes **no whole-file
-//!   SHA-256** in its metadata — only Xet chunk hashes (`X-Xet-Hash` /
-//!   `X-Linked-ETag`), which are content-chunk addresses, not file hashes.
-//!   Downloading ~865 MB just to hash it was deliberately avoided, so
-//!   `sha256` is `None` for both GGUFs: verification falls back to exact
-//!   size (+ presence). Whenever a manifest entry carries `Some(sha256)`,
-//!   downloads and imports are hash-verified; the test suite pins real
-//!   SHA-256 values for its small fixture files and exercises the hash path
-//!   (including tamper rejection) there.
+//! - SHA-256 values were computed 2026-10-22 by downloading both files once
+//!   from those same `resolve/main` URLs to a temp dir (sizes re-verified
+//!   byte-exact against the manifest before hashing) and hashing the bytes
+//!   with two independent implementations (PowerShell `Get-FileHash` and the
+//!   crate's own `sha256_of`, which agreed). They also match the quoted
+//!   `X-Linked-ETag` header values the repo metadata serves for these files.
+//!   Downloads and imports are therefore hash-verified, not just size-checked.
 //! - `EMBEDDING_DIM` (768) is the unified EmbeddingGemma 2 space recorded in
 //!   the plan; the compat record below binds the index to it.
 
@@ -46,7 +44,7 @@ pub struct ExpectedFile {
     pub name: &'static str,
     /// Exact byte size (`X-Linked-Size` at [`REPO_COMMIT`]).
     pub size: u64,
-    /// Expected hex SHA-256, when known (see module docs). Verified on
+    /// Expected lowercase hex SHA-256 (see module docs). Verified on
     /// download/import whenever present.
     pub sha256: Option<&'static str>,
 }
@@ -63,12 +61,12 @@ pub const EXPECTED_FILES: [ExpectedFile; 2] = [
     ExpectedFile {
         name: TEXT_FILE,
         size: 309_855_456,
-        sha256: None,
+        sha256: Some("2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"),
     },
     ExpectedFile {
         name: MMPROJ_FILE,
         size: 554_821_024,
-        sha256: None,
+        sha256: Some("c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f"),
     },
 ];
 
@@ -132,7 +130,20 @@ mod tests {
         for f in &EXPECTED_FILES {
             assert!(f.url().ends_with(f.name));
             assert!(f.url().contains(MODEL_ID));
+            // Real SHA-256 pins: 64 lowercase hex chars, both present.
+            let hash = f.sha256.expect("production GGUFs must pin SHA-256");
+            assert_eq!(hash.len(), 64);
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_eq!(hash, hash.to_ascii_lowercase());
         }
+        assert_eq!(
+            EXPECTED_FILES[0].sha256,
+            Some("2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135")
+        );
+        assert_eq!(
+            EXPECTED_FILES[1].sha256,
+            Some("c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f")
+        );
     }
 
     #[test]

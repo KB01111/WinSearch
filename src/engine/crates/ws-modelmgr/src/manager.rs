@@ -5,10 +5,12 @@
 //! blocking and borrow-free so it runs on a plain worker thread.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::download::{download_file, verify_file, DownloadError, DownloadOptions, ProgressFn};
 use crate::manifest::{ExpectedFile, EXPECTED_FILES};
@@ -169,15 +171,23 @@ impl ModelManager {
     /// Imports model files from a local path: either a directory containing
     /// (some of) the manifest files, or a single file whose name matches one
     /// manifest entry. Every copied file is verified (size + hash when
-    /// pinned); failures abort with nothing half-written.
-    pub fn import(&self, path: &Path) -> Result<ModelStatus, ManagerError> {
+    /// pinned); failures abort with nothing half-written. Cancellation is
+    /// honored per 1 MiB chunk: a cancelled import removes its temp file and
+    /// reports [`DownloadError::Cancelled`], leaving no residue behind.
+    pub fn import(&self, path: &Path, cancel: &AtomicBool) -> Result<ModelStatus, ManagerError> {
         fs::create_dir_all(&self.dir)?;
         if path.is_dir() {
             let mut any = false;
             for f in &self.files {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(ManagerError::Download(DownloadError::Cancelled(
+                        0,
+                        self.total_bytes(),
+                    )));
+                }
                 let src = path.join(f.name);
                 if src.is_file() {
-                    self.import_one(f, &src)?;
+                    self.import_one(f, &src, cancel)?;
                     any = true;
                 }
             }
@@ -204,7 +214,7 @@ impl ModelManager {
                         known.join(", ")
                     ))
                 })?;
-            self.import_one(entry, path)?;
+            self.import_one(entry, path, cancel)?;
         } else {
             return Err(ManagerError::Import(format!(
                 "import path does not exist: {}",
@@ -230,7 +240,15 @@ impl ModelManager {
         Ok(self.status())
     }
 
-    fn import_one(&self, expected: &ExpectedFile, src: &Path) -> Result<(), ManagerError> {
+    fn import_one(
+        &self,
+        expected: &ExpectedFile,
+        src: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<(), ManagerError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ManagerError::Download(DownloadError::Cancelled(0, expected.size)));
+        }
         // Verify the source before touching the model dir.
         let len = src.metadata()?.len();
         if len != expected.size {
@@ -239,24 +257,56 @@ impl ModelManager {
                 expected.name, expected.size
             )));
         }
-        if let Some(pinned) = expected.sha256 {
-            let got = crate::download::sha256_of(src).map_err(DownloadError::from)?;
+        // Copy in 1 MiB chunks so cancellation lands mid-copy; hash inline
+        // when the manifest pins a hash. The temp file + rename means a crash
+        // never leaves a truncated model file behind.
+        let dest = self.dir.join(expected.name);
+        let tmp = self.dir.join(format!("{}.import-tmp", expected.name));
+        let mut reader = fs::File::open(src)?;
+        let mut out = fs::File::create(&tmp)?;
+        let mut hasher: Option<Sha256> = expected.sha256.map(|_| Sha256::new());
+        let mut chunk = vec![0u8; 1024 * 1024];
+        let mut copied = 0u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                drop(out);
+                let _ = fs::remove_file(&tmp);
+                return Err(ManagerError::Download(DownloadError::Cancelled(
+                    copied,
+                    expected.size,
+                )));
+            }
+            let n = reader.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&chunk[..n])?;
+            if let Some(h) = hasher.as_mut() {
+                h.update(&chunk[..n]);
+            }
+            copied += n as u64;
+        }
+        out.flush()?;
+        drop(out);
+        // Verify what was written (size always, hash when pinned) before the
+        // rename commits it.
+        if copied != expected.size || tmp.metadata()?.len() != expected.size {
+            let _ = fs::remove_file(&tmp);
+            return Err(ManagerError::Import(format!(
+                "{}: short copy ({copied} of {} bytes)",
+                expected.name, expected.size
+            )));
+        }
+        if let (Some(hasher), Some(pinned)) = (hasher, expected.sha256) {
+            let got = hex::encode(hasher.finalize());
             if got != pinned {
+                let _ = fs::remove_file(&tmp);
                 return Err(ManagerError::Import(format!(
                     "{}: sha-256 {got} != expected {pinned}",
                     expected.name
                 )));
             }
         }
-        // Copy via a temp file + rename so a crash never leaves a truncated
-        // model file behind.
-        let dest = self.dir.join(expected.name);
-        let tmp = self.dir.join(format!("{}.import-tmp", expected.name));
-        fs::copy(src, &tmp)?;
-        verify_file(&tmp, expected).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            ManagerError::Download(e)
-        })?;
         fs::rename(&tmp, &dest)?;
         Ok(())
     }
@@ -273,6 +323,8 @@ mod tests {
     use crate::manifest::EXPECTED_FILES;
     use std::fs;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -327,28 +379,142 @@ mod tests {
         let dir = temp_dir("import");
         let src = temp_dir("import-src");
         let mgr = ModelManager::new(dir.clone());
+        let live = AtomicBool::new(false);
 
         // Unknown file name.
         fs::write(src.join("other.bin"), b"nope").unwrap();
-        assert!(mgr.import(&src.join("other.bin")).is_err());
+        assert!(mgr.import(&src.join("other.bin"), &live).is_err());
 
         // Right name, wrong size (manifest expects hundreds of MB).
         fs::write(src.join(EXPECTED_FILES[0].name), b"too small").unwrap();
-        let err = mgr.import(&src.join(EXPECTED_FILES[0].name)).unwrap_err();
+        let err = mgr.import(&src.join(EXPECTED_FILES[0].name), &live).unwrap_err();
         assert!(err.to_string().contains("size"), "got {err}");
 
         // Directory containing only a wrong-sized candidate fails.
-        let dir_err = mgr.import(&src).unwrap_err();
+        let dir_err = mgr.import(&src, &live).unwrap_err();
         assert!(
             dir_err.to_string().contains("size") || dir_err.to_string().contains("none"),
             "got {dir_err}"
         );
 
         // Missing path.
-        assert!(mgr.import(&src.join("missing.gguf")).is_err());
+        assert!(mgr.import(&src.join("missing.gguf"), &live).is_err());
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&src);
+    }
+
+    /// Happy path for the chunked copy: small stand-in files with pinned
+    /// hashes import byte-identical through file and directory forms.
+    #[test]
+    fn import_copies_and_verifies() {
+        use sha2::{Digest, Sha256};
+        let dir = temp_dir("import-ok");
+        let src = temp_dir("import-ok-src");
+        let bodies = vec![(leak("ok-a.gguf"), vec![11u8; 4096]), (leak("ok-b.gguf"), vec![12u8; 9000])];
+        let files: Vec<ExpectedFile> = bodies
+            .iter()
+            .map(|(name, body)| ExpectedFile {
+                name: *name,
+                size: body.len() as u64,
+                sha256: Some(Box::leak(
+                    format!("{:x}", Sha256::digest(body)).into_boxed_str(),
+                )),
+            })
+            .collect();
+        for (name, body) in &bodies {
+            fs::write(src.join(name), body).unwrap();
+        }
+        let mgr = ModelManager::with_files(dir.clone(), DownloadOptions::default(), files);
+        let live = AtomicBool::new(false);
+
+        // Single-file form.
+        mgr.import(&src.join("ok-a.gguf"), &live).unwrap();
+        assert_eq!(fs::read(dir.join("ok-a.gguf")).unwrap(), bodies[0].1);
+
+        // Directory form picks up every known file.
+        let s = mgr.import(&src, &live).unwrap();
+        assert_eq!(s.state, ModelState::Ready);
+        assert_eq!(fs::read(dir.join("ok-b.gguf")).unwrap(), bodies[1].1);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// A pre-set cancel flag aborts the import immediately (deterministic),
+    /// and a cancel mid-copy stops the copy with no residue.
+    #[test]
+    fn import_honors_cancel() {
+        let dir = temp_dir("import-cancel");
+        let src = temp_dir("import-cancel-src");
+        let name = leak("cancel-big.gguf");
+        // 1 GiB: even at multi-GB/s the copy spans hundreds of 1 MiB chunks,
+        // so a 5 ms canceller reliably lands mid-copy.
+        const SIZE: usize = 1024 * 1024 * 1024;
+        let files = vec![ExpectedFile {
+            name,
+            size: SIZE as u64,
+            sha256: None,
+        }];
+        // Deterministic pattern without holding 1 GiB in RAM twice.
+        write_pattern(&src.join(name), SIZE);
+        let mgr = ModelManager::with_files(dir.clone(), DownloadOptions::default(), files);
+
+        // Pre-cancelled: aborts before copying anything.
+        let dead = AtomicBool::new(true);
+        let err = mgr.import(&src.join(name), &dead).unwrap_err();
+        assert!(
+            matches!(err, ManagerError::Download(DownloadError::Cancelled(..))),
+            "got {err:?}"
+        );
+        assert!(!dir.join(name).exists());
+
+        // Mid-copy cancel from another thread. Retried because under parallel
+        // test load the canceller can fire before the first chunk check;
+        // partial `copied` proves the cancel landed mid-copy.
+        let mut mid_copy = false;
+        for _ in 0..10 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                stop.store(true, Ordering::Relaxed);
+            });
+            match mgr.import(&src.join(name), &cancel).unwrap_err() {
+                ManagerError::Download(DownloadError::Cancelled(copied, total)) if copied > 0 => {
+                    assert_eq!(total, SIZE as u64);
+                    mid_copy = true;
+                    break;
+                }
+                ManagerError::Download(DownloadError::Cancelled(..)) => continue,
+                other => panic!("expected Cancelled, got {other:?}"),
+            }
+        }
+        assert!(mid_copy, "never observed a mid-copy cancel in 10 attempts");
+        // No partial dest, no temp file left behind.
+        assert!(!dir.join(name).exists());
+        assert!(!dir.join(format!("{name}.import-tmp")).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    fn leak(s: &str) -> &'static str {
+        Box::leak(s.to_string().into_boxed_str())
+    }
+
+    /// Writes `len` deterministic bytes without materializing them all at once.
+    fn write_pattern(path: &Path, len: usize) {
+        use std::io::Write as _;
+        let mut out = fs::File::create(path).unwrap();
+        let chunk: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            out.write_all(&chunk[..n]).unwrap();
+            left -= n;
+        }
+        out.flush().unwrap();
     }
 
     #[test]

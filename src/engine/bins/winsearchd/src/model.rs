@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
-use ws_modelmgr::{ModelCompat, ModelManager, ModelState, ModelStatus, EMBEDDING_MODEL_META_KEY};
+use ws_modelmgr::{
+    DownloadError, ManagerError, ModelCompat, ModelManager, ModelState, ModelStatus,
+    EMBEDDING_MODEL_META_KEY,
+};
 use ws_protocol::ServerMessage;
 
 use crate::indexer::Indexer;
@@ -46,6 +49,31 @@ enum Outcome {
     Ok,
     Cancelled,
     Failed(String),
+}
+
+/// Typed worker result: cancellation is matched on the error variant, never
+/// on message text, so an unrelated failure that merely mentions "cancelled"
+/// cannot be misclassified as a clean cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpError {
+    Cancelled,
+    Failed(String),
+}
+
+impl OpError {
+    fn from_download(e: DownloadError) -> Self {
+        match e {
+            DownloadError::Cancelled(..) => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+
+    fn from_manager(e: ManagerError) -> Self {
+        match e {
+            ManagerError::Download(DownloadError::Cancelled(..)) => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
+        }
+    }
 }
 
 /// What the stored compat record says about the current manifest.
@@ -198,8 +226,13 @@ impl ModelService {
         path: Option<PathBuf>,
     ) -> Result<ModelStatus, String> {
         if self.active.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
-            // Idempotent while running: the caller gets the live snapshot.
-            return Ok(self.status());
+            return match kind {
+                // A second start is the same resumable work: idempotent.
+                OpKind::Download => Ok(self.status()),
+                // Import is not idempotent (it copies), so a concurrent
+                // import is refused and surfaces as Error{invalid_request}.
+                OpKind::Import => Err("a model download/import is already running".into()),
+            };
         }
         if kind == OpKind::Import && path.is_none() {
             return Err("import needs a local path".into());
@@ -251,26 +284,17 @@ impl ModelService {
             }
         };
 
-        let result: Result<(), String> = match kind {
+        let result: Result<(), OpError> = match kind {
             OpKind::Download => self
                 .manager
                 .download_all(&progress_cb, cancel)
-                .map_err(|e| e.to_string()),
+                .map_err(OpError::from_download),
             OpKind::Import => {
                 let path = path.expect("import path checked at start");
                 self.manager
-                    .import(path)
+                    .import(path, cancel)
                     .map(|_| ())
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| {
-                        // Import is one shot: honour a cancel that landed
-                        // mid-copy by reporting it as cancelled.
-                        if cancel.load(Ordering::Relaxed) {
-                            Err("cancelled".into())
-                        } else {
-                            Ok(())
-                        }
-                    })
+                    .map_err(OpError::from_manager)
             }
         };
 
@@ -293,13 +317,15 @@ impl ModelService {
                 info!("model operation complete: {:?}", status.state);
                 self.push(&status);
             }
-            Err(msg) if msg == "cancelled" || msg.contains("cancelled") => {
+            Err(OpError::Cancelled) => {
                 *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(Outcome::Cancelled);
-                let status = self.manager.status(); // paused (part files kept)
+                // Downloads keep `.part` files (state: paused); cancelled
+                // imports leave no residue (state: not_downloaded).
+                let status = self.manager.status();
                 info!("model operation cancelled");
                 self.push(&status);
             }
-            Err(msg) => {
+            Err(OpError::Failed(msg)) => {
                 *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some(Outcome::Failed(msg.clone()));
                 warn!(error = %msg, "model operation failed");
@@ -502,6 +528,84 @@ mod tests {
         let service = ModelService::new(temp_dir("idle-cancel"), test_indexer());
         assert_eq!(service.status().state, ModelState::NotDownloaded);
         assert_eq!(service.cancel_download().state, ModelState::NotDownloaded);
+    }
+
+    #[test]
+    fn cancelled_word_in_other_errors_is_not_cancel() {
+        // A failure that merely mentions "cancelled" must stay a failure.
+        let e = OpError::from_download(DownloadError::Http("upstream cancelled by admin".into()));
+        assert!(matches!(e, OpError::Failed(_)), "got {e:?}");
+        let e = OpError::from_manager(ManagerError::Import("source cancelled mid-read".into()));
+        assert!(matches!(e, OpError::Failed(_)), "got {e:?}");
+        // ...while the real variants still classify as cancel.
+        assert_eq!(
+            OpError::from_download(DownloadError::Cancelled(1, 2)),
+            OpError::Cancelled
+        );
+        assert_eq!(
+            OpError::from_manager(ManagerError::Download(DownloadError::Cancelled(3, 4))),
+            OpError::Cancelled
+        );
+    }
+
+    #[test]
+    fn busy_import_refused_while_download_runs() {
+        let body = vec![5u8; 512 * 1024];
+        let blobs = vec![("slow-busy.gguf".to_string(), body)];
+        let files: HashMap<String, Vec<u8>> = blobs.iter().cloned().collect();
+        let fx = Fixture::serve(files, Duration::from_millis(2));
+        let dir = temp_dir("svc-busy-import");
+        let service = tiny_service(dir.clone(), &fx, &blobs);
+
+        service.start_download();
+        assert!(wait_until(Duration::from_secs(10), || service.status().bytes > 0));
+        // Refused (engine maps this to Error{invalid_request}), not merged.
+        let err = service.start_import(dir.join("whatever.gguf")).unwrap_err();
+        assert!(err.contains("already running"), "got {err}");
+        service.cancel_download();
+        assert!(
+            wait_until(Duration::from_secs(10), || service.status().state == ModelState::Paused),
+            "cancel never settled, got {:?}",
+            service.status()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn busy_second_import_refused_while_import_runs() {
+        // 96 MB: the first import is still copying when the second arrives
+        // (copy + debug-build hashing take seconds).
+        let body = vec![7u8; 96 * 1024 * 1024];
+        let blobs = vec![("huge.gguf".to_string(), body)];
+        let fx = Fixture::serve(HashMap::new(), Duration::ZERO);
+        let srcdir = temp_dir("svc-import-big-src");
+        std::fs::write(srcdir.join("huge.gguf"), &blobs[0].1).unwrap();
+        let dir = temp_dir("svc-import-big");
+        let service = tiny_service(dir.clone(), &fx, &blobs);
+
+        let first = service.start_import(srcdir.join("huge.gguf")).unwrap();
+        assert_eq!(first.state, ModelState::Downloading);
+        // A concurrent import is refused...
+        let err = service.start_import(srcdir.join("huge.gguf")).unwrap_err();
+        assert!(err.contains("already running"), "got {err}");
+        // ...while a download start stays idempotent-ok (no second thread).
+        assert_eq!(service.start_download().state, ModelState::Downloading);
+
+        // The first import still completes byte-identical with compat written.
+        assert!(
+            wait_until(Duration::from_secs(90), || service.status().state == ModelState::Ready),
+            "import never reached ready, got {:?}",
+            service.status()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("huge.gguf")).unwrap(),
+            std::fs::read(srcdir.join("huge.gguf")).unwrap()
+        );
+        assert_eq!(service.check_compat().unwrap(), CompatCheck::Compatible);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&srcdir);
     }
 
     #[test]
