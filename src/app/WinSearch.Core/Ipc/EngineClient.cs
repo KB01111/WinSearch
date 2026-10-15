@@ -38,6 +38,9 @@ public sealed class EngineClient : IAsyncDisposable
     /// <summary>Raised for every pushed or request-scoped status snapshot.</summary>
     public event EventHandler<EngineStatus>? StatusChanged;
 
+    /// <summary>Raised for every pushed or request-scoped model status (download progress, completion).</summary>
+    public event EventHandler<ModelStatus>? ModelStatusChanged;
+
     /// <summary>Raised when the pipe drops and reconnect attempts begin.</summary>
     public event EventHandler? Disconnected;
 
@@ -136,6 +139,26 @@ public sealed class EngineClient : IAsyncDisposable
     /// <summary>Requests a status snapshot; pushed updates also arrive via <see cref="StatusChanged"/>.</summary>
     public Task<EngineStatus> GetStatusAsync(CancellationToken cancellationToken = default)
         => UnaryAsync(static id => new GetStatusMessage { Id = id }, static m => ((StatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Starts (or resumes) the embedding-model download; progress arrives via <see cref="ModelStatusChanged"/>.</summary>
+    public Task<ModelStatus> StartModelDownloadAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new ModelDownloadStartMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Cancels the in-flight model download; partial files stay for resume.</summary>
+    public Task<ModelStatus> CancelModelDownloadAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new ModelDownloadCancelMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Imports model files from a local file or directory.</summary>
+    public Task<ModelStatus> ImportModelAsync(string path, CancellationToken cancellationToken = default)
+        => UnaryAsync(id => new ModelImportMessage { Id = id, Path = path }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Deletes the downloaded model files.</summary>
+    public Task<ModelStatus> DeleteModelAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new ModelDeleteMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Requests a model status snapshot; pushed updates also arrive via <see cref="ModelStatusChanged"/>.</summary>
+    public Task<ModelStatus> GetModelStatusAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new GetModelStatusMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
 
     /// <summary>
     /// Runs a search and streams result batches. Cancelling <paramref name="cancellationToken"/>
@@ -341,6 +364,14 @@ public sealed class EngineClient : IAsyncDisposable
                     statusTcs.TrySetResult(status);
                 }
                 StatusChanged?.Invoke(this, status.Status);
+                break;
+
+            case ModelStatusMessage modelStatus:
+                if (modelStatus.Id is { } modelStatusId && _unary.TryRemove(modelStatusId, out var modelStatusTcs))
+                {
+                    modelStatusTcs.TrySetResult(modelStatus);
+                }
+                ModelStatusChanged?.Invoke(this, modelStatus.Status);
                 break;
 
             case ErrorMessage error:

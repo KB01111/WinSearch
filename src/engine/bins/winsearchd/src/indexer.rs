@@ -145,6 +145,23 @@ impl Indexer {
             .search(req)
     }
 
+    /// Reads a `meta` record (e.g. the `embedding_model` compat record the
+    /// model service maintains).
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .meta_get(key)
+    }
+
+    /// Upserts a `meta` record.
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .meta_set(key, value)
+    }
+
     pub fn status(&self) -> Result<IndexerStatus, StoreError> {
         let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let counters = self.counters.lock().unwrap_or_else(|p| p.into_inner());

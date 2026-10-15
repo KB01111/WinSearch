@@ -41,6 +41,11 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
 | `search` | `id`, `query` | Execute a search; results stream as `results` frames. |
 | `cancel` | `id` | Cancels the in-flight request with this id. |
 | `get_status` | `id` | Snapshot request; answered by `status` with `id` set. |
+| `model_download_start` | `id` | Begin (or resume) the embedding-model download; answered by `model_status` with `id` set. Idempotent while running. |
+| `model_download_cancel` | `id` | Cancel the in-flight model download; partial files stay for resume (`paused`). |
+| `model_import` | `id`, `path` | Import model files from a local file or directory (copied + verified). |
+| `model_delete` | `id` | Delete the downloaded model files. |
+| `get_model_status` | `id` | Snapshot request; answered by `model_status` with `id` set. |
 
 ### Engine → client (`ServerMessage`)
 
@@ -50,6 +55,7 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
 | `pong` | `id` | Heartbeat reply. |
 | `results` | `id`, `batch[]`, `done` | Streamed result batches; terminal frame has `done: true` (also sent when cancelled). |
 | `status` | `id?`, `status` | `id: null` is a pushed update (indexing progress); `id` set answers `get_status`. |
+| `model_status` | `id?`, `status` | `id: null` is a pushed update (download progress / completion); `id` set answers a model request. |
 | `error` | `id?`, `code`, `message` | `id: null` is connection-scoped (e.g. handshake failure). |
 
 ### Payload models
@@ -63,6 +69,8 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
 - `EngineStatus`: `state` (`idle|indexing|paused|error`), `current_activity`,
   `files_discovered`, `files_indexed`, `segments_indexed`, `queue_depth`,
   `model_loaded`, `index_size_bytes`.
+- `ModelStatus`: `state` (`not_downloaded|downloading|paused|ready|error`),
+  `bytes`, `total_bytes`, `error?`.
 - `ErrorCode`: `protocol_version_mismatch`, `invalid_request`, `internal`,
   `not_ready`, `cancelled`, `unsupported`.
 
@@ -78,6 +86,11 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
   reconnect (with engine restart if needed) and a fresh handshake.
 - **Engine independence**: `winsearchd` runs with or without any client
   attached; closing the UI never interrupts indexing.
+- **Model lifecycle**: `model_download_start` resumes `<name>.part` files via
+  HTTP `Range`; progress and completion arrive as pushed `model_status`
+  frames (throttled to ~4 Hz server-side). `model_delete` refuses to run
+  while a download/import is in flight. Every message above is additive:
+  `PROTOCOL_VERSION` stays **1**.
 
 ## Versioning
 
