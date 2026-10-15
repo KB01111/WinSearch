@@ -107,12 +107,28 @@ pub struct EmbedStats {
 /// How to reach and launch the worker. Explicit config beats env beats
 /// compiled defaults, so integration tests can run in parallel with unique
 /// pipes and CLI args instead of mutating process-global env.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EmbedConfig {
     pub worker_bin: PathBuf,
     pub pipe_name: String,
     pub worker_args: Vec<String>,
     pub backoff_base: Duration,
+    /// Test hook: when set, backoff waits call this instead of blocking the
+    /// thread, so tests assert the sleep schedule deterministically.
+    /// `None` (production) blocks on the calling thread.
+    pub sleeper: Option<std::sync::Arc<dyn Fn(Duration) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for EmbedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedConfig")
+            .field("worker_bin", &self.worker_bin)
+            .field("pipe_name", &self.pipe_name)
+            .field("worker_args", &self.worker_args)
+            .field("backoff_base", &self.backoff_base)
+            .field("sleeper_set", &self.sleeper.is_some())
+            .finish()
+    }
 }
 
 impl EmbedConfig {
@@ -141,6 +157,7 @@ impl EmbedConfig {
             pipe_name,
             worker_args: Vec::new(),
             backoff_base,
+            sleeper: None,
         }
     }
 }
@@ -349,18 +366,16 @@ impl EmbedSupervisor {
         }
     }
 
-    /// Restart path: drop the (presumed dead) child, back off, respawn, and
-    /// run one attempt. Used exactly once per job after a transport failure.
+    /// Restart path: drop the (presumed dead) child and run one attempt.
+    /// Used exactly once per job after a transport failure. The backoff wait
+    /// lives in `ensure_worker_locked` below, so the retry path sleeps
+    /// exactly once (single sleep, `backoff_for` shape).
     fn transact_after_restart(&self, req: EmbedRequest) -> Result<EmbedResponse, EmbedError> {
         let _conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
             kill_locked(&mut slot);
         }
-        backoff_sleep(
-            self.failures.load(Ordering::Relaxed),
-            self.config.backoff_base,
-        );
         {
             let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
             self.ensure_worker_locked(&mut slot)?;
@@ -401,9 +416,9 @@ impl EmbedSupervisor {
         }
         let failures = self.failures.load(Ordering::Relaxed);
         if failures > 0 {
-            // ensure_worker is also reached on the first attempt after a
-            // failure was counted elsewhere; back off before respawning.
-            backoff_sleep(failures, self.config.backoff_base);
+            // The single backoff sleep on every (re)spawn path: `transact`
+            // counts the failure, the retry path lands here exactly once.
+            self.backoff_sleep(failures);
         }
         let mut cmd = Command::new(&self.config.worker_bin);
         cmd.args(&self.config.worker_args);
@@ -576,10 +591,18 @@ fn backoff_for(failures: u32, base: Duration) -> Duration {
     scaled.min(MAX_BACKOFF)
 }
 
-fn backoff_sleep(failures: u32, base: Duration) {
-    let d = backoff_for(failures, base);
-    if !d.is_zero() {
-        std::thread::sleep(d);
+impl EmbedSupervisor {
+    /// Waits out the backoff for `failures` consecutive transport failures
+    /// (`backoff_for` shape). Honors the test `sleeper` hook when set.
+    fn backoff_sleep(&self, failures: u32) {
+        let d = backoff_for(failures, self.config.backoff_base);
+        if d.is_zero() {
+            return;
+        }
+        match &self.config.sleeper {
+            Some(sleeper) => sleeper(d),
+            None => std::thread::sleep(d),
+        }
     }
 }
 
@@ -740,13 +763,22 @@ mod tests {
     }
 
     fn test_supervisor(pipe_name: String) -> EmbedSupervisor {
+        test_supervisor_with_sleeper(pipe_name, Duration::from_millis(1), None)
+    }
+
+    fn test_supervisor_with_sleeper(
+        pipe_name: String,
+        backoff_base: Duration,
+        sleeper: Option<std::sync::Arc<dyn Fn(Duration) + Send + Sync>>,
+    ) -> EmbedSupervisor {
         EmbedSupervisor::with_config(EmbedConfig {
             // Never spawned in these tests: the fake is already serving, so
             // `ensure` takes the probe path.
             worker_bin: PathBuf::from(r"C:\definitely-not-a-worker.exe"),
             pipe_name,
             worker_args: Vec::new(),
-            backoff_base: Duration::from_millis(1),
+            backoff_base,
+            sleeper,
         })
     }
 
@@ -758,6 +790,31 @@ mod tests {
         assert_eq!(backoff_for(2, base), Duration::from_millis(500));
         assert_eq!(backoff_for(3, base), Duration::from_secs(1));
         assert_eq!(backoff_for(99, base), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn live_worker_reuse_never_sleeps() {
+        // Retrying against an already-serving worker costs no backoff: the
+        // single sleep lives on the spawn path (see the respawn test below).
+        // The recorder proves the fast path waits never.
+        let fake = FakeWorker::start(Mode::DropFirstJob);
+        let sleeps = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sleeps2 = std::sync::Arc::clone(&sleeps);
+        let sup = test_supervisor_with_sleeper(
+            fake.pipe_name.clone(),
+            Duration::from_millis(250),
+            Some(std::sync::Arc::new(move |d: Duration| {
+                sleeps2.lock().unwrap().push(d);
+            })),
+        );
+
+        let vecs = sup.embed_texts(&["retry me".to_string()]).expect("retry succeeds");
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(sup.stats().retries, 1);
+        assert!(
+            sleeps.lock().unwrap().is_empty(),
+            "live-worker retry must not back off"
+        );
     }
 
     #[test]
@@ -888,16 +945,30 @@ mod tests {
         }
 
         fn real_supervisor(extra_args: &[&str]) -> EmbedSupervisor {
+            real_supervisor_traced(extra_args).0
+        }
+
+        /// Real supervisor plus a recorder for its backoff waits (no real
+        /// waiting when the worker binary is exercised).
+        fn real_supervisor_traced(
+            extra_args: &[&str],
+        ) -> (EmbedSupervisor, std::sync::Arc<Mutex<Vec<Duration>>>) {
             let n = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
             let pipe = format!(r"\\.\pipe\winsearch-embed-int-{}-{n}", std::process::id());
             let mut args = vec!["--pipe".to_string(), pipe.clone()];
             args.extend(extra_args.iter().map(|s| s.to_string()));
-            EmbedSupervisor::with_config(EmbedConfig {
+            let sleeps = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let sleeps2 = std::sync::Arc::clone(&sleeps);
+            let sup = EmbedSupervisor::with_config(EmbedConfig {
                 worker_bin: worker_bin(),
                 pipe_name: pipe,
                 worker_args: args,
                 backoff_base: Duration::from_millis(10),
-            })
+                sleeper: Some(std::sync::Arc::new(move |d: Duration| {
+                    sleeps2.lock().unwrap().push(d);
+                })),
+            });
+            (sup, sleeps)
         }
 
         fn unit_norm(v: &[f32]) -> f64 {
@@ -947,7 +1018,8 @@ mod tests {
         #[test]
         fn killing_the_worker_mid_job_restarts_and_retries() {
             let _serial = serial();
-            let sup = real_supervisor(&["--stub", "--idle-secs", "60", "--stub-delay-ms", "10"]);
+            let (sup, sleeps) =
+                real_supervisor_traced(&["--stub", "--idle-secs", "60", "--stub-delay-ms", "10"]);
             // ~3 s of stub work: the kill below lands mid-job even on a
             // heavily loaded machine.
             let texts: Vec<String> = (0..300).map(|i| format!("mid-job item {i}")).collect();
@@ -968,6 +1040,13 @@ mod tests {
             let stats = sup.stats();
             assert!(stats.retries >= 1, "expected a retry, got {stats:?}");
             assert!(stats.restarts >= 1, "expected a restart, got {stats:?}");
+            // Single backoff on the respawn path (I2): exactly one wait of
+            // `backoff_for(1, base)` for the whole kill → restart → retry.
+            assert_eq!(
+                *sleeps.lock().unwrap(),
+                vec![backoff_for(1, Duration::from_millis(10))],
+                "exactly one backoff sleep with the backoff_for shape"
+            );
 
             // The respawned worker serves follow-up requests.
             let follow = sup

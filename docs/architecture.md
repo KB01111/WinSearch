@@ -91,8 +91,9 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
   queries map to the code mode (index lands in Phase 5) and return nothing
   rather than mixing in normal results. `status()` reports `model_loaded`
   from the embed supervisor's cache (real weights resident, or stub vectors
-  flowing in test setups); `embed_texts()` is the pipeline's entry to the
-  supervised worker (consumed by the semantic pipeline from P3.5).
+  flowing in test setups); the engine reaches the supervisor through
+  `embed_supervisor()` — the pipeline's `embed_texts()` entry lands with the
+  semantic pipeline (P3.5).
 - `embed_client.rs` — supervisor for the inference worker: spawns
   `winsearch-embed` on the first embed request (never before), handshakes
   every connection (health ping + version check + flag refresh), restarts
