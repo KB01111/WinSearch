@@ -1,0 +1,21 @@
+[package]
+name = "winsearch-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WinSearch embedding inference worker: lazy model load, framed-JSON pipe server, idle exit"
+
+[[bin]]
+name = "winsearch-embed"
+path = "src/main.rs"
+
+[dependencies]
+ws-embed.workspace = true
+ws-embed-protocol.workspace = true
+ws-protocol.workspace = true
+ws-platform.workspace = true
+ws-modelmgr.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -84,7 +84,12 @@ pub fn pipe_name() -> Result<String, IdentityError> {
     Ok(format!(r"\\.\pipe\winsearch-{}", current_user_sid()?))
 }
 
-#[cfg(test)]
+/// The embed worker's private pipe (winsearchd is its only client), also
+/// per-user. The `winsearch-embed-` prefix keeps it distinct from the
+/// frontend pipe above; both share the same DACL machinery.
+pub fn embed_pipe_name() -> Result<String, IdentityError> {
+    Ok(format!(r"\\.\pipe\winsearch-embed-{}", current_user_sid()?))
+}#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -99,5 +104,13 @@ mod tests {
     fn pipe_name_embeds_sid() {
         let name = pipe_name().unwrap();
         assert!(name.starts_with(r"\\.\pipe\winsearch-S-1-"));
+    }
+
+    #[test]
+    fn embed_pipe_name_is_distinct_from_engine_pipe() {
+        let embed = embed_pipe_name().unwrap();
+        let engine = pipe_name().unwrap();
+        assert!(embed.starts_with(r"\\.\pipe\winsearch-embed-S-1-"));
+        assert_ne!(embed, engine);
     }
 }

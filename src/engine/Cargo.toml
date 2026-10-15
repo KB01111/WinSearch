@@ -36,6 +36,8 @@ ws-protocol = { path = "crates/ws-protocol" }
 ws-platform = { path = "crates/ws-platform" }
 ws-index = { path = "crates/ws-index" }
 ws-modelmgr = { path = "crates/ws-modelmgr" }
+ws-embed = { path = "crates/ws-embed" }
+ws-embed-protocol = { path = "crates/ws-embed-protocol" }
 
 [profile.release]
 lto = "thin"

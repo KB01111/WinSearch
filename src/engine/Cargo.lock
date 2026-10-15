@@ -1040,16 +1040,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
+name = "winsearch-embed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "ws-embed",
+ "ws-embed-protocol",
+ "ws-modelmgr",
+ "ws-platform",
+ "ws-protocol",
+]
+
+[[package]]
 name = "winsearchd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
  "sha2",
+ "thiserror",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "windows",
+ "ws-embed-protocol",
  "ws-index",
  "ws-modelmgr",
  "ws-platform",
@@ -1066,6 +1083,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "ws-embed-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
