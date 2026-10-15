@@ -7,7 +7,10 @@
 
 use std::time::Instant;
 
-use ws_index::model::{EntryRecord, SearchRequest};
+use ws_index::model::{
+    EntryRecord, NewSegment, SearchRequest, VectorFilter, SEGMENT_KIND_NAME,
+};
+use ws_index::vectors::{EMBEDDING_DIM, VectorIndex};
 use ws_index::IndexStore;
 
 fn main() {
@@ -213,7 +216,108 @@ fn main() {
         stats.entries_total
     );
 
+    // ---- Phase 3 semantic vector benchmarks (768-d FP16) ----
+    run_semantic_bench(&mut store);
+
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pseudo_vector(seed: usize, dim: usize) -> Vec<f32> {
+    let mut state = (seed as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(0x2545_f491_4f6c_dd1d);
+    if state == 0 {
+        state = 1;
+    }
+    let mut v = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let bits = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+        let unit = ((bits >> 40) as f32) / 16_777_216.0;
+        v.push(unit * 2.0 - 1.0);
+    }
+    v
+}
+
+fn run_semantic_bench(store: &mut IndexStore) {
+    println!();
+    println!("--- semantic vector benchmarks (dim={EMBEDDING_DIM}, FP16) ---");
+
+    // 1. In-memory VectorIndex scan latency & throughput at 1k, 10k, 50k segments
+    for &count in &[1_000usize, 10_000, 50_000] {
+        let mut vindex = VectorIndex::new(EMBEDDING_DIM);
+        for i in 0..count {
+            let v = pseudo_vector(i + 1, EMBEDDING_DIM);
+            vindex
+                .add_or_update(i as i64 + 1, i as i64 + 1, SEGMENT_KIND_NAME, &v)
+                .unwrap();
+        }
+        let query = pseudo_vector(999_999, EMBEDDING_DIM);
+        let filter = VectorFilter::for_kind(SEGMENT_KIND_NAME);
+        let runs = if count <= 10_000 { 100 } else { 30 };
+        let mut times = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t = Instant::now();
+            let hits = vindex.search(&query, 200, Some(&filter)).unwrap();
+            std::hint::black_box(hits.len());
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let p50 = times[times.len() / 2];
+        let p95 = times[((times.len() as f64 - 1.0) * 0.95).round() as usize];
+        let vecs_per_sec = count as f64 / p50.as_secs_f64();
+        let fp16_bytes = count * EMBEDDING_DIM * 2;
+        println!(
+            "VectorIndex::search ({count:>6} segs, {:.2} MiB FP16 plane): p50 {:>8.2?}, p95 {:>8.2?}  ({:.0} vecs/s)",
+            fp16_bytes as f64 / 1_048_576.0,
+            p50,
+            p95,
+            vecs_per_sec
+        );
+    }
+
+    // 2. Warm SQLite-backed `IndexStore::search_vectors` at 1k and 10k segments
+    let entry_ids = store.all_entry_ids().unwrap();
+    let filter = VectorFilter::for_kind(SEGMENT_KIND_NAME);
+    let query = pseudo_vector(777_777, EMBEDDING_DIM);
+
+    for &target_segs in &[1_000usize, 10_000] {
+        let current = store.segment_count().unwrap() as usize;
+        for i in current..target_segs.min(entry_ids.len()) {
+            let eid = entry_ids[i];
+            let v = pseudo_vector(i + 100, EMBEDDING_DIM);
+            store
+                .upsert_segment(NewSegment {
+                    entry_id: eid,
+                    kind: SEGMENT_KIND_NAME,
+                    chunk_index: 0,
+                    text: "bench-name.txt",
+                    page: None,
+                    start_ms: None,
+                    end_ms: None,
+                    line: None,
+                    vector: &v,
+                })
+                .unwrap();
+        }
+        let runs = 30;
+        let mut times = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t = Instant::now();
+            let hits = store.search_vectors(&query, 200, Some(&filter)).unwrap();
+            std::hint::black_box(hits.len());
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let p50 = times[times.len() / 2];
+        let p95 = times[((times.len() as f64 - 1.0) * 0.95).round() as usize];
+        println!(
+            "IndexStore::search_vectors ({target_segs:>6} segs, SQLite warm): p50 {:>8.2?}, p95 {:>8.2?}",
+            p50, p95
+        );
+    }
 }
 
 fn synthetic_area(i: usize) -> &'static str {
