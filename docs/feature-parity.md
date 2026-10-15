@@ -47,12 +47,12 @@ implemented **and** verified. Legend: `[x]` done+verified · `[~]` partial ·
 
 ## Semantic search (EmbeddingGemma 2)
 
-- [ ] Model download (865 MB: text Q8_0 + mmproj Q8_0), SHA-256, resume, import (Phase 3)
-- [ ] llama.cpp integration, CUDA > Vulkan > CPU backend detection (Phase 3)
-- [ ] Lazy load / warm-up / idle unload / explicit GPU release (Phase 3)
-- [ ] Vector store (FP16, 768-d) + cosine scan (Phase 3)
-- [ ] Hybrid ranking + exact boost + explanations + thresholds (Phase 3)
-- [ ] Query-embedding cache, cancellation-aware semantic pass (Phase 3)
+- [x] Model download (865 MB: text Q8_0 + mmproj Q8_0), SHA-256, resume, import (Phase 3)
+- [x] llama.cpp integration, CUDA > Vulkan > CPU backend detection (Phase 3)
+- [x] Lazy load / warm-up / idle unload / explicit GPU release (Phase 3)
+- [x] Vector store (FP16, 768-d) + cosine scan (Phase 3)
+- [x] Hybrid ranking + exact boost + explanations + thresholds (Phase 3)
+- [x] Query-embedding cache, cancellation-aware semantic pass (Phase 3)
 
 ## Multimodal content
 
@@ -114,6 +114,7 @@ implemented **and** verified. Legend: `[x]` done+verified · `[~]` partial ·
 - [x] Crawler/watcher/filesystem behavior tests (Phase 2) — 68 tests across
       the workspace, incl. real ReadDirectoryChangesW events, shell-created
       .lnk round-trips, crash/resume, and subst-based drive disconnects
-- [ ] Retrieval evals (exact, OCR, PDF page, audio/video timestamps, code) (Phases 3–5)
+- [~] Retrieval evals (exact, OCR, PDF page, audio/video timestamps, code) (Phases 3–5) —
+      Phase 3 `winsearch-cli eval names` suite (Recall@5 + MRR + negative controls) implemented and passing; OCR/PDF/media/code suites land in Phases 4–5
 - [ ] Resource-behavior tests (Phase 7)
 - [ ] UI verification matrix (Phase 7)

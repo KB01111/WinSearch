@@ -1,0 +1,190 @@
+{
+  "name": "names",
+  "description": "Phase 3 name-corpus retrieval evaluation suite (exact, paraphrase, multilingual, and negative controls)",
+  "thresholds": {
+    "min_recall_at_5": 0.90,
+    "min_mrr": 0.85,
+    "max_false_positive_rate": 0.0
+  },
+  "entries": [
+    { "path": "C:\\Users\\demo\\Documents\\Finance\\2026-annual-budget-forecast.xlsx", "name": "2026-annual-budget-forecast.xlsx", "is_dir": false, "is_app": false, "size": 48120 },
+    { "path": "C:\\Users\\demo\\Documents\\Finance\\household-expenses-tracker.csv", "name": "household-expenses-tracker.csv", "is_dir": false, "is_app": false, "size": 12400 },
+    { "path": "C:\\Users\\demo\\Documents\\Finance\\q4-financial-projection.xlsx", "name": "q4-financial-projection.xlsx", "is_dir": false, "is_app": false, "size": 91200 },
+    { "path": "C:\\Users\\demo\\Documents\\Taxes\\2025-federal-tax-return-1040.pdf", "name": "2025-federal-tax-return-1040.pdf", "is_dir": false, "is_app": false, "size": 310400 },
+    { "path": "C:\\Users\\demo\\Documents\\Taxes\\Steuererklärung-2025-Einkommensteuer.pdf", "name": "Steuererklärung-2025-Einkommensteuer.pdf", "is_dir": false, "is_app": false, "size": 284000 },
+    { "path": "C:\\Users\\demo\\Documents\\Legal\\apartment-lease-agreement-signed.pdf", "name": "apartment-lease-agreement-signed.pdf", "is_dir": false, "is_app": false, "size": 520100 },
+    { "path": "C:\\Users\\demo\\Documents\\Legal\\Mietvertrag-Wohnung-Berlin.pdf", "name": "Mietvertrag-Wohnung-Berlin.pdf", "is_dir": false, "is_app": false, "size": 412000 },
+    { "path": "C:\\Users\\demo\\Documents\\Work\\q3-board-deck-slides.pptx", "name": "q3-board-deck-slides.pptx", "is_dir": false, "is_app": false, "size": 4210000 },
+    { "path": "C:\\Users\\demo\\Documents\\Work\\architecture-review-minutes.md", "name": "architecture-review-minutes.md", "is_dir": false, "is_app": false, "size": 8400 },
+    { "path": "C:\\Users\\demo\\Documents\\Work\\2026年度予算計画書.xlsx", "name": "2026年度予算計画書.xlsx", "is_dir": false, "is_app": false, "size": 65000 },
+    { "path": "C:\\Users\\demo\\Documents\\Career\\curriculum-vitae-2026.pdf", "name": "curriculum-vitae-2026.pdf", "is_dir": false, "is_app": false, "size": 195000 },
+    { "path": "C:\\Users\\demo\\Documents\\Career\\software-engineer-resume.docx", "name": "software-engineer-resume.docx", "is_dir": false, "is_app": false, "size": 88000 },
+    { "path": "C:\\Users\\demo\\Pictures\\Trips\\summer-holiday-hawaii-beach.jpg", "name": "summer-holiday-hawaii-beach.jpg", "is_dir": false, "is_app": false, "size": 3120000 },
+    { "path": "C:\\Users\\demo\\Pictures\\Trips\\urlaub-mallorca-strandfoto.png", "name": "urlaub-mallorca-strandfoto.png", "is_dir": false, "is_app": false, "size": 2890000 },
+    { "path": "C:\\Users\\demo\\Pictures\\Raw\\IMG_20260412_183920.jpg", "name": "IMG_20260412_183920.jpg", "is_dir": false, "is_app": false, "size": 4100000 },
+    { "path": "C:\\Users\\demo\\Pictures\\Screenshots\\Screenshot 2026-04-10 142201.png", "name": "Screenshot 2026-04-10 142201.png", "is_dir": false, "is_app": false, "size": 910000 },
+    { "path": "C:\\Users\\demo\\Downloads\\ubuntu-24.04-desktop-amd64-installer.iso", "name": "ubuntu-24.04-desktop-amd64-installer.iso", "is_dir": false, "is_app": false, "size": 4900000000 },
+    { "path": "C:\\Users\\demo\\Downloads\\archive-backup-tarball-2026.zip", "name": "archive-backup-tarball-2026.zip", "is_dir": false, "is_app": false, "size": 128000000 },
+    { "path": "C:\\Users\\demo\\Music\\ambient-focus-soundtrack.mp3", "name": "ambient-focus-soundtrack.mp3", "is_dir": false, "is_app": false, "size": 9400000 },
+    { "path": "C:\\Users\\demo\\Videos\\product-demo-walkthrough-recording.mp4", "name": "product-demo-walkthrough-recording.mp4", "is_dir": false, "is_app": false, "size": 54000000 },
+    { "path": "C:\\Users\\demo\\Documents\\Recipes\\sourdough-bread-baking-guide.txt", "name": "sourdough-bread-baking-guide.txt", "is_dir": false, "is_app": false, "size": 4100 },
+    { "path": "C:\\Users\\demo\\Documents\\Health\\dental-insurance-claim-form.pdf", "name": "dental-insurance-claim-form.pdf", "is_dir": false, "is_app": false, "size": 215000 },
+    { "path": "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Visual Studio Code.lnk", "name": "Visual Studio Code.lnk", "is_dir": false, "is_app": true, "keywords": "code editor ide", "size": 2048 },
+    { "path": "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Windows Terminal.lnk", "name": "Windows Terminal.lnk", "is_dir": false, "is_app": true, "keywords": "wt console shell powershell", "size": 2048 }
+  ],
+  "queries": [
+    {
+      "query": "budget spreadsheet",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "2026-annual-budget-forecast.xlsx",
+        "household-expenses-tracker.csv",
+        "q4-financial-projection.xlsx"
+      ]
+    },
+    {
+      "query": "financial expense sheet",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "household-expenses-tracker.csv",
+        "2026-annual-budget-forecast.xlsx",
+        "q4-financial-projection.xlsx"
+      ]
+    },
+    {
+      "query": "rental contract",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "apartment-lease-agreement-signed.pdf",
+        "Mietvertrag-Wohnung-Berlin.pdf"
+      ]
+    },
+    {
+      "query": "vacation beach picture",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "summer-holiday-hawaii-beach.jpg",
+        "urlaub-mallorca-strandfoto.png"
+      ]
+    },
+    {
+      "query": "job application cv",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "curriculum-vitae-2026.pdf",
+        "software-engineer-resume.docx"
+      ]
+    },
+    {
+      "query": "keynote presentation slides",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "q3-board-deck-slides.pptx"
+      ]
+    },
+    {
+      "query": "meeting notes",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "architecture-review-minutes.md"
+      ]
+    },
+    {
+      "query": "medical doctor reimbursement",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "dental-insurance-claim-form.pdf"
+      ]
+    },
+    {
+      "query": "cooking recipe",
+      "category": "semantic_paraphrase",
+      "include_semantic": true,
+      "expected_any": [
+        "sourdough-bread-baking-guide.txt"
+      ]
+    },
+    {
+      "query": "Einkommensteuer Erklärung",
+      "category": "multilingual",
+      "include_semantic": true,
+      "expected_any": [
+        "2025-federal-tax-return-1040.pdf",
+        "Steuererklärung-2025-Einkommensteuer.pdf"
+      ]
+    },
+    {
+      "query": "Wohnung Miete Vertrag",
+      "category": "multilingual",
+      "include_semantic": true,
+      "expected_any": [
+        "apartment-lease-agreement-signed.pdf",
+        "Mietvertrag-Wohnung-Berlin.pdf"
+      ]
+    },
+    {
+      "query": "家計 支出 予算",
+      "category": "multilingual",
+      "include_semantic": true,
+      "expected_any": [
+        "2026年度予算計画書.xlsx",
+        "2026-annual-budget-forecast.xlsx",
+        "household-expenses-tracker.csv"
+      ]
+    },
+    {
+      "query": "Sommerurlaub Strand",
+      "category": "multilingual",
+      "include_semantic": true,
+      "expected_any": [
+        "urlaub-mallorca-strandfoto.png",
+        "summer-holiday-hawaii-beach.jpg"
+      ]
+    },
+    {
+      "query": "apartment-lease-agreement",
+      "category": "exact",
+      "include_semantic": true,
+      "expected_any": [
+        "apartment-lease-agreement-signed.pdf"
+      ]
+    },
+    {
+      "query": "Visual Studio Code",
+      "category": "exact",
+      "include_semantic": true,
+      "expected_any": [
+        "Visual Studio Code.lnk"
+      ]
+    },
+    {
+      "query": "photo of a receipt from the hardware store",
+      "category": "negative_control",
+      "include_semantic": true,
+      "expected_any": [],
+      "expect_empty": true
+    },
+    {
+      "query": "error code 0x80070005 in screenshot",
+      "category": "negative_control",
+      "include_semantic": true,
+      "expected_any": [],
+      "expect_empty": true
+    },
+    {
+      "query": "podcast episode discussing rust borrow checker at 12:30",
+      "category": "negative_control",
+      "include_semantic": true,
+      "expected_any": [],
+      "expect_empty": true
+    }
+  ]
+}

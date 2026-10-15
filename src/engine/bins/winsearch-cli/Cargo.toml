@@ -1,0 +1,25 @@
+[package]
+name = "winsearch-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WinSearch CLI: daemon status/search client, model management, and headless retrieval evals"
+
+[[bin]]
+name = "winsearch-cli"
+path = "src/main.rs"
+
+[dependencies]
+ws-protocol.workspace = true
+ws-platform.workspace = true
+ws-index.workspace = true
+ws-modelmgr.workspace = true
+ws-embed-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+windows.workspace = true

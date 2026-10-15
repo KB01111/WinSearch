@@ -5,8 +5,9 @@ benchmarks in this repository on the machine described and pasting the real
 output. Re-run them with:
 
 ```sh
-cargo run --release -p ws-index --example bench 50000     # index + search
+cargo run --release -p ws-index --example bench 50000     # index + search + semantic vector scan
 cargo run --release -p ws-index --example bench 200000
+cargo run -p winsearch-cli -- eval names                  # retrieval eval suite (Recall@5 + MRR)
 target\release\winsearchd.exe --bench-crawl 20000         # crawl pipeline
 ```
 
@@ -68,6 +69,33 @@ Notes:
   daemon runs 4 bounded crawl workers, so wall-clock throughput on a real
   tree scales with I/O concurrency (the queue is per-directory).
 - ~640 bytes of index per file on disk.
+
+## Semantic vector search & hybrid ranking (Phase 3)
+
+Measured via `cargo run --release -p ws-index --example bench 50000` on 768-dimensional FP16-encoded vectors (`EMBEDDING_DIM = 768`, 1,536 bytes per segment in the contiguous FP16 plane; `SEMANTIC_TOP_K = 200`, `MIN_SEMANTIC_COSINE = 0.35`):
+
+| Vector store path | Segments | FP16 memory | p50 | p95 | Scan throughput |
+|---|---|---|---|---|---|
+| `VectorIndex::search` (in-memory FP16 plane) | 1,000 | 1.46 MiB | **2.14 ms** | 2.46 ms | ~467,300 vecs/s |
+| `VectorIndex::search` (in-memory FP16 plane) | 10,000 | 14.65 MiB | **21.81 ms** | 30.52 ms | ~458,600 vecs/s |
+| `VectorIndex::search` (in-memory FP16 plane) | 50,000 | 73.24 MiB | **99.80 ms** | 108.09 ms | ~501,000 vecs/s |
+| `IndexStore::search_vectors` (warm SQLite `segments` scan) | 1,000 | 1,536 B/row | **6.25 ms** | 6.58 ms | ~160,000 vecs/s |
+| `IndexStore::search_vectors` (warm SQLite `segments` scan) | 10,000 | 1,536 B/row | **64.83 ms** | 78.98 ms | ~154,200 vecs/s |
+
+### Retrieval evaluation baseline (`evals/names.json`)
+
+Run via `cargo run -p winsearch-cli -- eval names` (24 fixture entries, 18 queries across semantic paraphrases, German/Japanese multilingual queries, exact matches, and negative controls):
+
+| Suite | Queries | Recall@5 (gate ≥ 0.90) | MRR (gate ≥ 0.85) | Negative-control FP rate (gate ≤ 0.00) |
+|---|---|---|---|---|
+| `names` | 15 positive + 3 negative | **1.000** | **1.000** | **0.000** |
+
+### Tuned semantic & hybrid ranking thresholds
+
+- `MIN_SEMANTIC_COSINE = 0.35`: suppresses unrelated vectors (negative controls score `< 0.15`) while admitting paraphrases and cross-lingual matches (`0.70–0.99`).
+- `SEMANTIC_TOP_K = 200`: candidate pool before per-entry deduplication and hybrid scoring.
+- Hybrid score band `0.45 + 0.45 * cosine` (`[0.45, 0.90]`): places semantic matches below exact/prefix matches (`>= 0.92`) and above weak FTS token matches (`0.50`), with `+0.10` exact-token boost and `+0.02` 30-day recency boost.
+- `QUERY_CACHE_CAP = 64`: LRU cache for query embeddings so repeated/backspaced queries in an overlay session avoid re-embedding.
 
 ## Envelope and interpretation
 
