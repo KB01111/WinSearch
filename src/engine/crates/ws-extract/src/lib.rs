@@ -4,6 +4,8 @@
 pub mod budget;
 pub mod chunk;
 pub mod docs;
+pub mod image;
+pub mod ocr;
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +21,14 @@ pub use chunk::{
     DEFAULT_CHUNK_CHARS, DEFAULT_EXCERPT_CHARS, DEFAULT_OVERLAP_CHARS, DEFAULT_OVERLAP_RATIO,
 };
 pub use docs::{build_document_output, is_numeric_dominated, strip_rtf, DocumentExtractor};
+pub use image::{
+    is_screenshot_path, parse_exif_from_bytes, stat_thumbnail_key, thumbnail_cache_path,
+    ExifMetadata, ImageExtractor, DEFAULT_MAX_IMAGE_EDGE, DEFAULT_THUMBNAIL_MAX_EDGE,
+};
+pub use ocr::{
+    build_ocr_segments, OcrProvider, OcrResultData, OcrWordBox, WinRtOcrProvider,
+    DEFAULT_MAX_OCR_LANGUAGES,
+};
 
 /// Outcome status of running an [`Extractor`] on a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +141,9 @@ pub fn modality_kind_for_ext(ext: &str) -> Option<&'static str> {
             Some(SEGMENT_KIND_DOC)
         }
         "jpg" | "jpeg" | "png" | "webp" | "heic" | "heif" | "avif" | "tiff" | "tif" | "bmp"
-        | "gif" => Some(SEGMENT_KIND_IMAGE),
+        | "gif" | "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "orf" | "rw2" => {
+            Some(SEGMENT_KIND_IMAGE)
+        }
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "wma" | "opus" | "aiff" => {
             Some(SEGMENT_KIND_AUDIO)
         }

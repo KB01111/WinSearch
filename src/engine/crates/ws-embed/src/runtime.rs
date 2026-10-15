@@ -269,9 +269,54 @@ impl EmbedRuntime {
             .unwrap_or(false)
     }
 
-    /// Image embedding entry point. Stubbed until Phase 4 wires mtmd encode.
-    pub fn embed_image(&mut self, _rgb: &[u8], _width: u32, _height: u32) -> Result<Vec<f32>, EmbedError> {
-        Err(EmbedError::MtmdFailed("image embedding is wired in Phase 4".into()))
+    /// Embeds an RGB8 image (`width * height * 3` bytes) through the attached
+    /// `mtmd` vision projector and text model, returning a unit-length `n_embd` vector.
+    pub fn embed_image(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<f32>, EmbedError> {
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|px| px.checked_mul(3))
+            .ok_or_else(|| EmbedError::MtmdFailed("image dimensions overflow".into()))?;
+        if width == 0 || height == 0 || rgb.len() < expected_len {
+            return Err(EmbedError::MtmdFailed(format!(
+                "invalid RGB8 buffer: got {} bytes for {width}x{height}",
+                rgb.len()
+            )));
+        }
+        let mctx = self
+            .mtmd
+            .ok_or_else(|| EmbedError::MtmdFailed("mmproj not loaded".into()))?;
+        let lctx = self
+            .ctx
+            .ok_or_else(|| EmbedError::ContextFailed("context released".into()))?;
+        if !self.mtmd_supports_vision() {
+            return Err(EmbedError::MtmdFailed(
+                "loaded mmproj does not support vision".into(),
+            ));
+        }
+
+        let mut out = vec![0f32; self.n_embd];
+        let rc = unsafe {
+            ffi::wse_mtmd_embed_image(
+                mctx.as_ptr(),
+                lctx.as_ptr(),
+                rgb.as_ptr(),
+                width,
+                height,
+                DEFAULT_N_BATCH as i32,
+                self.n_embd as i32,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(EmbedError::Decode(rc));
+        }
+        l2_normalize(&mut out);
+        Ok(out)
     }
 
     /// Audio embedding entry point. Stubbed until Phase 4 wires mtmd encode.

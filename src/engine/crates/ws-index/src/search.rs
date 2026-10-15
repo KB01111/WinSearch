@@ -93,6 +93,7 @@ impl IndexStore {
                     is_dir: c.row.is_dir,
                     score,
                     explanation,
+                    thumbnail_path: c.row.thumbnail_path,
                 })
             })
             .collect();
@@ -106,7 +107,7 @@ impl IndexStore {
     fn exact_candidates(&self, query_lower: &str) -> Result<Vec<EntryRow>, StoreError> {
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    size, mtime, missing
+                    size, mtime, missing, thumbnail_path
              FROM entries
              WHERE missing = 0 AND name_lower = ?1
              LIMIT 8",
@@ -123,7 +124,7 @@ impl IndexStore {
         };
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    size, mtime, missing
+                    size, mtime, missing, thumbnail_path
              FROM entries
              WHERE missing = 0 AND name_lower >= ?1 AND name_lower < ?2
              LIMIT ?3",
@@ -142,7 +143,7 @@ impl IndexStore {
         let escaped = query_lower.replace('"', "\"\"");
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    size, mtime, missing
+                    size, mtime, missing, thumbnail_path
              FROM entries
              WHERE id IN (
                  SELECT rowid FROM entries_tri WHERE entries_tri MATCH ?1 LIMIT ?2
@@ -162,7 +163,7 @@ impl IndexStore {
             .join(" ");
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    size, mtime, missing
+                    size, mtime, missing, thumbnail_path
              FROM entries
              WHERE id IN (
                  SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1 LIMIT ?2
@@ -180,7 +181,7 @@ impl IndexStore {
             .join(" ");
         self.rows_by(
             "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                    size, mtime, missing
+                    size, mtime, missing, thumbnail_path
              FROM entries
              WHERE id IN (
                  SELECT CAST(entry_id AS INTEGER) FROM content_fts
@@ -265,7 +266,7 @@ fn hit_kind(row: &EntryRow) -> HitKind {
     } else if row.is_dir {
         HitKind::Folder
     } else {
-        crate::model::kind_for_ext(&row.ext).hit_kind()
+        crate::model::kind_for_path_and_ext(&row.path, &row.ext).hit_kind()
     }
 }
 
@@ -283,6 +284,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
         size: row.get::<_, i64>(9)?.max(0) as u64,
         mtime: row.get(10)?,
         missing: row.get::<_, i64>(11)? != 0,
+        thumbnail_path: row.get::<_, Option<String>>(12).unwrap_or(None),
     })
 }
 

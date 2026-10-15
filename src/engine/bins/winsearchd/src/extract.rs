@@ -18,9 +18,9 @@ use std::sync::Arc;
 use tracing::warn;
 use ws_extract::{
     DocumentExtractor, ExtractBudget, ExtractError, ExtractOutput, ExtractionStatus, Extractor,
-    SegmentDraft,
+    ImageExtractor, SegmentDraft,
 };
-use ws_index::model::{NewSegment, SEGMENT_KIND_DOC};
+use ws_index::model::{NewSegment, SEGMENT_KIND_DOC, SEGMENT_KIND_IMAGE};
 use ws_index::{ExtractJob, StoreError};
 
 use crate::embed_client::{EmbedSupervisor, EMBED_JOB_TIMEOUT};
@@ -62,6 +62,7 @@ impl Default for ExtractorRegistry {
             budget_factory: Box::new(|_kind| ExtractBudget::default()),
         };
         reg.register(SEGMENT_KIND_DOC, Arc::new(DocumentExtractor));
+        reg.register(SEGMENT_KIND_IMAGE, Arc::new(ImageExtractor::default()));
         reg
     }
 }
@@ -108,6 +109,22 @@ impl Indexer {
     ) -> Result<ExtractStepOutcome, StoreError>
     where
         F: Fn(&[String]) -> Result<Vec<Vec<f32>>, String>,
+    {
+        self.extract_once_with_media(registry, embed, |_path| Ok(None))
+    }
+
+    /// Like [`Self::extract_once_with`], with an optional `embed_image`
+    /// callback for computing a visual embedding (`EmbedImage` via `mtmd`) on
+    /// `image` modality jobs.
+    pub fn extract_once_with_media<F, FI>(
+        &self,
+        registry: &ExtractorRegistry,
+        embed: F,
+        embed_image: FI,
+    ) -> Result<ExtractStepOutcome, StoreError>
+    where
+        F: Fn(&[String]) -> Result<Vec<Vec<f32>>, String>,
+        FI: Fn(&Path) -> Result<Option<Vec<f32>>, String>,
     {
         // 1. Claim highest-priority non-name job and snapshot entry metadata.
         let claimed = {
@@ -274,6 +291,34 @@ impl Indexer {
             }
         }
 
+        // 5b. For `image` jobs, also compute a visual embedding via `embed_image(path)`
+        // when available (e.g. `mtmd` projector or stub worker).
+        let visual_vec: Option<Vec<f32>> =
+            if output.status == ExtractionStatus::Extracted && job.kind == SEGMENT_KIND_IMAGE {
+                match embed_image(path) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            job = job.id,
+                            error = %e,
+                            "visual image embed failed; releasing job for retry"
+                        );
+                        let mut store = self.store_lock();
+                        let poisoned =
+                            Self::fail_extract_job_capped(&mut store, &job, &entry.name);
+                        return Ok(ExtractStepOutcome {
+                            claimed: true,
+                            status: Some(output.status),
+                            failed: !poisoned,
+                            poisoned,
+                            ..Default::default()
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+
         // 6. Commit FTS + vector segments under the store lock if the entry is unchanged.
         let mut store = self.store_lock();
         let Some(fresh) = store.get_entry(job.entry_id)? else {
@@ -306,10 +351,34 @@ impl Indexer {
         store.replace_content_fts(job.entry_id, &job.kind, &fts_texts)?;
         store.remove_segments_for_entry_and_kind(job.entry_id, &job.kind)?;
 
+        if let Some(thumb) = output
+            .segments
+            .iter()
+            .find_map(|s| s.thumbnail_hint.as_ref())
+        {
+            let thumb_str = thumb.to_string_lossy();
+            store.set_entry_thumbnail_path(job.entry_id, Some(&thumb_str))?;
+        }
+
         // Group chunk_index per segment kind in case an extractor returns
         // multiple kinds (e.g. `image` + `ocr` or `video` + `audio`).
         let mut next_chunk_by_kind: HashMap<&str, i64> = HashMap::new();
         let mut stored = 0usize;
+        if let Some(vvec) = &visual_vec {
+            store.upsert_segment(NewSegment {
+                entry_id: job.entry_id,
+                kind: SEGMENT_KIND_IMAGE,
+                chunk_index: 0,
+                text: &entry.name,
+                page: None,
+                start_ms: None,
+                end_ms: None,
+                line: None,
+                vector: vvec,
+            })?;
+            next_chunk_by_kind.insert(SEGMENT_KIND_IMAGE, 1);
+            stored += 1;
+        }
         for (draft, vec) in embeddable.iter().zip(vectors.iter()) {
             let kind_str = draft.kind.as_str();
             let chunk_idx = next_chunk_by_kind.entry(kind_str).or_insert(0);
@@ -349,10 +418,18 @@ impl Indexer {
         registry: &ExtractorRegistry,
         sup: &Arc<EmbedSupervisor>,
     ) -> Result<ExtractStepOutcome, StoreError> {
-        self.extract_once_with(registry, |texts| {
-            sup.embed_texts_bounded(texts, EMBED_JOB_TIMEOUT)
-                .map_err(|e| e.to_string())
-        })
+        self.extract_once_with_media(
+            registry,
+            |texts| {
+                sup.embed_texts_bounded(texts, EMBED_JOB_TIMEOUT)
+                    .map_err(|e| e.to_string())
+            },
+            |path| match sup.embed_image_bounded(path, EMBED_JOB_TIMEOUT) {
+                Ok(vec) => Ok(Some(vec)),
+                Err(crate::embed_client::EmbedError::Unsupported(_)) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            },
+        )
     }
 
     /// Spawns the 2-thread background content extraction worker pool
@@ -671,6 +748,186 @@ mod tests {
         let store = indexer.store_lock();
         let segs = store.list_segments_for_entry(hits[0].entry_id).unwrap();
         assert!(segs.iter().all(|s| s.kind != SEGMENT_KIND_DOC));
+    }
+
+    #[test]
+    fn image_exif_ocr_screenshot_semantic_and_thumbnail_end_to_end() {
+        use ws_extract::{OcrProvider, OcrResultData, OcrWordBox};
+        use ws_index::model::{HitKind, SEGMENT_KIND_OCR};
+        use ws_platform::wic::write_bgra_thumbnail_png;
+
+        struct MapOcrProvider;
+        impl OcrProvider for MapOcrProvider {
+            fn recognize_bgra8(
+                &self,
+                _bgra8: &[u8],
+                width: u32,
+                _height: u32,
+                _budget: &ExtractBudget,
+            ) -> Result<OcrResultData, ExtractError> {
+                // Distinguish the 800x600 error dialog screenshot from the 640x480 photo.
+                if width == 800 {
+                    Ok(OcrResultData {
+                        text: "Fatal dialog error 0x80070005 CUDA out of memory".into(),
+                        words: vec![OcrWordBox {
+                            text: "0x80070005".into(),
+                            x: 10,
+                            y: 20,
+                            w: 80,
+                            h: 18,
+                        }],
+                        language_tag: Some("en-US".into()),
+                    })
+                } else {
+                    Ok(OcrResultData::default())
+                }
+            }
+        }
+
+        let tree = TempTree::new();
+        let thumb_dir = TempTree::new();
+
+        // 1. Create a photo with EXIF (including a GPS IFD that must NOT be indexed).
+        let photo_path = tree.0.join("receipt_desk.png");
+        let bgra_photo = vec![180u8; 640 * 480 * 4];
+        write_bgra_thumbnail_png(&bgra_photo, 640, 480, 640, &photo_path).unwrap();
+        {
+            // Inject PNG `eXIf` chunk with Camera = "Sony ILCE-7RM4" and GPS = "SECRET_GPS_48_8566".
+            let png = fs::read(&photo_path).unwrap();
+            let mut tiff = Vec::new();
+            tiff.extend_from_slice(b"II*\0");
+            tiff.extend_from_slice(&8u32.to_le_bytes());
+            tiff.extend_from_slice(&2u16.to_le_bytes());
+            let model = b"Sony ILCE-7RM4\0";
+            let model_off = 38u32;
+            let gps_off = model_off + model.len() as u32;
+            // Tag 0x0110 Model
+            tiff.extend_from_slice(&0x0110u16.to_le_bytes());
+            tiff.extend_from_slice(&2u16.to_le_bytes());
+            tiff.extend_from_slice(&(model.len() as u32).to_le_bytes());
+            tiff.extend_from_slice(&model_off.to_le_bytes());
+            // Tag 0x8825 GPSInfo IFD
+            tiff.extend_from_slice(&0x8825u16.to_le_bytes());
+            tiff.extend_from_slice(&4u16.to_le_bytes());
+            tiff.extend_from_slice(&1u32.to_le_bytes());
+            tiff.extend_from_slice(&gps_off.to_le_bytes());
+            tiff.extend_from_slice(&0u32.to_le_bytes());
+            while tiff.len() < model_off as usize {
+                tiff.push(0);
+            }
+            tiff.extend_from_slice(model);
+            // GPS IFD with secret coordinate string
+            let gps_secret = b"SECRET_GPS_48_8566\0";
+            let gps_str_off = gps_off + 2 + 12 + 4;
+            tiff.extend_from_slice(&1u16.to_le_bytes());
+            tiff.extend_from_slice(&0x0002u16.to_le_bytes());
+            tiff.extend_from_slice(&2u16.to_le_bytes());
+            tiff.extend_from_slice(&(gps_secret.len() as u32).to_le_bytes());
+            tiff.extend_from_slice(&gps_str_off.to_le_bytes());
+            tiff.extend_from_slice(&0u32.to_le_bytes());
+            tiff.extend_from_slice(gps_secret);
+
+            let iend = png.len() - 12;
+            let mut out = Vec::new();
+            out.extend_from_slice(&png[..iend]);
+            out.extend_from_slice(&(tiff.len() as u32).to_be_bytes());
+            out.extend_from_slice(b"eXIf");
+            out.extend_from_slice(&tiff);
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&png[iend..]);
+            fs::write(&photo_path, out).unwrap();
+        }
+
+        // 2. Create a screenshot inside a `Screenshots` folder.
+        let shots_dir = tree.0.join("Screenshots");
+        fs::create_dir_all(&shots_dir).unwrap();
+        let shot_path = shots_dir.join("dialog.png");
+        let bgra_shot = vec![220u8; 800 * 600 * 4];
+        write_bgra_thumbnail_png(&bgra_shot, 800, 600, 800, &shot_path).unwrap();
+
+        let indexer = seeded_indexer(&tree);
+        assert_eq!(indexer.content_extract_queue_depth().unwrap(), 2);
+
+        let mut registry = ExtractorRegistry::default();
+        registry.register(
+            SEGMENT_KIND_IMAGE,
+            Arc::new(ImageExtractor::new(
+                thumb_dir.0.clone(),
+                Arc::new(MapOcrProvider),
+            )),
+        );
+
+        // Visual embedding callback simulates mmproj embedding "a receipt on a desk"
+        // for `receipt_desk.png`.
+        let receipt_query = "a receipt on a desk";
+        let visual_embed = |p: &Path| -> Result<Option<Vec<f32>>, String> {
+            let seed = if p.file_name().and_then(|n| n.to_str()) == Some("receipt_desk.png") {
+                receipt_query.to_string()
+            } else {
+                format!("image:{}", p.display())
+            };
+            Ok(Some(ws_embed_protocol::stub_vector(
+                &seed,
+                ws_embed_protocol::STUB_DIM,
+            )))
+        };
+
+        while indexer.content_extract_queue_depth().unwrap() > 0 {
+            let step = indexer
+                .extract_once_with_media(&registry, fake_embed, visual_embed)
+                .unwrap();
+            assert!(step.claimed);
+            assert_eq!(step.status, Some(ExtractionStatus::Extracted));
+        }
+
+        // A. EXIF fields are searchable via FTS, while GPS geotags are never indexed.
+        let cam_hits = indexer
+            .search(&SearchRequest {
+                text: "ILCE-7RM4".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(cam_hits.len(), 1);
+        assert_eq!(cam_hits[0].name, "receipt_desk.png");
+        assert!(cam_hits[0].thumbnail_path.as_ref().is_some_and(|t| Path::new(t).is_file()));
+
+        let gps_hits = indexer
+            .search(&SearchRequest {
+                text: "SECRET_GPS_48_8566".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(gps_hits.is_empty(), "GPS geotag must never be indexed");
+
+        // B. Screenshot OCR exact error-code hit + `HitKind::Screenshot` classification.
+        let ocr_hits = indexer
+            .search(&SearchRequest {
+                text: "0x80070005".into(),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(ocr_hits.len(), 1);
+        assert_eq!(ocr_hits[0].name, "dialog.png");
+        assert_eq!(ocr_hits[0].kind, HitKind::Screenshot);
+
+        // Verify OCR segment is also stored for semantic search.
+        {
+            let store = indexer.store_lock();
+            let segs = store.list_segments_for_entry(ocr_hits[0].entry_id).unwrap();
+            assert!(segs.iter().any(|s| s.kind == SEGMENT_KIND_OCR));
+        }
+
+        // C. Semantic visual query "a receipt on a desk" matches the mmproj image segment.
+        let qvec = ws_embed_protocol::stub_vector(receipt_query, ws_embed_protocol::STUB_DIM);
+        let sem_hits = indexer
+            .search_vectors(&qvec, 5, Some(&VectorFilter::for_kind(SEGMENT_KIND_IMAGE)))
+            .unwrap();
+        assert!(!sem_hits.is_empty());
+        assert_eq!(sem_hits[0].segment.entry_id, cam_hits[0].entry_id);
+        assert!(sem_hits[0].cosine > 0.99);
     }
 }
 

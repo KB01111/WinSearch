@@ -9,6 +9,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <cstdint>
 #include <cstring>
@@ -232,6 +233,78 @@ int32_t wse_mtmd_supports_vision(const mtmd_context * ctx) {
 
 int32_t wse_mtmd_supports_audio(const mtmd_context * ctx) {
     return mtmd_support_audio(ctx) ? 1 : 0;
+}
+
+// Encodes an RGB8 image (`width * height * 3` bytes) through the mtmd vision
+// projector + text model context and copies the pooled `n_embd` vector into `out`.
+// Returns 0 on success, non-zero on failure.
+int32_t wse_mtmd_embed_image(
+    mtmd_context * mctx,
+    struct llama_context * lctx,
+    const unsigned char * rgb,
+    uint32_t width,
+    uint32_t height,
+    int32_t n_batch,
+    int32_t n_embd,
+    float * out
+) {
+    if (!mctx || !lctx || !rgb || width == 0 || height == 0 || n_embd <= 0 || !out) {
+        return -1;
+    }
+    if (!mtmd_support_vision(mctx)) {
+        return -2;
+    }
+    mtmd_bitmap * bmp = mtmd_bitmap_init(width, height, rgb);
+    if (!bmp) {
+        return -3;
+    }
+    const char * marker = mtmd_default_marker();
+    if (!marker) {
+        marker = "<__media__>";
+    }
+    mtmd_input_text inp_text;
+    inp_text.text = marker;
+    inp_text.text_len = std::strlen(marker);
+    inp_text.add_special = true;
+    inp_text.parse_special = true;
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    const mtmd_bitmap * bitmaps[1] = { bmp };
+    int32_t tok_rc = mtmd_tokenize(mctx, chunks, &inp_text, bitmaps, 1);
+    if (tok_rc != 0) {
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(bmp);
+        return -4;
+    }
+
+    llama_memory_clear(llama_get_memory(lctx), true);
+    llama_pos new_n_past = 0;
+    int32_t eval_rc = mtmd_helper_eval_chunks(
+        mctx,
+        lctx,
+        chunks,
+        0,
+        0,
+        n_batch > 0 ? n_batch : 512,
+        true,
+        &new_n_past
+    );
+    int32_t rc = eval_rc;
+    if (rc == 0) {
+        float * e = llama_get_embeddings_seq(lctx, 0);
+        if (!e) {
+            e = llama_get_embeddings_ith(lctx, -1);
+        }
+        if (!e) {
+            rc = -5;
+        } else {
+            std::memcpy(out, e, sizeof(float) * (size_t) n_embd);
+        }
+    }
+
+    mtmd_input_chunks_free(chunks);
+    mtmd_bitmap_free(bmp);
+    return rc;
 }
 
 } // extern "C"

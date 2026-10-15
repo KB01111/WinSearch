@@ -62,6 +62,7 @@ pub struct EntryRow {
     pub size: u64,
     pub mtime: i64,
     pub missing: bool,
+    pub thumbnail_path: Option<String>,
 }
 
 pub struct IndexStore {
@@ -223,6 +224,18 @@ impl IndexStore {
             if !cols.iter().any(|c| c == "priority") {
                 conn.execute(
                     "ALTER TABLE extract_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
+        {
+            let entry_cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(entries)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            if !entry_cols.iter().any(|c| c == "thumbnail_path") {
+                conn.execute(
+                    "ALTER TABLE entries ADD COLUMN thumbnail_path TEXT NULL",
                     [],
                 )?;
             }
@@ -504,7 +517,7 @@ impl IndexStore {
         self.conn
             .query_row(
                 "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                        size, mtime, missing
+                        size, mtime, missing, thumbnail_path
                  FROM entries WHERE path = ?1",
                 params![path],
                 map_entry_row,
@@ -523,7 +536,7 @@ impl IndexStore {
         self.conn
             .query_row(
                 "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                        size, mtime, missing
+                        size, mtime, missing, thumbnail_path
                  FROM entries WHERE volume_serial = ?1 AND file_id = ?2 LIMIT 1",
                 params![volume_serial as i64, file_id as i64],
                 map_entry_row,
@@ -1328,13 +1341,26 @@ impl IndexStore {
         self.conn
             .query_row(
                 "SELECT id, root_id, parent_id, path, name, name_lower, ext, is_dir, is_app,
-                        size, mtime, missing
+                        size, mtime, missing, thumbnail_path
                  FROM entries WHERE id = ?1",
                 params![id],
                 map_entry_row,
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Persists or clears the cached `thumbnail_path` for `entry_id`.
+    pub fn set_entry_thumbnail_path(
+        &mut self,
+        entry_id: i64,
+        thumbnail_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE entries SET thumbnail_path = ?2 WHERE id = ?1",
+            params![entry_id, thumbnail_path],
+        )?;
+        Ok(())
     }
 
     /// Every entry id, ordered (model-swap requeue path enqueues one name job
@@ -1411,6 +1437,7 @@ fn map_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
         size: row.get::<_, i64>(9)?.max(0) as u64,
         mtime: row.get(10)?,
         missing: row.get::<_, i64>(11)? != 0,
+        thumbnail_path: row.get::<_, Option<String>>(12).unwrap_or(None),
     })
 }
 

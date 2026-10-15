@@ -61,8 +61,48 @@ impl EntryRecord {
         if self.is_dir {
             return EntryKind::Folder;
         }
-        kind_for_ext(&self.ext)
+        kind_for_path_and_ext(&self.path, &self.ext)
     }
+}
+
+/// Extension (lowercase, no dot) + path → entry kind (flags images in
+/// `Screenshots` folders or with `Screenshot*` filenames as [`EntryKind::Screenshot`]).
+pub fn kind_for_path_and_ext(path: &str, ext: &str) -> EntryKind {
+    let base = kind_for_ext(ext);
+    if base == EntryKind::Image && is_screenshot_path_str(path) {
+        EntryKind::Screenshot
+    } else {
+        base
+    }
+}
+
+/// Returns `true` when `path` is inside a known screenshot directory
+/// (`Screenshots`, `Screen Shots`, `Captures`) or its filename starts with
+/// `Screenshot` / `Screen Shot` / `Snip_`.
+pub fn is_screenshot_path_str(path: &str) -> bool {
+    let p = Path::new(path);
+    for ancestor in p.ancestors().skip(1) {
+        if let Some(folder) = ancestor.file_name().and_then(|n| n.to_str()) {
+            let lower = folder.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "screenshots" | "screen shots" | "screencaptures" | "captures"
+            ) {
+                return true;
+            }
+        }
+    }
+    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+        let lower = stem.to_ascii_lowercase();
+        if lower.starts_with("screenshot")
+            || lower.starts_with("screen shot")
+            || lower.starts_with("screen_shot")
+            || lower.starts_with("snip_")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extension (lowercase, no dot) → entry kind.
@@ -107,6 +147,8 @@ pub struct SearchHit {
     pub score: f64,
     /// Short human-readable match reason ("Name starts with query", ...).
     pub explanation: String,
+    /// Optional cached thumbnail path on disk.
+    pub thumbnail_path: Option<String>,
 }
 
 /// Search request against the index (calculator and settings results are

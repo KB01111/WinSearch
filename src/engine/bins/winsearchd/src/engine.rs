@@ -15,7 +15,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use ws_index::model::{
     EngineConfig as StoredEngineConfig, HitKind, PreferredBackend, SearchRequest, VectorFilter,
-    kind_for_ext, SEGMENT_KIND_NAME,
+    kind_for_path_and_ext, SEGMENT_KIND_NAME,
 };
 use ws_index::{EntryRow, evaluate, search_settings};
 use ws_platform::paths;
@@ -466,29 +466,32 @@ impl EngineService {
                 return Vec::new();
             }
         };
-        let filter = VectorFilter::for_kind(SEGMENT_KIND_NAME);
-        let scored = match self.indexer.search_vectors(&query_vec, SEMANTIC_TOP_K, Some(&filter)) {
+        let scored = match self.indexer.search_vectors(&query_vec, SEMANTIC_TOP_K, None) {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "semantic stage: vector search failed; exact results stand");
                 return Vec::new();
             }
         };
-        // Best cosine per entry (a re-embedded name leaves one segment row,
-        // but the per-entry pass keeps this robust to multi-segment futures).
-        let mut best: HashMap<i64, f32> = HashMap::new();
+        // Best cosine per entry across all segment kinds (`name`, `doc`, `image`, `ocr`, `pdf`, ...).
+        let mut best: HashMap<i64, (f32, String)> = HashMap::new();
         for hit in &scored {
             if hit.cosine < MIN_SEMANTIC_COSINE {
                 continue;
             }
             best.entry(hit.segment.entry_id)
-                .and_modify(|c| *c = c.max(hit.cosine))
-                .or_insert(hit.cosine);
+                .and_modify(|(c, k)| {
+                    if hit.cosine > *c {
+                        *c = hit.cosine;
+                        *k = hit.segment.kind.clone();
+                    }
+                })
+                .or_insert_with(|| (hit.cosine, hit.segment.kind.clone()));
         }
         let kinds = hit_kinds(&query.categories);
         let now = now_unix();
         let mut out = Vec::new();
-        for (entry_id, cosine) in best {
+        for (entry_id, (cosine, seg_kind)) in best {
             if exact_entry_ids.contains(&entry_id) {
                 continue; // duplicate suppression vs the exact batch
             }
@@ -518,11 +521,11 @@ impl EngineService {
                 kind: to_result_kind(kind),
                 title: entry.name.clone(),
                 subtitle: entry.path.clone(),
-                match_explanation: semantic_explanation(cosine),
+                match_explanation: semantic_explanation_for_kind(&seg_kind, cosine),
                 score: hybrid_score(cosine, text, &entry.name_lower, entry.mtime, now),
                 path: Some(entry.path),
                 location: None,
-                thumbnail_path: None,
+                thumbnail_path: entry.thumbnail_path,
             });
         }
         out.sort_by(|a, b| {
@@ -756,7 +759,7 @@ impl EngineService {
                         score: hit.score,
                         path: Some(hit.path),
                         location: None,
-                        thumbnail_path: None,
+                        thumbnail_path: hit.thumbnail_path,
                     });
                 }
             }
@@ -797,14 +800,15 @@ fn to_result_kind(kind: HitKind) -> ResultKind {
 }
 
 /// `HitKind` for a stored entry row (mirrors the retrieval ranking's typing:
-/// applications first, then directories, then extension kinds).
+/// applications first, then directories, then path+extension kinds including
+/// `Screenshot`).
 fn entry_hit_kind(row: &EntryRow) -> HitKind {
     if row.is_app {
         HitKind::Application
     } else if row.is_dir {
         HitKind::Folder
     } else {
-        kind_for_ext(&row.ext).hit_kind()
+        kind_for_path_and_ext(&row.path, &row.ext).hit_kind()
     }
 }
 
@@ -868,6 +872,16 @@ fn hybrid_score(cosine: f32, query_text: &str, name_lower: &str, mtime: i64, now
 /// Human-readable reason on every semantic hit.
 fn semantic_explanation(cosine: f32) -> String {
     format!("semantic name match · similarity {cosine:.2}")
+}
+
+fn semantic_explanation_for_kind(seg_kind: &str, cosine: f32) -> String {
+    match seg_kind {
+        SEGMENT_KIND_NAME => semantic_explanation(cosine),
+        "image" => format!("semantic image match · similarity {cosine:.2}"),
+        "ocr" => format!("semantic OCR match · similarity {cosine:.2}"),
+        "doc" | "pdf" => format!("semantic content match · similarity {cosine:.2}"),
+        other => format!("semantic {other} match · similarity {cosine:.2}"),
+    }
 }
 
 fn now_unix() -> i64 {

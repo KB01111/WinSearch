@@ -473,6 +473,100 @@ impl EmbedSupervisor {
         Ok(all)
     }
 
+    /// Bounded single-image embed path (`EmbedRequest::EmbedImage { id, path }`)
+    /// for the Phase 4 image extractor. Uses the same leak-free helper +
+    /// `CancelSynchronousIo` watchdog as [`Self::embed_texts_bounded`].
+    pub fn embed_image_bounded(
+        self: &std::sync::Arc<Self>,
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> Result<Vec<f32>, EmbedError> {
+        use std::sync::mpsc;
+        let path_str = path.to_string_lossy().into_owned();
+        if path_str.is_empty() {
+            return Err(EmbedError::InvalidRequest("empty image path".into()));
+        }
+        let sup = std::sync::Arc::clone(self);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel2 = std::sync::Arc::clone(&cancel);
+        let deadline = Instant::now() + timeout;
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("winsearch-embed-img".into())
+            .spawn(move || {
+                let r = sup.embed_image_cancelable(&path_str, &cancel2, deadline);
+                let _ = tx.send(r);
+            })
+            .map_err(|e| EmbedError::Transport(format!("cannot spawn image embed helper: {e}")))?;
+        match rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel.store(true, Ordering::Relaxed);
+                self.cancel_inflight_read();
+                self.terminate_worker();
+                warn!("image embed job timed out after {timeout:?}; helper cancelled");
+                Err(EmbedError::Transport(format!(
+                    "image embed job timed out after {timeout:?}"
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EmbedError::Transport(
+                "image embed helper died before answering".into(),
+            )),
+        }
+    }
+
+    fn embed_image_cancelable(
+        &self,
+        path: &str,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Vec<f32>, EmbedError> {
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(EmbedError::Transport("image embed job cancelled".into()));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = EmbedRequest::EmbedImage {
+            id,
+            path: path.to_string(),
+        };
+        let extract_first = |vecs: Vec<Vec<f32>>| -> Result<Vec<f32>, EmbedError> {
+            vecs.into_iter().next().ok_or_else(|| {
+                EmbedError::Protocol("embed_image returned empty vector list".into())
+            })
+        };
+        match self.transact_bounded(req, cancel, deadline) {
+            Ok(EmbedResponse::Embeddings { vecs, .. }) => {
+                self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
+                extract_first(vecs)
+            }
+            Ok(other) => Err(EmbedError::Protocol(format!(
+                "unexpected reply to embed_image: {}",
+                response_kind(&other)
+            ))),
+            Err(EmbedError::Transport(_)) => {
+                self.stats.lock().unwrap_or_else(|p| p.into_inner()).retries += 1;
+                info!("image embed job interrupted; restarting worker and retrying once");
+                let retry_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let retry = EmbedRequest::EmbedImage {
+                    id: retry_id,
+                    path: path.to_string(),
+                };
+                match self.transact_bounded_after_restart(retry, cancel, deadline) {
+                    Ok(EmbedResponse::Embeddings { vecs, .. }) => {
+                        self.stats.lock().unwrap_or_else(|p| p.into_inner()).jobs += 1;
+                        extract_first(vecs)
+                    }
+                    Ok(other) => Err(EmbedError::Protocol(format!(
+                        "unexpected reply to retried embed_image: {}",
+                        response_kind(&other)
+                    ))),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Health ping: handshake + `status` round-trip, spawning the worker if
     /// needed. Refreshes the cached `model_loaded` flags.
     pub fn ping(&self) -> Result<WorkerSnapshot, EmbedError> {

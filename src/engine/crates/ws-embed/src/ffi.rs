@@ -74,4 +74,14 @@ extern "C" {
     pub fn wse_mtmd_free(ctx: *mut MtmdContext);
     pub fn wse_mtmd_supports_vision(ctx: *const MtmdContext) -> i32;
     pub fn wse_mtmd_supports_audio(ctx: *const MtmdContext) -> i32;
+    pub fn wse_mtmd_embed_image(
+        mctx: *mut MtmdContext,
+        lctx: *mut LlamaContext,
+        rgb: *const u8,
+        width: u32,
+        height: u32,
+        n_batch: i32,
+        n_embd: i32,
+        out: *mut f32,
+    ) -> i32;
 }

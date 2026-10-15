@@ -307,9 +307,9 @@ fn dispatch(req: &EmbedRequest, shared: &Shared) -> Action {
             };
             job_guard(shared, || embed_media_job(shared, *id, &seed, "audio"))
         }
-        EmbedRequest::EmbedImage { id, path } => job_guard(shared, || {
-            embed_media_job(shared, *id, &format!("image:{path}"), "image")
-        }),
+        EmbedRequest::EmbedImage { id, path } => {
+            job_guard(shared, || embed_image_job(shared, *id, path))
+        }
         EmbedRequest::Status { id } => reply(status_response(shared, *id)),
         EmbedRequest::Shutdown { id } => {
             Action::RespondAndExit(EmbedResponse::ShutdownAck { id: *id })
@@ -410,6 +410,80 @@ fn embed_texts_job(shared: &Shared, id: u64, texts: &[String]) -> EmbedResponse 
             EmbedResponse::Embeddings {
                 id,
                 vecs,
+                dim,
+                backend,
+                stub: false,
+            }
+        }
+        Err(message) => EmbedResponse::Error {
+            id: Some(id),
+            code: EmbedErrorCode::EmbedFailed,
+            message,
+        },
+    }
+}
+
+fn embed_image_job(shared: &Shared, id: u64, path_str: &str) -> EmbedResponse {
+    if shared.cfg.stub {
+        if !shared.cfg.stub_delay.is_zero() {
+            std::thread::sleep(shared.cfg.stub_delay);
+        }
+        served(shared);
+        let seed = format!("image:{path_str}");
+        return EmbedResponse::Embeddings {
+            id,
+            vecs: vec![stub_vector(&seed, STUB_DIM)],
+            dim: STUB_DIM,
+            backend: "stub".to_string(),
+            stub: true,
+        };
+    }
+
+    let path = std::path::Path::new(path_str);
+    let wic = match ws_platform::wic::decode_image_wic(path, 1024) {
+        Ok(img) => img,
+        Err(e) => {
+            return EmbedResponse::Error {
+                id: Some(id),
+                code: EmbedErrorCode::EmbedFailed,
+                message: format!("WIC image decode failed for {path_str}: {e}"),
+            };
+        }
+    };
+    let rgb = ws_platform::wic::bgra8_to_rgb8(&wic.bgra8);
+
+    let mut eng = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
+    let (dim, result) = match ensure_runtime(&mut eng, shared) {
+        Ok(rt) if rt.has_mtmd() && rt.mtmd_supports_vision() => {
+            let dim = rt.n_embd();
+            (
+                dim,
+                rt.embed_image(&rgb, wic.scaled_width, wic.scaled_height)
+                    .map_err(|e| e.to_string()),
+            )
+        }
+        Ok(_) => {
+            return EmbedResponse::Error {
+                id: Some(id),
+                code: EmbedErrorCode::Unsupported,
+                message: "image embedding requires the multimodal vision projector (mmproj)".into(),
+            };
+        }
+        Err(message) => {
+            return EmbedResponse::Error {
+                id: Some(id),
+                code: EmbedErrorCode::ModelNotAvailable,
+                message,
+            };
+        }
+    };
+    let backend = eng.backend.clone().unwrap_or_else(|| "?".into());
+    match result {
+        Ok(vec) => {
+            eng.jobs_served += 1;
+            EmbedResponse::Embeddings {
+                id,
+                vecs: vec![vec],
                 dim,
                 backend,
                 stub: false,
