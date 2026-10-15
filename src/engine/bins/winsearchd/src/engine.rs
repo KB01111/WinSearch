@@ -20,6 +20,7 @@ use ws_protocol::{
     SearchMode, SearchQuery, SearchResult, ServerMessage,
 };
 
+use crate::embed_client::EmbedSupervisor;
 use crate::indexer::Indexer;
 use crate::model::ModelService;
 
@@ -52,6 +53,10 @@ pub struct EngineService {
     next_client_id: std::sync::atomic::AtomicU64,
     indexer: Arc<Indexer>,
     models: Arc<ModelService>,
+    /// Embed worker supervisor (lazy: spawns on first embed request).
+    /// `winsearchd` links no native inference code; all embeddings flow
+    /// through this supervisor over the internal pipe.
+    embed: EmbedSupervisor,
 }
 
 pub type SharedEngine = Arc<EngineService>;
@@ -61,8 +66,21 @@ impl EngineService {
         Self::new_with_model_dir(indexer, paths::model_dir())
     }
 
+    /// Production wiring used by `main.rs`: explicit embed supervisor.
+    pub fn new_with_embed(indexer: Arc<Indexer>, embed: EmbedSupervisor) -> SharedEngine {
+        Self::new_inner(indexer, paths::model_dir(), embed)
+    }
+
     /// Test hook: same engine with an isolated model directory.
     pub fn new_with_model_dir(indexer: Arc<Indexer>, model_dir: std::path::PathBuf) -> SharedEngine {
+        Self::new_inner(indexer, model_dir, EmbedSupervisor::new())
+    }
+
+    fn new_inner(
+        indexer: Arc<Indexer>,
+        model_dir: std::path::PathBuf,
+        embed: EmbedSupervisor,
+    ) -> SharedEngine {
         let models = ModelService::new(model_dir, Arc::clone(&indexer));
         Arc::new(Self {
             status: Mutex::new(EngineStatus {
@@ -75,11 +93,16 @@ impl EngineService {
             next_client_id: std::sync::atomic::AtomicU64::new(1),
             indexer,
             models,
+            embed,
         })
     }
 
     pub fn model_service(&self) -> &Arc<ModelService> {
         &self.models
+    }
+
+    pub fn embed_supervisor(&self) -> &EmbedSupervisor {
+        &self.embed
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -88,6 +111,10 @@ impl EngineService {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        // `model_loaded` is live from the embed supervisor's cache (real
+        // weights resident, or stub vectors flowing in test setups). Reading
+        // the cache never spawns a worker.
+        status.model_loaded = self.embed.model_loaded();
         // Indexing counters are live; the stored snapshot only carries the
         // broadcast state.
         if let Ok(s) = self.indexer.status() {

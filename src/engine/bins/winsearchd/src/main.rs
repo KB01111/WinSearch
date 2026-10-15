@@ -5,6 +5,7 @@
 
 mod catalog;
 mod crawl;
+mod embed_client;
 mod engine;
 mod indexer;
 mod model;
@@ -59,7 +60,15 @@ fn main() -> anyhow::Result<()> {
     indexer.start_background()?;
 
     let pipe_name = identity::pipe_name()?;
-    let engine = EngineService::new(Arc::clone(&indexer));
+    // The embed worker is supervisor-owned and lazy: constructing it spawns
+    // nothing (first embed request starts the worker, idle timeout stops it).
+    let embed = embed_client::EmbedSupervisor::new();
+    let engine = EngineService::new_with_embed(Arc::clone(&indexer), embed);
+    info!(
+        bin = %engine.embed_supervisor().worker_bin().display(),
+        pipe = %engine.embed_supervisor().pipe_name(),
+        "embed supervisor wired to engine"
+    );
     spawn_status_pusher(Arc::clone(&engine));
     // Model progress/completion pushes fan out to every connected client.
     {

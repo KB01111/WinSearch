@@ -71,8 +71,7 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
 
 ### `winsearchd` (bins/winsearchd)
 
-- `crawl.rs` — per-directory scan with the exclusion policy: hidden/system
-  items, dev trees (`.git`, `node_modules`, `target`, …), and sensitive files
+- `crawl.rs` — per-directory scan with the exclusion policy: hidden/system  items, dev trees (`.git`, `node_modules`, `target`, …), and sensitive files
   (keys, certs, credential stores). Metadata comes from directory enumeration;
   identity lookups open files with `FILE_READ_ATTRIBUTES` only, so cloud
   placeholders (OneDrive) are never hydrated. Reparse points are indexed as
@@ -90,7 +89,29 @@ The search index — no Windows dependencies, fully unit-tested anywhere.
 - `engine.rs` — the search pipeline: calculator → settings → index hits,
   streamed as progressive batches with cooperative cancellation. `code:`
   queries map to the code mode (index lands in Phase 5) and return nothing
-  rather than mixing in normal results.
+  rather than mixing in normal results. `status()` reports `model_loaded`
+  from the embed supervisor's cache (real weights resident, or stub vectors
+  flowing in test setups); `embed_texts()` is the pipeline's entry to the
+  supervised worker (consumed by the semantic pipeline from P3.5).
+- `embed_client.rs` — supervisor for the inference worker: spawns
+  `winsearch-embed` on the first embed request (never before), handshakes
+  every connection (health ping + version check + flag refresh), restarts
+  with backoff after a transport failure and retries the in-flight job once.
+  Definitive worker errors are never retried. Links no native inference code.
+
+### `winsearch-embed` (bins/winsearch-embed) + `ws-embed-protocol`
+
+- `winsearch-embed` — crash-isolated inference process serving the internal
+  embed-worker protocol on `\\.\pipe\winsearch-embed-<SID>` (one client,
+  `winsearchd`). Loads the model lazily on the first job (stays alive on
+  `model_not_available` so a later download can succeed), warms up via
+  `EmbedRuntime`, and exits after 5 minutes idle — process exit is the full
+  GPU release. Single-instance mutex `Local\WinSearch.Embed.v1`.
+  `--stub` serves deterministic 768-d unit vectors with no model file.
+- `ws-embed-protocol` — the single definition of that protocol (own version
+  `EMBED_PROTOCOL_VERSION`, never mirrored to the frontend): `hello`,
+  `embed_texts`/`embed_audio`/`embed_image` jobs, `status`/`shutdown`, and
+  the deterministic stub-vector math. See `ipc-protocol.md`.
 
 ### Frontend (src/app)
 

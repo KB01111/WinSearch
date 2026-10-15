@@ -98,3 +98,49 @@ All messages carry a `type` discriminator (snake_case). Requests carry `id`
 Breaking wire changes bump `PROTOCOL_VERSION`. Both sides refuse mismatched
 versions at handshake with `error: protocol_version_mismatch` and disconnect.
 Additive fields use `#[serde(default)]` semantics and do not bump the version.
+
+## Internal embed-worker protocol (P3.2)
+
+`winsearchd` talks to its inference worker `winsearch-embed` over a **second**
+per-user pipe, `\\.\pipe\winsearch-embed-<SID>`, built on the same
+`ws-platform` DACL machinery (`PIPE_REJECT_REMOTE_CLIENTS`, current user
+only). Framing is the same length-prefixed JSON codec (16 MiB cap), but the
+message set and version are independent: `EMBED_PROTOCOL_VERSION` (currently
+**1**) lives in the `ws-embed-protocol` crate, which is the single definition
+both sides code against. This protocol is **internal**: it is never mirrored
+to `WinSearch.Core` and `PROTOCOL_VERSION` above is untouched by it.
+
+`winsearchd` is the only client (one connection at a time; concurrent
+connections serialize). The supervisor batches 32–256 texts per job; larger
+batches are split into one `embed_texts` job per 256-text chunk.
+
+| direction | `type` | fields | description |
+|---|---|---|---|
+| → worker | `hello` | `protocol_version`, `client`, `client_version` | First message per connection; doubles as the health ping. Mismatch → `error{version_mismatch}` + close. |
+| → worker | `embed_texts` | `id`, `texts[1–256]` | Embed a batch; answered by `embeddings`. |
+| → worker | `embed_audio` | `id`, `path`, `window_ms?` | Plumbing lands in P3.2; vectors in Phase 4 (real worker answers `unsupported` until mtmd is wired). |
+| → worker | `embed_image` | `id`, `path` | Same Phase-4 note as audio. |
+| → worker | `status` | `id` | Health probe; answered by `worker_status`. |
+| → worker | `shutdown` | `id` | Acknowledge with `shutdown_ack`, then exit (idle-exit stays the normal path). |
+| worker → | `hello_ack` | `protocol_version`, `worker_version`, `features[]`, `model_loaded`, `stub` | `features` always has `embed_texts`; audio/image tags appear only when servable (stub mode, or mtmd from Phase 4). |
+| worker → | `embeddings` | `id`, `vecs[]`, `dim`, `backend`, `stub` | One L2-normalized vector per input, in order; plain JSON f32 arrays (binary encoding only if profiling demands it). |
+| worker → | `worker_status` | `id`, `model_loaded`, `backend?`, `stub`, `dim`, `uptime_secs`, `jobs_served` | Self-reported liveness. |
+| worker → | `error` | `id?`, `code`, `message` | `code`: `version_mismatch` \| `invalid_request` \| `model_not_available` \| `embed_failed` \| `unsupported`. Only transport failures trigger a supervisor restart; `error` answers are definitive for the job. |
+| worker → | `shutdown_ack` | `id` | Shutdown accepted. |
+
+Worker lifecycle: single-instance mutex `Local\WinSearch.Embed.v1`; model
+loads lazily on the first job (missing file → `model_not_available`, worker
+stays alive for a later retry after download); idle exit after 5 minutes
+without work — process exit returns all GPU memory, which is the full GPU
+release. Supervisor: spawn on first request (never before), handshake every
+connection (refreshes the cached `model_loaded`/`stub` behind
+`EngineStatus.model_loaded`), restart with backoff (`250 ms · 2ⁿ`, 5 s cap)
+after a transport failure and retry the in-flight job exactly once.
+
+Test/ops knobs (CLI flags win over env): `--pipe/--idle-secs/--stub/
+--model/--backend/--stub-delay-ms`, else `WS_EMBED_PIPE/WS_EMBED_IDLE_SECS/
+WS_EMBED_STUB/WS_EMBED_MODEL/WS_EMBED_BACKEND/WS_EMBED_STUB_DELAY_MS`, else
+compiled defaults. Supervisor side: `WS_EMBED_BIN` (worker exe override),
+`WS_EMBED_PIPE`, `WS_EMBED_BACKOFF_MS`. `WS_EMBED_STUB=1` serves
+deterministic stub vectors (FNV-1a seeded, 768-d, unit-norm) with no model
+file; `WS_EMBED_TEST_MODEL` gates the real-model tests (never committed).
