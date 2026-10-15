@@ -56,11 +56,11 @@ implemented **and** verified. Legend: `[x]` done+verified · `[~]` partial ·
 
 ## Multimodal content
 
-- [ ] Image semantic search (JPEG/PNG/WebP/HEIC/AVIF/TIFF/BMP/GIF/RAW) + EXIF (Phase 4)
-- [ ] Screenshot search: visual + OCR text, exact error codes (Phase 4)
+- [x] Image semantic search (JPEG/PNG/WebP/HEIC/AVIF/TIFF/BMP/GIF/RAW) + EXIF (Phase 4)
+- [x] Screenshot search: visual + OCR text, exact error codes (Phase 4)
 - [ ] PDF page-level search, scanned-page OCR, page numbers/thumbnails,
       first-30-pages fast path, 5,000-page cap, resumable (Phase 4)
-- [ ] Document search (txt/md/rtf/doc/docx/odt/html) with chunking, excerpts,
+- [x] Document search (txt/md/rtf/doc/docx/odt/html) with chunking, excerpts,
       numeric-content exact-only routing (Phase 4)
 - [ ] Audio: 30 s overlapping windows, timestamp matches, player with
       seek-to-match (Phase 4)
@@ -69,10 +69,10 @@ implemented **and** verified. Legend: `[x]` done+verified · `[~]` partial ·
 
 ## Code search (opt-in)
 
-- [ ] Separate code index (never mixes with normal results) (Phase 5)
-- [ ] Repository detection, .gitignore, language detection (Phase 5)
-- [ ] Tree-sitter chunking + symbols, definitions over references (Phase 5)
-- [ ] Notebook cells (without outputs), line-number preservation (Phase 5)
+- [x] Separate code index (never mixes with normal results) (Phase 5)
+- [x] Repository detection, .gitignore, language detection (Phase 5)
+- [x] Tree-sitter chunking + symbols, definitions over references (Phase 5)
+- [x] Notebook cells (without outputs), line-number preservation (Phase 5)
 - [ ] `code:` queries (semantic + exact identifier) (Phase 5)
 - [ ] Editor detection + open-at-line (VS Code, Cursor, VS, JetBrains,
       Sublime, Zed, configurable) (Phase 5)

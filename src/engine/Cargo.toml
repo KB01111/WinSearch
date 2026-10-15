@@ -51,6 +51,8 @@ ws-modelmgr = { path = "crates/ws-modelmgr" }
 ws-embed = { path = "crates/ws-embed" }
 ws-embed-protocol = { path = "crates/ws-embed-protocol" }
 ws-extract = { path = "crates/ws-extract" }
+ws-code = { path = "crates/ws-code" }
+ignore = "0.4"
 
 [profile.release]
 lto = "thin"
