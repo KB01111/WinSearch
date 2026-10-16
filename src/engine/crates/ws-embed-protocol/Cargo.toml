@@ -1,0 +1,12 @@
+[package]
+name = "ws-embed-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WinSearch internal embed-worker protocol: typed framed-JSON messages between winsearchd and winsearch-embed (own pipe, own version; never mirrored to the frontend)"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -40,26 +40,47 @@ internal static class ResultActions
 
     public static void RevealInExplorer(SearchResult result)
     {
-        var path = result.Path ?? result.Subtitle;
-        if (string.IsNullOrEmpty(path))
+        if (result.Kind is ResultKind.Calculator or ResultKind.Settings or ResultKind.Action)
         {
             return;
         }
 
-        NativeMethods.SHParseDisplayName(path, IntPtr.Zero, out var pidl, 0, out _);
-        if (pidl == IntPtr.Zero)
+        var path = result.Path ?? result.Subtitle;
+        if (string.IsNullOrWhiteSpace(path))
         {
             return;
         }
+
+        string fullPath;
         try
         {
-            // Parent folder + single item selection.
-            var fullPidl = pidl;
-            NativeMethods.SHOpenFolderAndSelectItems(fullPidl, 0, IntPtr.Zero, 0);
+            fullPath = Path.GetFullPath(path);
         }
-        finally
+        catch
         {
-            NativeMethods.ILFree(pidl);
+            fullPath = path.Replace('/', '\\');
+        }
+
+        var hr = NativeMethods.SHParseDisplayName(fullPath, IntPtr.Zero, out var pidl, 0, out _);
+        if (hr >= 0 && pidl != IntPtr.Zero)
+        {
+            try
+            {
+                // When cidl == 0, pidlFolder is the full item PIDL; Explorer opens its parent and selects the item.
+                if (NativeMethods.SHOpenFolderAndSelectItems(pidl, 0, IntPtr.Zero, 0) >= 0)
+                {
+                    return;
+                }
+            }
+            finally
+            {
+                NativeMethods.ILFree(pidl);
+            }
+        }
+
+        if (File.Exists(fullPath) || Directory.Exists(fullPath))
+        {
+            NativeMethods.ShellExecuteW(IntPtr.Zero, "open", "explorer.exe", $"/select,\"{fullPath}\"", null, 1);
         }
     }
 

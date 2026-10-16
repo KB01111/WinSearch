@@ -8,12 +8,35 @@ using WinSearch.Core.Protocol;
 namespace WinSearch.Core.Ipc;
 
 /// <summary>
+/// Contract for engine IPC operations consumed by view models, allowing
+/// deterministic in-memory unit tests alongside the named-pipe <see cref="EngineClient"/>.
+/// </summary>
+public interface IEngineClient : IAsyncDisposable
+{
+    event EventHandler<EngineStatus>? StatusChanged;
+    event EventHandler<ModelStatus>? ModelStatusChanged;
+    event EventHandler<EngineConfig>? ConfigChanged;
+    event EventHandler? Disconnected;
+    event EventHandler? Reconnected;
+
+    Task<EngineStatus> GetStatusAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> StartModelDownloadAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> CancelModelDownloadAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> ImportModelAsync(string path, CancellationToken cancellationToken = default);
+    Task<ModelStatus> DeleteModelAsync(CancellationToken cancellationToken = default);
+    Task<ModelStatus> GetModelStatusAsync(CancellationToken cancellationToken = default);
+    Task<EngineConfig> GetConfigAsync(CancellationToken cancellationToken = default);
+    Task<EngineConfig> SetConfigAsync(EngineConfig config, CancellationToken cancellationToken = default);
+    IAsyncEnumerable<SearchBatch> SearchAsync(SearchQuery query, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
 /// Async client for the engine's named pipe. Supports request/response with
 /// correlation ids, streamed search batches, per-request cancellation, pushed
 /// status updates, and automatic reconnection (with engine restart) when the
 /// connection drops.
 /// </summary>
-public sealed class EngineClient : IAsyncDisposable
+public sealed class EngineClient : IEngineClient
 {
     private const int MaxFrameBytes = 16 * 1024 * 1024;
     private const int HandshakeTimeoutMs = 5000;
@@ -37,6 +60,12 @@ public sealed class EngineClient : IAsyncDisposable
 
     /// <summary>Raised for every pushed or request-scoped status snapshot.</summary>
     public event EventHandler<EngineStatus>? StatusChanged;
+
+    /// <summary>Raised for every pushed or request-scoped model status (download progress, completion).</summary>
+    public event EventHandler<ModelStatus>? ModelStatusChanged;
+
+    /// <summary>Raised when the engine search policy arrives (Get/SetConfig answers).</summary>
+    public event EventHandler<EngineConfig>? ConfigChanged;
 
     /// <summary>Raised when the pipe drops and reconnect attempts begin.</summary>
     public event EventHandler? Disconnected;
@@ -130,12 +159,41 @@ public sealed class EngineClient : IAsyncDisposable
                 ErrorCode.ProtocolVersionMismatch,
                 $"engine speaks protocol v{ack.ProtocolVersion}, client speaks v{ProtocolJson.Version}");
         }
+        Reconnected?.Invoke(this, EventArgs.Empty);
         return ack;
     }
 
     /// <summary>Requests a status snapshot; pushed updates also arrive via <see cref="StatusChanged"/>.</summary>
     public Task<EngineStatus> GetStatusAsync(CancellationToken cancellationToken = default)
         => UnaryAsync(static id => new GetStatusMessage { Id = id }, static m => ((StatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Starts (or resumes) the embedding-model download; progress arrives via <see cref="ModelStatusChanged"/>.</summary>
+    public Task<ModelStatus> StartModelDownloadAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new ModelDownloadStartMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Cancels the in-flight model download; partial files stay for resume.</summary>
+    public Task<ModelStatus> CancelModelDownloadAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new ModelDownloadCancelMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Imports model files from a local file or directory.</summary>
+    public Task<ModelStatus> ImportModelAsync(string path, CancellationToken cancellationToken = default)
+        => UnaryAsync(id => new ModelImportMessage { Id = id, Path = path }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Deletes the downloaded model files.</summary>
+    public Task<ModelStatus> DeleteModelAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new ModelDeleteMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Requests a model status snapshot; pushed updates also arrive via <see cref="ModelStatusChanged"/>.</summary>
+    public Task<ModelStatus> GetModelStatusAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new GetModelStatusMessage { Id = id }, static m => ((ModelStatusMessage)m).Status, cancellationToken);
+
+    /// <summary>Requests the engine search policy; answers also arrive via <see cref="ConfigChanged"/>.</summary>
+    public Task<EngineConfig> GetConfigAsync(CancellationToken cancellationToken = default)
+        => UnaryAsync(static id => new GetConfigMessage { Id = id }, static m => ((ConfigMessage)m).Config, cancellationToken);
+
+    /// <summary>Persists the engine search policy; the stored copy arrives via <see cref="ConfigChanged"/>.</summary>
+    public Task<EngineConfig> SetConfigAsync(EngineConfig config, CancellationToken cancellationToken = default)
+        => UnaryAsync(id => new SetConfigMessage { Id = id, Config = config }, static m => ((ConfigMessage)m).Config, cancellationToken);
 
     /// <summary>
     /// Runs a search and streams result batches. Cancelling <paramref name="cancellationToken"/>
@@ -343,6 +401,22 @@ public sealed class EngineClient : IAsyncDisposable
                 StatusChanged?.Invoke(this, status.Status);
                 break;
 
+            case ModelStatusMessage modelStatus:
+                if (modelStatus.Id is { } modelStatusId && _unary.TryRemove(modelStatusId, out var modelStatusTcs))
+                {
+                    modelStatusTcs.TrySetResult(modelStatus);
+                }
+                ModelStatusChanged?.Invoke(this, modelStatus.Status);
+                break;
+
+            case ConfigMessage config:
+                if (config.Id is { } configId && _unary.TryRemove(configId, out var configTcs))
+                {
+                    configTcs.TrySetResult(config);
+                }
+                ConfigChanged?.Invoke(this, config.Config);
+                break;
+
             case ErrorMessage error:
                 var exception = new EngineException(error.Code, error.Message);
                 if (error.Id is { } errorId)
@@ -398,7 +472,6 @@ public sealed class EngineClient : IAsyncDisposable
             {
                 await Task.Delay(500);
                 await ConnectAsync(_lifetime.Token);
-                Reconnected?.Invoke(this, EventArgs.Empty);
                 return;
             }
             catch (OperationCanceledException)

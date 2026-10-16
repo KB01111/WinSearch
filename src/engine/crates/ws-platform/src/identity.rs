@@ -84,6 +84,56 @@ pub fn pipe_name() -> Result<String, IdentityError> {
     Ok(format!(r"\\.\pipe\winsearch-{}", current_user_sid()?))
 }
 
+/// The embed worker's private pipe (winsearchd is its only client), also
+/// per-user. The `winsearch-embed-` prefix keeps it distinct from the
+/// frontend pipe above; both share the same DACL machinery.
+pub fn embed_pipe_name() -> Result<String, IdentityError> {
+    Ok(format!(r"\\.\pipe\winsearch-embed-{}", current_user_sid()?))
+}
+
+/// Captures `(volume_serial, file_id)` for `path` via `GetFileInformationByHandleEx`
+/// without reading file contents (`FILE_READ_ATTRIBUTES` only).
+pub fn file_identity(path: &std::path::Path) -> Option<(u32, u64)> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FileIdInfo, GetFileInformationByHandleEx, FILE_FLAGS_AND_ATTRIBUTES,
+        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+        .ok()?;
+        let mut info: FILE_ID_INFO = std::mem::zeroed();
+        let result = GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            &mut info as *mut FILE_ID_INFO as *mut c_void,
+            size_of::<FILE_ID_INFO>() as u32,
+        );
+        let _ = CloseHandle(handle);
+        result.ok()?;
+        let file_id =
+            u64::from_le_bytes(info.FileId.Identifier[..8].try_into().unwrap_or([0; 8]));
+        Some((info.VolumeSerialNumber as u32, file_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +149,13 @@ mod tests {
     fn pipe_name_embeds_sid() {
         let name = pipe_name().unwrap();
         assert!(name.starts_with(r"\\.\pipe\winsearch-S-1-"));
+    }
+
+    #[test]
+    fn embed_pipe_name_is_distinct_from_engine_pipe() {
+        let embed = embed_pipe_name().unwrap();
+        let engine = pipe_name().unwrap();
+        assert!(embed.starts_with(r"\\.\pipe\winsearch-embed-S-1-"));
+        assert_ne!(embed, engine);
     }
 }

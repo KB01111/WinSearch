@@ -12,7 +12,8 @@ public enum AppTheme
 /// <summary>
 /// Frontend settings (theme, hotkey, search behaviour) stored in
 /// <c>%LOCALAPPDATA%\WinSearch\settings.json</c>. Engine-side policy (folders,
-/// schedules) travels over IPC and lives in the engine database.
+/// schedules, semantic enablement, preferred backend) travels over IPC and
+/// lives in the engine database.
 /// </summary>
 public sealed class AppSettings
 {

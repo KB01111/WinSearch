@@ -4,60 +4,157 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
-    <Grid x:Name="RootGrid" Padding="24" RowSpacing="16">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="*" />
-        </Grid.RowDefinitions>
+    <ScrollViewer x:Name="RootGrid" Padding="24">
+        <StackPanel Spacing="20">
+            <TextBlock
+                Style="{StaticResource TitleTextBlockStyle}"
+                Text="Settings" />
 
-        <TextBlock
-            Grid.Row="0"
-            Style="{StaticResource TitleTextBlockStyle}"
-            Text="Settings" />
+            <!-- Theme -->
+            <StackPanel Spacing="8">
+                <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Theme" />
+                <ComboBox
+                    x:Name="ThemeCombo"
+                    MinWidth="220"
+                    HorizontalAlignment="Left"
+                    SelectionChanged="OnThemeChanged" />
+            </StackPanel>
 
-        <!-- Theme -->
-        <StackPanel Grid.Row="1" Spacing="8">
-            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Theme" />
-            <ComboBox
-                x:Name="ThemeCombo"
-                MinWidth="220"
-                HorizontalAlignment="Left"
-                SelectionChanged="OnThemeChanged" />
-        </StackPanel>
+            <!-- Global shortcut -->
+            <StackPanel Spacing="8">
+                <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Global shortcut" />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Border
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1"
+                        CornerRadius="4"
+                        Padding="12,6">
+                        <TextBlock x:Name="HotkeyText" FontFamily="Consolas" Text="Alt + Space" />
+                    </Border>
+                    <Button x:Name="ChangeHotkeyButton" Click="OnChangeHotkeyClick" Content="Change" />
+                    <Button Click="OnResetHotkeyClick" Content="Reset" />
+                </StackPanel>
+                <TextBlock
+                    x:Name="HotkeyStatusText"
+                    FontSize="12"
+                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                    Text="Click Change, then press the new key combination." />
+            </StackPanel>
 
-        <!-- Global shortcut -->
-        <StackPanel Grid.Row="2" Spacing="8">
-            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Global shortcut" />
-            <StackPanel Orientation="Horizontal" Spacing="8">
+            <!-- Search behaviour -->
+            <StackPanel Spacing="8">
+                <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Search" />
+                <ToggleSwitch
+                    x:Name="RememberQueryToggle"
+                    OffContent="Start with an empty search field"
+                    OnContent="Remember the last query between launches"
+                    Toggled="OnRememberQueryToggled" />
+            </StackPanel>
+
+            <!-- AI model -->
+            <StackPanel Spacing="10">
+                <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="AI model" />
+
                 <Border
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                     BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                     BorderThickness="1"
-                    CornerRadius="4"
-                    Padding="12,6">
-                    <TextBlock x:Name="HotkeyText" FontFamily="Consolas" Text="Alt + Space" />
-                </Border>
-                <Button x:Name="ChangeHotkeyButton" Click="OnChangeHotkeyClick" Content="Change" />
-                <Button Click="OnResetHotkeyClick" Content="Reset" />
-            </StackPanel>
-            <TextBlock
-                x:Name="HotkeyStatusText"
-                FontSize="12"
-                Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                Text="Click Change, then press the new key combination." />
-        </StackPanel>
+                    CornerRadius="8"
+                    Padding="16"
+                    MaxWidth="640"
+                    HorizontalAlignment="Left">
+                    <StackPanel Spacing="12" MinWidth="460">
+                        <StackPanel Spacing="4">
+                            <TextBlock
+                                FontWeight="SemiBold"
+                                Text="EmbeddingGemma 2 (Q8_0 text + multimodal projector)" />
+                            <TextBlock
+                                x:Name="ModelStatusSummaryText"
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="AI model not downloaded (~865 MB)" />
+                        </StackPanel>
 
-        <!-- Search behaviour -->
-        <StackPanel Grid.Row="3" Spacing="8">
-            <TextBlock Style="{StaticResource BodyStrongTextBlockStyle}" Text="Search" />
-            <ToggleSwitch
-                x:Name="RememberQueryToggle"
-                OffContent="Start with an empty search field"
-                OnContent="Remember the last query between launches"
-                Toggled="OnRememberQueryToggled" />
+                        <StackPanel x:Name="ModelProgressPanel" Spacing="4">
+                            <ProgressBar
+                                x:Name="ModelProgressBar"
+                                Minimum="0"
+                                Maximum="100"
+                                Value="0" />
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock
+                                    x:Name="ModelProgressDetailText"
+                                    Grid.Column="0"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                    Text="0 MB / 865 MB" />
+                                <TextBlock
+                                    x:Name="ModelSpeedText"
+                                    Grid.Column="1"
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                            </Grid>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button
+                                x:Name="DownloadModelButton"
+                                Click="OnDownloadModelClick"
+                                Content="Download" />
+                            <Button
+                                x:Name="PauseModelButton"
+                                Click="OnPauseModelClick"
+                                Content="Pause"
+                                IsEnabled="False" />
+                            <Button
+                                x:Name="ImportModelButton"
+                                Click="OnImportModelClick"
+                                Content="Import…" />
+                            <Button
+                                x:Name="DeleteModelButton"
+                                Click="OnDeleteModelClick"
+                                Content="Delete"
+                                IsEnabled="False" />
+                        </StackPanel>
+
+                        <TextBlock
+                            x:Name="ModelErrorTextBlock"
+                            FontSize="12"
+                            Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                            TextWrapping="Wrap"
+                            Visibility="Collapsed" />
+
+                        <ToggleSwitch
+                            x:Name="SemanticSearchToggle"
+                            Header="Semantic search"
+                            OffContent="Exact matches only"
+                            OnContent="Show semantic matches after exact results"
+                            Toggled="OnSemanticSearchToggled" />
+
+                        <StackPanel Spacing="4">
+                            <TextBlock
+                                FontSize="12"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="Inference backend" />
+                            <ComboBox
+                                x:Name="BackendCombo"
+                                MinWidth="220"
+                                HorizontalAlignment="Left"
+                                SelectionChanged="OnBackendChanged" />
+                            <TextBlock
+                                x:Name="DetectedBackendText"
+                                FontSize="11"
+                                Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                Text="Auto (CUDA &gt; Vulkan &gt; CPU)" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
         </StackPanel>
-    </Grid>
+    </ScrollViewer>
 </Window>

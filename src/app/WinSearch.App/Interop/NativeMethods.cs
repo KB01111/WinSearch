@@ -219,12 +219,12 @@ internal static class NativeMethods
         string? lpDirectory, int nShowCmd);
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    public static extern void SHParseDisplayName(
+    public static extern int SHParseDisplayName(
         string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
 
     [DllImport("shell32.dll")]
     public static extern void ILFree(IntPtr pidl);
 
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    public static extern bool SHOpenFolderAndSelectItems(IntPtr pidlFolder, uint cidl, IntPtr apidl, uint dwFlags);
+    [DllImport("shell32.dll")]
+    public static extern int SHOpenFolderAndSelectItems(IntPtr pidlFolder, uint cidl, IntPtr apidl, uint dwFlags);
 }

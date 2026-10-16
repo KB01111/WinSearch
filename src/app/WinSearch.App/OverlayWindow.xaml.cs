@@ -39,6 +39,7 @@ public sealed partial class OverlayWindow : Window
 
         ResultsList.ItemsSource = _viewModel.Results;
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+        SearchBox.TextChanged += OnSearchBoxTextChanged;
         ApplyTheme();
 
         Activated += OnWindowActivated;
@@ -47,6 +48,14 @@ public sealed partial class OverlayWindow : Window
         {
             SearchBox.Text = _settings.LastQuery;
             _viewModel.QueryText = _settings.LastQuery;
+        }
+    }
+
+    private void OnSearchBoxTextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_viewModel.QueryText != SearchBox.Text)
+        {
+            _viewModel.QueryText = SearchBox.Text;
         }
     }
 
@@ -59,6 +68,17 @@ public sealed partial class OverlayWindow : Window
                 break;
             case nameof(MainOverlayViewModel.ModeLabel):
                 ModeIndicator.Text = _viewModel.ModeLabel;
+                break;
+            case nameof(MainOverlayViewModel.IsSemanticPending):
+                SemanticPendingPanel.Visibility = _viewModel.IsSemanticPending
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+                break;
+            case nameof(MainOverlayViewModel.SemanticHintText):
+                SemanticHintText.Text = _viewModel.SemanticHintText;
+                SemanticHintText.Visibility = string.IsNullOrEmpty(_viewModel.SemanticHintText)
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
                 break;
         }
     }
@@ -131,8 +151,11 @@ public sealed partial class OverlayWindow : Window
         }
     }
 
-    private void OnSearchBoxKeyDown(object sender, KeyRoutedEventArgs e)
+    private async void OnSearchBoxKeyDown(object sender, KeyRoutedEventArgs e)
     {
+        var ctrlDown = (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
+                        & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+
         switch (e.Key)
         {
             case VirtualKey.Escape:
@@ -140,6 +163,7 @@ public sealed partial class OverlayWindow : Window
                 {
                     SearchBox.Text = "";
                     _viewModel.QueryText = "";
+                    _ = _viewModel.SearchNowAsync();
                 }
                 else
                 {
@@ -148,9 +172,26 @@ public sealed partial class OverlayWindow : Window
                 e.Handled = true;
                 break;
 
-            case VirtualKey.Enter:
-                OpenSelectedResult();
+            case VirtualKey.Enter when ctrlDown:
+                // Ctrl+Enter: reveal the result in its folder instead of opening it.
                 e.Handled = true;
+                await FlushPendingQueryAsync();
+                RevealSelectedResult();
+                break;
+
+            case VirtualKey.Enter:
+                e.Handled = true;
+                await FlushPendingQueryAsync();
+                OpenSelectedResult();
+                break;
+
+            case VirtualKey.C when ctrlDown && string.IsNullOrEmpty(SearchBox.SelectedText):
+                // Ctrl+C with no text selection copies the selected result's path.
+                if (ResultsList.SelectedItem is ResultItemViewModel copyItem)
+                {
+                    ResultActions.CopyPath(copyItem.Result);
+                    e.Handled = true;
+                }
                 break;
 
             case VirtualKey.Down:
@@ -163,9 +204,7 @@ public sealed partial class OverlayWindow : Window
                 e.Handled = true;
                 break;
 
-            case VirtualKey.Space when
-                (Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control)
-                 & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0:
+            case VirtualKey.Space when ctrlDown:
                 // Ctrl+Space reserved for preview (Phase 6).
                 break;
         }
@@ -199,9 +238,41 @@ public sealed partial class OverlayWindow : Window
         }
     }
 
+    private async Task FlushPendingQueryAsync()
+    {
+        var queryMismatch = _viewModel.QueryText != SearchBox.Text;
+        if (queryMismatch)
+        {
+            _viewModel.QueryText = SearchBox.Text;
+            await _viewModel.SearchNowAsync();
+        }
+        else
+        {
+            await _viewModel.FlushOrWaitForSearchAsync();
+        }
+
+        if (ResultsList.SelectedIndex < 0 && _viewModel.Results.Count > 0)
+        {
+            ResultsList.SelectedIndex = 0;
+        }
+    }
+
+    private void RevealSelectedResult()
+    {
+        var item = ResultsList.SelectedItem as ResultItemViewModel
+            ?? (_viewModel.Results.Count > 0 ? _viewModel.Results[0] : null);
+        if (item is not null)
+        {
+            ResultActions.RevealInExplorer(item.Result);
+            HideOverlay();
+        }
+    }
+
     private void OpenSelectedResult()
     {
-        if (ResultsList.SelectedItem is ResultItemViewModel item)
+        var item = ResultsList.SelectedItem as ResultItemViewModel
+            ?? (_viewModel.Results.Count > 0 ? _viewModel.Results[0] : null);
+        if (item is not null)
         {
             ResultActions.Open(item.Result);
             HideOverlay();

@@ -10,3 +10,7 @@ pub mod messages;
 
 pub use framing::{read_message, write_message, FrameError, MAX_FRAME_BYTES};
 pub use messages::*;
+
+// Model lifecycle snapshots ride the wire verbatim; the canonical shape lives
+// in ws-modelmgr so Rust and the C# mirror cannot drift.
+pub use ws_modelmgr::{ModelState, ModelStatus};

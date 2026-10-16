@@ -12,6 +12,13 @@ namespace WinSearch.Core.Protocol;
 [JsonDerivedType(typeof(SearchMessage), "search")]
 [JsonDerivedType(typeof(CancelMessage), "cancel")]
 [JsonDerivedType(typeof(GetStatusMessage), "get_status")]
+[JsonDerivedType(typeof(ModelDownloadStartMessage), "model_download_start")]
+[JsonDerivedType(typeof(ModelDownloadCancelMessage), "model_download_cancel")]
+[JsonDerivedType(typeof(ModelImportMessage), "model_import")]
+[JsonDerivedType(typeof(ModelDeleteMessage), "model_delete")]
+[JsonDerivedType(typeof(GetModelStatusMessage), "get_model_status")]
+[JsonDerivedType(typeof(GetConfigMessage), "get_config")]
+[JsonDerivedType(typeof(SetConfigMessage), "set_config")]
 public abstract class ClientMessage;
 
 public sealed class HelloMessage : ClientMessage
@@ -42,6 +49,43 @@ public sealed class GetStatusMessage : ClientMessage
     public ulong Id { get; set; }
 }
 
+public sealed class ModelDownloadStartMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+}
+
+public sealed class ModelDownloadCancelMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+}
+
+public sealed class ModelImportMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+    public string Path { get; set; } = "";
+}
+
+public sealed class ModelDeleteMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+}
+
+public sealed class GetModelStatusMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+}
+
+public sealed class GetConfigMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+}
+
+public sealed class SetConfigMessage : ClientMessage
+{
+    public ulong Id { get; set; }
+    public EngineConfig Config { get; set; } = new();
+}
+
 // ---------------------------------------------------------------------------
 // Engine -> client
 // ---------------------------------------------------------------------------
@@ -51,6 +95,8 @@ public sealed class GetStatusMessage : ClientMessage
 [JsonDerivedType(typeof(PongMessage), "pong")]
 [JsonDerivedType(typeof(ResultsMessage), "results")]
 [JsonDerivedType(typeof(StatusMessage), "status")]
+[JsonDerivedType(typeof(ModelStatusMessage), "model_status")]
+[JsonDerivedType(typeof(ConfigMessage), "config")]
 [JsonDerivedType(typeof(ErrorMessage), "error")]
 public abstract class ServerMessage;
 
@@ -78,6 +124,20 @@ public sealed class StatusMessage : ServerMessage
     /// <summary>Set when answering GetStatus; null for pushed updates.</summary>
     public ulong? Id { get; set; }
     public EngineStatus Status { get; set; } = new();
+}
+
+public sealed class ModelStatusMessage : ServerMessage
+{
+    /// <summary>Set when answering a model request; null for pushed progress updates.</summary>
+    public ulong? Id { get; set; }
+    public ModelStatus Status { get; set; } = new();
+}
+
+public sealed class ConfigMessage : ServerMessage
+{
+    /// <summary>Set when answering GetConfig/SetConfig.</summary>
+    public ulong? Id { get; set; }
+    public EngineConfig Config { get; set; } = new();
 }
 
 public sealed class ErrorMessage : ServerMessage
@@ -187,6 +247,38 @@ public sealed class EngineStatus
     public ulong QueueDepth { get; set; }
     public bool ModelLoaded { get; set; }
     public ulong IndexSizeBytes { get; set; }
+}
+
+public enum ModelState
+{
+    NotDownloaded,
+    Downloading,
+    Paused,
+    Ready,
+    Error,
+}
+
+public sealed class ModelStatus
+{
+    public ModelState State { get; set; }
+    public ulong Bytes { get; set; }
+    public ulong TotalBytes { get; set; }
+    public string? Error { get; set; }
+
+    /// <summary>Fraction downloaded in [0, 1]; 0.0 when <see cref="TotalBytes"/> is zero.</summary>
+    public double Fraction => TotalBytes == 0 ? 0 : (double)Bytes / TotalBytes;
+}
+
+/// <summary>
+/// Engine search policy (mirrors the Rust EngineConfig verbatim).
+/// PreferredBackend is a plain string on the wire (canonical
+/// "auto|cuda|vulkan|cpu"); the engine refuses unknown spellings with
+/// invalid_request at set_config time.
+/// </summary>
+public sealed class EngineConfig
+{
+    public bool SemanticEnabled { get; set; } = true;
+    public string PreferredBackend { get; set; } = "auto";
 }
 
 /// <summary>One streamed chunk of search results (client-side only).</summary>

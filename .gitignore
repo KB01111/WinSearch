@@ -21,3 +21,5 @@ cache/
 *.log
 .DS_Store
 .commandcode/
+.worktrees/
+.superpowers/

@@ -9,3 +9,4 @@ description = "WinSearch IPC protocol: typed messages and framing"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ws-modelmgr.workspace = true

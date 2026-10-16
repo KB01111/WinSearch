@@ -1,15 +1,17 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using Windows.Storage.Pickers;
 using Windows.System;
+using WinSearch.Core.Ipc;
 using WinSearch.Core.Settings;
 using WinSearch.ViewModels;
 
 namespace WinSearch.App;
 
 /// <summary>
-/// Settings window. Phase 1 covers General (theme, shortcut, search behaviour);
-/// additional sections arrive with their feature phases.
+/// Settings window. Covers General (theme, shortcut, search behaviour) and AI
+/// model management (download/pause/resume/import/delete, semantic toggle, backend).
 /// </summary>
 internal sealed partial class SettingsWindow : Window
 {
@@ -17,12 +19,13 @@ internal sealed partial class SettingsWindow : Window
     private readonly HotkeyManager _hotkeyManager;
     private readonly SettingsViewModel _viewModel;
     private bool _capturingHotkey;
+    private bool _syncingFromViewModel;
 
-    public SettingsWindow(AppSettings settings, HotkeyManager hotkeyManager)
+    public SettingsWindow(AppSettings settings, HotkeyManager hotkeyManager, IEngineClient? engineClient = null)
     {
         _settings = settings;
         _hotkeyManager = hotkeyManager;
-        _viewModel = new SettingsViewModel(settings);
+        _viewModel = new SettingsViewModel(settings, engineClient);
         InitializeComponent();
 
         Title = "WinSearch Settings";
@@ -34,6 +37,7 @@ internal sealed partial class SettingsWindow : Window
             _ => ElementTheme.Default,
         };
 
+        _viewModel.PropertyChanged += OnViewModelPropertyChanged;
         _viewModel.Initialize();
         HotkeyText.Text = _viewModel.HotkeyDisplay;
 
@@ -41,7 +45,63 @@ internal sealed partial class SettingsWindow : Window
         ThemeCombo.SelectedItem = _viewModel.SelectedTheme;
         RememberQueryToggle.IsOn = _viewModel.RememberLastQuery;
 
+        BackendCombo.ItemsSource = SettingsViewModel.BackendOptions;
+        SyncAiControlsFromViewModel();
+
         RootGrid.KeyDown += OnRootKeyDown;
+        Closed += OnWindowClosed;
+
+        _ = _viewModel.InitializeAsync();
+    }
+
+    private void OnWindowClosed(object sender, WindowEventArgs args)
+    {
+        _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        _viewModel.Dispose();
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        SyncAiControlsFromViewModel();
+    }
+
+    private void SyncAiControlsFromViewModel()
+    {
+        _syncingFromViewModel = true;
+        try
+        {
+            ModelStatusSummaryText.Text = _viewModel.ModelStatusSummary;
+            ModelProgressBar.Value = _viewModel.ModelProgressPercent;
+            ModelProgressDetailText.Text = _viewModel.ModelProgressText;
+            ModelSpeedText.Text = _viewModel.DownloadSpeedText;
+
+            DownloadModelButton.Content = _viewModel.PrimaryModelActionLabel;
+            DownloadModelButton.IsEnabled = _viewModel.CanStartOrResumeDownload;
+            PauseModelButton.IsEnabled = _viewModel.CanPauseDownload;
+            ImportModelButton.IsEnabled = _viewModel.CanImportModel;
+            DeleteModelButton.IsEnabled = _viewModel.CanDeleteModel;
+
+            ModelErrorTextBlock.Text = _viewModel.ModelErrorText;
+            ModelErrorTextBlock.Visibility = string.IsNullOrEmpty(_viewModel.ModelErrorText)
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+
+            if (SemanticSearchToggle.IsOn != _viewModel.EnableSemanticSearch)
+            {
+                SemanticSearchToggle.IsOn = _viewModel.EnableSemanticSearch;
+            }
+
+            if (BackendCombo.SelectedItem as string != _viewModel.SelectedBackend)
+            {
+                BackendCombo.SelectedItem = _viewModel.SelectedBackend;
+            }
+
+            DetectedBackendText.Text = _viewModel.DetectedBackendDisplay;
+        }
+        finally
+        {
+            _syncingFromViewModel = false;
+        }
     }
 
     private void OnThemeChanged(object sender, SelectionChangedEventArgs e)
@@ -139,7 +199,64 @@ internal sealed partial class SettingsWindow : Window
 
     private void OnRememberQueryToggled(object sender, RoutedEventArgs e)
     {
+        if (_syncingFromViewModel)
+        {
+            return;
+        }
         _viewModel.RememberLastQuery = RememberQueryToggle.IsOn;
+    }
+
+    private void OnSemanticSearchToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingFromViewModel)
+        {
+            return;
+        }
+        _viewModel.EnableSemanticSearch = SemanticSearchToggle.IsOn;
+    }
+
+    private void OnBackendChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingFromViewModel)
+        {
+            return;
+        }
+        if (BackendCombo.SelectedItem is string backend)
+        {
+            _viewModel.SelectedBackend = backend;
+        }
+    }
+
+    private async void OnDownloadModelClick(object sender, RoutedEventArgs e)
+    {
+        await _viewModel.StartOrResumeDownloadAsync();
+    }
+
+    private async void OnPauseModelClick(object sender, RoutedEventArgs e)
+    {
+        await _viewModel.PauseDownloadAsync();
+    }
+
+    private async void OnImportModelClick(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileOpenPicker();
+        var hwnd = OverlayPlacement.WindowNativeHandle(this);
+        if (hwnd != IntPtr.Zero)
+        {
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+        }
+        picker.FileTypeFilter.Add(".gguf");
+
+        var file = await picker.PickSingleFileAsync();
+        if (file is not null && !string.IsNullOrWhiteSpace(file.Path))
+        {
+            await _viewModel.ImportModelFromPathAsync(file.Path);
+        }
+    }
+
+    private async void OnDeleteModelClick(object sender, RoutedEventArgs e)
+    {
+        await _viewModel.DeleteModelAsync();
     }
 
     private const uint NativeMethods_MOD_ALT = 0x1;

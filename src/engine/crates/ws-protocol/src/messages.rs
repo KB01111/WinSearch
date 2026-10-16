@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use ws_modelmgr::ModelStatus;
+
 /// Bumped on breaking wire changes. A client and engine with different
 /// versions refuse to work together (the engine answers `Error` with
 /// `ErrorCode::ProtocolVersionMismatch` and closes the connection).
@@ -27,6 +29,28 @@ pub enum ClientMessage {
     Cancel { id: RequestId },
     /// Snapshot of engine/indexing status.
     GetStatus { id: RequestId },
+    /// Begin (or resume) the embedding-model download. Answered by
+    /// `ModelStatus` with `id` set; progress arrives as pushed `ModelStatus`
+    /// frames (`id: None`) until the download completes or is cancelled.
+    ModelDownloadStart { id: RequestId },
+    /// Cancel the in-flight model download; the partial files stay on disk
+    /// so a later start resumes (status `paused`).
+    ModelDownloadCancel { id: RequestId },
+    /// Copy model files from a local `path` (file or directory) into the
+    /// model dir, verifying size (and SHA-256 when pinned).
+    ModelImport { id: RequestId, path: String },
+    /// Delete the downloaded model files.
+    ModelDelete { id: RequestId },
+    /// Snapshot of the model lifecycle state.
+    GetModelStatus { id: RequestId },
+    /// Snapshot of the engine search policy (`semantic_enabled`,
+    /// `preferred_backend`). Answered by `Config` with `id` set.
+    GetConfig { id: RequestId },
+    /// Persist the engine search policy. Answered by `Config` with `id` set;
+    /// an unknown `preferred_backend` spelling is refused with
+    /// `Error{invalid_request}` (the typed store only holds
+    /// `auto|cuda|vulkan|cpu`).
+    SetConfig { id: RequestId, config: EngineConfig },
 }
 
 /// Messages sent by the engine to a client.
@@ -51,12 +75,62 @@ pub enum ServerMessage {
         id: Option<RequestId>,
         status: EngineStatus,
     },
+    /// `id: Some(_)` answers a model request (`ModelDownloadStart/Cancel`,
+    /// `ModelImport`, `ModelDelete`, `GetModelStatus`); `id: None` is a
+    /// pushed progress/completion update sent proactively to all clients.
+    ModelStatus {
+        id: Option<RequestId>,
+        status: ModelStatus,
+    },
+    /// `id: Some(_)` answers `GetConfig`/`SetConfig`. Additive like every
+    /// other frame: `PROTOCOL_VERSION` stays 1.
+    Config {
+        id: Option<RequestId>,
+        config: EngineConfig,
+    },
     Error {
         /// `None` means the error is connection-scoped (e.g. handshake).
         id: Option<RequestId>,
         code: ErrorCode,
         message: String,
     },
+}
+
+/// Engine search policy (P3.6): the semantic-stage kill switch plus the
+/// recorded inference-backend preference.
+///
+/// `preferred_backend` is deliberately a plain string on the wire (canonical
+/// `auto|cuda|vulkan|cpu`) rather than an enum: an unknown spelling from a
+/// newer peer still parses, and validation happens at application time
+/// (`set_config` refuses it with `invalid_request`). The typed
+/// `ws_index::PreferredBackend` is the store-side counterpart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EngineConfig {
+    /// Whether the semantic query stage may run (default true; the stage
+    /// additionally requires the embedding model to be ready).
+    #[serde(default = "default_semantic_enabled")]
+    pub semantic_enabled: bool,
+    /// Canonical `auto|cuda|vulkan|cpu`.
+    #[serde(default = "default_preferred_backend")]
+    pub preferred_backend: String,
+}
+
+fn default_semantic_enabled() -> bool {
+    true
+}
+
+fn default_preferred_backend() -> String {
+    "auto".to_string()
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            semantic_enabled: true,
+            preferred_backend: "auto".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +263,7 @@ pub struct EngineStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ws_modelmgr::ModelState;
 
     #[test]
     fn client_message_json_round_trip() {
@@ -248,5 +323,99 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: ServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn model_messages_round_trip() {
+        for msg in [
+            ClientMessage::ModelDownloadStart { id: 1 },
+            ClientMessage::ModelDownloadCancel { id: 2 },
+            ClientMessage::ModelImport {
+                id: 3,
+                path: "C:\\models".into(),
+            },
+            ClientMessage::ModelDelete { id: 4 },
+            ClientMessage::GetModelStatus { id: 5 },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: ClientMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(msg, back);
+        }
+
+        let status = ServerMessage::ModelStatus {
+            id: None,
+            status: ModelStatus {
+                state: ModelState::Downloading,
+                bytes: 10,
+                total_bytes: 100,
+                error: None,
+            },
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"type\":\"model_status\""));
+        assert!(json.contains("\"state\":\"downloading\""));
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(status, back);
+    }
+
+    #[test]
+    fn old_clients_still_parse_new_server_frames() {
+        // Additive IPC: unknown-to-old-clients frames carry only `#[serde(default)]`
+        // fields, and new client messages parse from the exact wire JSON.
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"model_import","id":9,"path":"x"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMessage::ModelImport {
+                id: 9,
+                path: "x".into()
+            }
+        );
+    }
+
+    #[test]
+    fn config_messages_round_trip() {
+        for msg in [
+            ClientMessage::GetConfig { id: 11 },
+            ClientMessage::SetConfig {
+                id: 12,
+                config: EngineConfig {
+                    semantic_enabled: false,
+                    preferred_backend: "cuda".into(),
+                },
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: ClientMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(msg, back);
+        }
+        let answer = ServerMessage::Config {
+            id: Some(11),
+            config: EngineConfig::default(),
+        };
+        let json = serde_json::to_string(&answer).unwrap();
+        assert!(json.contains("\"type\":\"config\""));
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(answer, back);
+    }
+
+    #[test]
+    fn config_defaults_are_additive() {
+        // A bare `{}` (or a frame from an older peer that never sent the new
+        // fields) reads back as "semantic on, auto backend" — never a parse
+        // error, and `PROTOCOL_VERSION` stays 1.
+        let cfg: EngineConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.semantic_enabled);
+        assert_eq!(cfg.preferred_backend, "auto");
+        // Unknown backend spellings still parse on the wire; the engine
+        // refuses them at `set_config` application time.
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"semantic_enabled":true,"preferred_backend":"opencl"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.preferred_backend, "opencl");
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"get_config","id":3}"#).unwrap();
+        assert_eq!(msg, ClientMessage::GetConfig { id: 3 });
     }
 }

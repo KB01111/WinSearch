@@ -15,7 +15,7 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn features() -> Vec<String> {
     // Capability tags advertised at handshake. Grows with the phases:
     // "search.semantic" appears in Phase 3, "code" in Phase 5.
-    vec!["search.exact".to_string()]
+    vec!["search.exact".to_string(), "search.semantic".to_string()]
 }
 
 pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
@@ -75,6 +75,8 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
         status: engine.status(),
     });
 
+    let mut active_search: Option<ws_protocol::RequestId> = None;
+
     loop {
         let msg = match read_message::<_, ClientMessage>(&mut reader) {
             Ok(Some(msg)) => msg,
@@ -100,10 +102,15 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
                 let _ = client.send(&ServerMessage::Pong { id });
             }
             ClientMessage::Search { id, query } => {
+                if let Some(prev) = active_search.replace(id) {
+                    if prev != id {
+                        engine.cancel_for_client(client.id(), prev);
+                    }
+                }
                 engine.search(&client, id, query);
             }
             ClientMessage::Cancel { id } => {
-                engine.cancel(id);
+                engine.cancel_for_client(client.id(), id);
             }
             ClientMessage::GetStatus { id } => {
                 let _ = client.send(&ServerMessage::Status {
@@ -111,23 +118,209 @@ pub fn handle_connection(stream: PipeStream, engine: SharedEngine) {
                     status: engine.status(),
                 });
             }
+            ClientMessage::ModelDownloadStart { id } => {
+                engine.model_download_start(&client, id);
+            }
+            ClientMessage::ModelDownloadCancel { id } => {
+                engine.model_download_cancel(&client, id);
+            }
+            ClientMessage::ModelImport { id, path } => {
+                engine.model_import(&client, id, path);
+            }
+            ClientMessage::ModelDelete { id } => {
+                engine.model_delete(&client, id);
+            }
+            ClientMessage::GetModelStatus { id } => {
+                engine.model_status(&client, id);
+            }
+            ClientMessage::GetConfig { id } => {
+                engine.get_config(&client, id);
+            }
+            ClientMessage::SetConfig { id, config } => {
+                engine.set_config(&client, id, config);
+            }
         }
     }
 
+    if let Some(prev) = active_search {
+        engine.cancel_for_client(client.id(), prev);
+    }
     engine.unregister_client(&client);
 }
 
-/// Adapter giving the framing codec read access to the shared pipe stream.
+/// Adapter giving the framing codec read access to the shared pipe stream
+/// without holding the stream mutex (or blocking `ReadFile` on the synchronous
+/// pipe handle) while waiting for the peer to send the next frame.
 struct ReaderGuard {
     stream: Arc<Mutex<PipeStream>>,
 }
 
 impl Read for ReaderGuard {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut guard = self
-            .stream
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.read(buf)
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            {
+                let mut guard = self
+                    .stream
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match guard.peek_available()? {
+                    None => return Ok(0),
+                    Some(n) if n > 0 => return guard.read(buf),
+                    Some(_) => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use ws_protocol::{write_message, SearchQuery, SearchResult};
+
+    use crate::engine::EngineService;
+    use crate::indexer::Indexer;
+
+    static SERVER_PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_pipe() -> String {
+        let n = SERVER_PIPE_SEQ.fetch_add(1, Ordering::SeqCst);
+        format!(r"\\.\pipe\winsearch-server-test-{}-{n}", std::process::id())
+    }
+
+    fn connect_retry(pipe: &str) -> PipeStream {
+        let start = std::time::Instant::now();
+        loop {
+            match PipeStream::connect(pipe) {
+                Ok(s) => return s,
+                Err(_) if start.elapsed() < Duration::from_secs(30) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("pipe {pipe} never answered: {e}"),
+            }
+        }
+    }
+
+    fn read_results(stream: &mut PipeStream) -> (u64, Vec<SearchResult>, bool) {
+        loop {
+            let msg: Option<ServerMessage> =
+                read_message(stream).expect("read server frame");
+            match msg {
+                Some(ServerMessage::Results { id, batch, done }) => return (id, batch, done),
+                Some(ServerMessage::Status { .. }) => continue,
+                Some(other) => panic!("unexpected server frame: {other:?}"),
+                None => panic!("pipe closed before Results frame"),
+            }
+        }
+    }
+
+    #[test]
+    fn in_band_cancel_on_pipe_aborts_slow_semantic_stage() {
+        let root = std::env::temp_dir().join(format!(
+            "winsearch-server-cancel-{}-{}",
+            std::process::id(),
+            SERVER_PIPE_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = root.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("meeting-notes.txt"), b"x").unwrap();
+        std::fs::write(files.join("banquet-hall.txt"), b"x").unwrap();
+
+        let store = ws_index::IndexStore::open_in_memory().unwrap();
+        let indexer = Indexer::open(store, &[files.clone()]).unwrap();
+        indexer.enqueue_initial_scan().unwrap();
+        while indexer.scan_available(64) > 0 {}
+        indexer
+            .embed_once_with(|texts| {
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        if t.contains("banquet") {
+                            vec![1.0, 0.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0, 0.0]
+                        }
+                    })
+                    .collect())
+            })
+            .unwrap();
+
+        let engine = EngineService::new_with_model_dir(indexer, root.join("models"));
+        engine.set_model_ready_override(Some(true));
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        engine.set_query_embed_hook(Arc::new(move |_| {
+            let _ = entered_tx.send(());
+            // Hold the semantic stage open long enough for the in-band `Cancel`
+            // frame on the same pipe to be read and processed by `handle_connection`.
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(vec![1.0, 0.0, 0.0])
+        }));
+
+        let pipe = unique_pipe();
+        let server_pipe = pipe.clone();
+        let server_engine = Arc::clone(&engine);
+        std::thread::Builder::new()
+            .name("winsearch-server-test".into())
+            .spawn(move || {
+                let _ = ws_platform::pipe::serve(&server_pipe, move |stream| {
+                    handle_connection(stream, Arc::clone(&server_engine));
+                });
+            })
+            .unwrap();
+
+        let mut client = connect_retry(&pipe);
+        write_message(
+            &mut client,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client: "test".into(),
+                client_version: "0.1.0".into(),
+            },
+        )
+        .unwrap();
+        let ack: ServerMessage = read_message(&mut client).unwrap().unwrap();
+        assert!(matches!(ack, ServerMessage::HelloAck { .. }));
+
+        // Send `Search` followed immediately by `Cancel` on the same pipe.
+        write_message(
+            &mut client,
+            &ClientMessage::Search {
+                id: 55,
+                query: SearchQuery {
+                    text: "meeting".into(),
+                    limit: 20,
+                    include_semantic: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("semantic stage must begin");
+        write_message(&mut client, &ClientMessage::Cancel { id: 55 }).unwrap();
+
+        let (id1, exact_batch, done1) = read_results(&mut client);
+        assert_eq!(id1, 55);
+        assert!(!done1, "exact batch leaves stream open for semantic stage");
+        assert!(exact_batch.iter().any(|r| r.title == "meeting-notes.txt"));
+
+        let (id2, terminal_batch, done2) = read_results(&mut client);
+        assert_eq!(id2, 55);
+        assert!(done2, "cancelled search must emit terminal done:true frame");
+        assert!(
+            terminal_batch.is_empty(),
+            "in-band Cancel must suppress slow semantic hits, got {terminal_batch:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

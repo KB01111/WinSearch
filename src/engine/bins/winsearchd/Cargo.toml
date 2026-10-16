@@ -12,8 +12,17 @@ path = "src/main.rs"
 [dependencies]
 ws-protocol.workspace = true
 ws-platform.workspace = true
+ws-index.workspace = true
+ws-modelmgr.workspace = true
+ws-embed-protocol.workspace = true
+ws-extract.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+windows.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
