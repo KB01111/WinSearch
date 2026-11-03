@@ -48,7 +48,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 quick-xml = "0.37"
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 ws-protocol = { path = "crates/ws-protocol" }
 ws-platform = { path = "crates/ws-platform" }
